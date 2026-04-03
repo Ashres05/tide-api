@@ -6,3 +6,10 @@ __pycache__/
 secrets/
 **/.env*
 **/.pem*
+
+# Ignore updated artifacts
+artifacts_75k/
+archetypes_artifacts/
+
+# Ignore database
+marketshare_data.db

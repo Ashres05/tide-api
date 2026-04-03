@@ -1,24 +1,27 @@
-# TODO: Train and store models with optimized hyperparameters
+"""Train and store models with optimized hyperparameters."""
+from models.all_data_archetypes_simulator import main as train_archetype_simulator
+from models.train_marketshare_artifacts import main as train_marketshare_artifacts
 
 def train_marketshare_model() -> None:
-    # TODO: Call train_marketshare_artifacts.py.
-    # TODO: Update parquet based on latest marketshare data.
-    # TODO: Train model with optimized hyperparameters.
-    # train_marketshare_artifacts.py will automatically save the model locally using joblib.
-    pass
+    """
+    Full 75k marketshare train/export (see ``models/train_marketshare_artifacts.py``).
+
+    Already persists under ``<repo>/artifacts_75k/``:
+    - joblib: ``production_lgbm_75k.pkl``, ``production_prophet_models_75k.pkl``,
+      ``production_spike_engine.pkl``, and optionally ``kmeans_archetype_75k.pkl``
+    - parquet: ``df_full.parquet``, ``actuals_2026.parquet``
+    - JSON: ``metadata.json``, profiles, DNA, coefficients, etc.
+    """
+    train_marketshare_artifacts()
 
 
 def train_decay_model() -> None:
-    # TODO: Call all_data_archetypes_simulator.py with set parquet.
-
-    # TODO: Save model locally.
-    save_model()
-    pass
-
-
-# TODO: Store model locally using joblib for future use.
-def save_model() -> None:
-    pass
+    """
+    Refresh archetype API artifacts (parquets + JSON under ``archetypes_artifacts/``) from
+    ``models/all_releases_18_25_compressed.parquet``. Same entrypoint as ``main()`` in
+    ``models/all_data_archetypes_simulator.py``.
+    """
+    train_archetype_simulator()
 
 
 def train_model_main() -> None:
