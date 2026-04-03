@@ -1,0 +1,8 @@
+# Ignore all python compiled files
+__pycache__/
+*.pyc
+
+# Ignore all secrets
+secrets/
+**/.env*
+**/.pem*
