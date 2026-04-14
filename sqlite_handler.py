@@ -73,6 +73,15 @@ def update_sqlite_main() -> None:
             marketshare_release_metrics_data = marketshare_release_metrics_data.rename(
                 columns=str.upper,
             )
+            # After rename(columns=str.upper)
+            if "WEEK_ENDING_DATE" in marketshare_release_metrics_data.columns:
+                marketshare_release_metrics_data["WEEK_ENDING_DATE"] = marketshare_release_metrics_data["WEEK_ENDING_DATE"].astype(str)
+
+            for col in ("ALBUM_EQUIVALENT", "PRODUCT_SALES", "SONG_SALE_EQUIVALENT", "STREAMING_EQUIVALENT"):
+                if col in marketshare_release_metrics_data.columns:
+                    s = pd.to_numeric(marketshare_release_metrics_data[col], errors="coerce")
+                    s = s.replace([float("inf"), float("-inf")], pd.NA)
+                    marketshare_release_metrics_data[col] = s.where(~s.isna(), None).astype(object)
         else:
             marketshare_release_metrics_data = pd.DataFrame(
                 columns=[
@@ -132,4 +141,5 @@ def drop_table(table_name: str) -> None:
 
 
 if __name__ == "__main__":
+    
     update_sqlite_main()

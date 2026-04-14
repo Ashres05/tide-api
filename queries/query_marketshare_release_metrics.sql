@@ -39,8 +39,11 @@ SELECT
 FROM
     luminate_prod.extract_s.vw_daily_fact_mrelg_summary_ds s
     JOIN luminate_prod.extract_s.vw_date_ds da ON da.datename = s.report_date
+    JOIN luminate_prod.extract_s.vw_musical_release_group_ds m ON m.mrelg_id = s.mrelg_id
 WHERE
     s.country_code = 'US'
     AND s.mrelg_id IN ({RELEASE_IDS})
+    AND s.report_date >= m.first_sale_date
+    AND da.week_end_date < DATEADD(DAY, -2, CURRENT_DATE())
 GROUP BY
-    ALL
+    ALL;

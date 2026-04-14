@@ -29,7 +29,6 @@ class ReleaseCreateBody(BaseModel):
     avg_historical_w1_product_ratio: float = 0.3
     product_ratio_coefficient: float = 0.3
     cluster: int = 0
-    is_released: bool = False
 
 
 class ReleaseUpdateBody(ReleaseCreateBody):
@@ -124,16 +123,15 @@ def weekly_marketshare(week_ending_date: str | None = None):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/v1/releases/{release_id}/series")
-def weekly_series(release_id: int):
-    """
-    Convenience endpoint returning parallel arrays for decay + label marketshare.
-    """
-    try:
-        payload = model_handler.get_release_weekly_decay_and_marketshare_json(release_id)
-        return Response(content=json.dumps(payload), media_type="application/json")
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
+# @app.get("/v1/releases/{release_id}/series")
+# def weekly_series(release_id: int):
+#     """
+#     Convenience endpoint returning parallel arrays for decay + label marketshare.
+#     """
+#     try:
+#         payload = model_handler.get_release_weekly_decay_and_marketshare_json(release_id)
+#         return Response(content=json.dumps(payload), media_type="application/json")
+#     except ValueError as e:
+#         raise HTTPException(status_code=400, detail=str(e))
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
