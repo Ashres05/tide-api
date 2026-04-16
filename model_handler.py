@@ -6,15 +6,17 @@ import json
 import math
 import numbers
 import sqlite3
-from datetime import datetime
+from datetime import datetime, date
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 import pandas as pd
 
 from sqlite_handler import DATABASE_NAME
 from model.marketshare_75k_simulation import DISTRIBUTIONS
 from snowflake_conn import load_sql
 from model.forecast_engine_server import ForecastEngine
+from sqlite_handler import update_sqlite_main
+from snowflake_conn import get_snowflake_connection
 
 # Default training output: model/train_marketshare_artifacts.py writes here (not repo-root artifacts_75k).
 ARTIFACTS_DIR = Path(__file__).resolve().parent / "model" / "artifacts_75k"
@@ -28,6 +30,8 @@ RELEASE_UPDATE_QUERY = "release_update.sql"
 RELEASE_DELETE_QUERY = "release_delete.sql"
 RELEASE_GET_QUERY = "release_get.sql"
 RELEASE_GET_ALL_QUERY = "release_get_all.sql"
+MRELG_METADATA_QUERY = "query_mrelg_id.sql"
+RELEASE_BACKFILL_QUERY = "query_release_backfill.sql"
 
 _RELEASE_FIELD_KEYS = frozenset(
     {
@@ -75,8 +79,7 @@ def create_release(
     release_date: str, 
     genre: str, 
     scenario: str, 
-    known_vols: List[float] = [], 
-    fw_vol: float = 0.0, 
+    fw_vol: float, 
     fy_vol: float = 0.0, 
     avg_historical_w1_product_ratio: float = 0.3, 
     product_ratio_coefficient: float = 0.3,
@@ -87,6 +90,7 @@ def create_release(
     Creates a new release in the database.
     Returns the release ID.
     """
+            
     _verify_release_fields(locals())
 
     params = (
@@ -113,7 +117,105 @@ def create_release(
     except sqlite3.Error as e:
         raise sqlite3.Error(f"Error creating release: {e}") from e
 
-# TODO: Adjust the usage of known_volumes_json within the database.
+
+def _create_backfilled_release(
+    *,
+    mrelg_id: str,
+    label_name: str,
+    scenario: str = "Base",
+    fw_vol: float = 100000.0 # Default to 100,000 units for backfilled releases, this doesn't matter as backfilled releases will have known volumes.
+) -> int:
+    """
+    Creates a new release in the database from a mrelg_id.
+    Returns the release ID.
+    """
+    mrelg_metadata = _verify_mrelg_id(mrelg_id)
+    name = mrelg_metadata["TITLE"].iloc[0]
+    artist = mrelg_metadata["DISPLAY_ARTIST"].iloc[0]
+    release_date = _validate_date(mrelg_metadata["RELEASE_DATE"].iloc[0])
+    genre = mrelg_metadata["GENRE"].iloc[0]
+
+    # Temporary adjustment to genres to ensure they are in the distribution.
+    genre_aliases = {
+        "Alt. Rock": "Rock",
+        "R&B": "R&B/Hip-Hop",
+    }
+    genre = genre_aliases.get(genre, genre)
+    if genre not in DISTRIBUTIONS["Genre"]:
+        genre = "Pop"
+
+    metadata_cols = [name, artist, release_date, genre]
+
+    for col in metadata_cols:
+        if col is None:
+            raise ValueError(f"MRELG ID {mrelg_id} has no {col} in the metadata. Try create_release() instead.")
+
+    
+    return create_release(mrelg_id=mrelg_id, 
+        name=name,
+        artist=artist,
+        label_name=label_name,
+        release_date=release_date,
+        genre=genre,
+        scenario=scenario,
+        fw_vol=fw_vol,
+        fy_vol=0.0,
+        avg_historical_w1_product_ratio=0.3,
+        product_ratio_coefficient=0.3,
+        cluster=0)
+
+
+def backfill_releases() -> dict:
+    """
+    Backfills releases from Snowflake into the local SQLite database.
+
+    Returns a summary dict with counts and any per-release errors:
+        {"inserted": int, "skipped": int, "errors": [{"mrelg_id": str, "error": str}, ...]}
+    """
+    query = load_sql(RELEASE_BACKFILL_QUERY)
+    
+    # Get the releases from Snowflake.
+    with get_snowflake_connection() as sf:
+        df = sf.query(query)
+
+    if df.empty:
+        return {"inserted": 0, "skipped": 0, "errors": []}
+
+    # Get the existing mrelg_ids from the SQLite database.
+    existing_mrelg_ids = {
+        (row["MRELG_ID"] or "").strip()
+        for row in _get_all_release_rows()
+        if "MRELG_ID" in row.keys() and row["MRELG_ID"]
+    }
+
+    # Keep track of the number of inserted, skipped, and errors.
+    inserted = 0
+    skipped = 0
+    errors: list[dict] = []
+
+    for mrelg_id, label_name in df.itertuples(index=False, name=None):
+        if mrelg_id in existing_mrelg_ids:
+            # Skip if the release already exists in the database.
+            skipped += 1
+            continue
+
+        try:
+            # Create the release in the database.
+            _create_backfilled_release(mrelg_id=mrelg_id, label_name=label_name)
+            inserted += 1
+            existing_mrelg_ids.add(mrelg_id)
+        except Exception as e:
+            errors.append({"mrelg_id": mrelg_id, "error": str(e)})
+    try:
+        # Refresh SQLite data for backfilled releases.
+        if inserted > 0:
+            update_sqlite_main()
+    except Exception as e:
+        errors.append({"stage": "update_sqlite_main", "error": str(e) + "\nWARNING: This means official weekly equivalent data for some releases may not be available at the moment."})
+
+    return {"inserted": inserted, "skipped": skipped, "errors": errors}
+
+
 def update_release(
     *,
     id: int,
@@ -260,7 +362,7 @@ def get_marketshare_forecasts(week_ending_date: str | None = None) -> pd.DataFra
     """
     # Verify the week ending date (if provided).
     if week_ending_date is not None:
-        _verify_week_ending_date(week_ending_date)
+        _validate_date(week_ending_date)
 
     # Get all releases and verify the parquet file.
     releases = [_sqlite_row_to_release_map(row) for row in _get_all_release_rows()]
@@ -288,7 +390,7 @@ def get_release_forecasts(id: int, week_ending_date: str | None = None) -> pd.Da
     # Verify the week ending date (if provided) and ID.
     _verify_id(id)
     if week_ending_date is not None:
-        _verify_week_ending_date(week_ending_date)
+        _validate_date(week_ending_date)
 
     # Get the release and verify the parquet file.
     release = get_release(id)
@@ -303,7 +405,7 @@ def get_release_forecasts(id: int, week_ending_date: str | None = None) -> pd.Da
     if week_ending_date is None:
         return weekly_injections
     else:
-        mask = weekly_injections["Week Ending Date"].astype(str) == week_ending_date.strip()
+        mask = weekly_injections["Week Ending Date"].astype(str) == week_ending_date
         return weekly_injections.loc[mask]
 
 
@@ -434,28 +536,28 @@ def _verify_release_fields(inputs: dict) -> None:
     if known_vols is None:
         known_vols = []
     if not isinstance(known_vols, (list, tuple)):
-        raise ValueError("known_vols must be a list.")
+        raise ValueError("Known volumes must be a list.")
     for i, x in enumerate(known_vols):
         if not _is_real_number(x):
-            raise ValueError(f"known_vols[{i}] must be a number.")
+            raise ValueError(f"Value {x} at index {i} is not a number.")
         xf = float(x)
         if math.isnan(xf) or math.isinf(xf):
-            raise ValueError(f"known_vols[{i}] must be a finite number.")
+            raise ValueError(f"Value {x} at index {i} is not a finite number.")
 
     # Verify fw_vol is a positive number when known_vols is empty.
     fw_vol = float(data["fw_vol"])
     if len(known_vols) == 0 and fw_vol <= 0:
-        raise ValueError("fw_vol must be positive when known_vols is empty.")
+        raise ValueError("Expected weekly volume must be positive when known volumes is empty.")
 
     # Verify genre is in the distribution.
     genre = data["genre"]
     if genre not in DISTRIBUTIONS["Genre"]:
-        raise ValueError(f"Genre {genre!r} not found in distribution.")
+        raise ValueError(f"Genre {genre!r} not found in distribution: {DISTRIBUTIONS['Genre']}.")
 
     # Verify label is in the distribution.
     label_name = data["label_name"]
     if label_name not in DISTRIBUTIONS["Label"]:
-        raise ValueError(f"Label {label_name!r} not found in distribution.")
+        raise ValueError(f"Label {label_name!r} not found in distribution: {DISTRIBUTIONS['Label']}.")
 
     try:
         datetime.strptime(data["release_date"].strip(), "%Y-%m-%d")
@@ -467,26 +569,38 @@ def _verify_release_fields(inputs: dict) -> None:
     scenario = data["scenario"].strip()
     if scenario not in _ALLOWED_SCENARIOS:
         raise ValueError(
-            f"scenario must be one of {sorted(_ALLOWED_SCENARIOS)}; got {scenario!r}."
+            f"Scenario {scenario!r} must be one of {sorted(_ALLOWED_SCENARIOS)}."
         )
 
 
-def _verify_id(id: int) -> None:
+def _verify_id(id: int | None) -> None:
     """Verifies that the id is a positive integer and is not None."""
     if id is None:
-        raise ValueError("id is required.")
+        raise ValueError("ID is required.")
     if not _is_integral(id) or int(id) < 0:
-        raise ValueError("id must be a positive integer.")
+        raise ValueError("ID must be a positive integer.")
 
 
-def _verify_week_ending_date(week_ending_date: str) -> None:
-    """Verifies that the week ending date is a valid YYYY-MM-DD date."""
+def _validate_date(date_value: str | None) -> str:
+    """Validates that the date is a valid YYYY-MM-DD date and returns it as a string."""
     try:
-        datetime.strptime(week_ending_date.strip(), "%Y-%m-%d")
+        if date_value is None:
+            raise ValueError(f"Date is required. Got {date_value!r}.")
+        if pd.isna(date_value):
+            raise ValueError(f"Date is required. Got {date_value!r}.")
+    except TypeError:
+        raise TypeError(f"Date {date_value!r} must be a string.")
+    if isinstance(date_value, datetime):
+        s = date_value.date().isoformat()
+    elif isinstance(date_value, date):
+        s = date_value.isoformat()
+    else:
+        s = str(date_value).strip()
+    try:
+        datetime.strptime(s, "%Y-%m-%d")
     except ValueError as e:
-        raise ValueError(
-            f"week_ending_date {week_ending_date!r} is not a valid YYYY-MM-DD date."
-        ) from e
+        raise ValueError(f"Date {date_value!r} must be in the format YYYY-MM-DD.") from e
+    return s
 
 
 def _verify_parquet_file(parquet_file: Path) -> None:
@@ -497,3 +611,13 @@ def _verify_parquet_file(parquet_file: Path) -> None:
             "Run `python train_model.py` (or `model/train_marketshare_artifacts.py`) to generate them."
         )
     return parquet_file
+
+
+def _verify_mrelg_id(mrelg_id: str) -> pd.DataFrame:
+    """Verifies that the mrelg_id is a valid mrelg_id."""
+    with get_snowflake_connection() as sf:
+        query = load_sql(MRELG_METADATA_QUERY)
+        mrelg_metadata = sf.query(query.format(MRELG_ID=f"'{mrelg_id}'"))
+        if mrelg_metadata.empty:
+            raise ValueError(f"Invalid mrelg_id: {mrelg_id}")
+        return mrelg_metadata

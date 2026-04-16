@@ -141,5 +141,4 @@ def drop_table(table_name: str) -> None:
 
 
 if __name__ == "__main__":
-    
     update_sqlite_main()

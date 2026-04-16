@@ -9,9 +9,21 @@ import model_handler
 
 app = FastAPI(title="Tide Marketshare API", version="1.0.0")
 
+# TODO: Stop adding releases to model if older than 18 months
+
+
+@app.get("/")
+def root():
+    return {
+        "service": "Tide Marketshare API",
+        "health": "/health",
+        "docs": "/docs",
+    }
+
 
 @app.get("/health")
 def health():
+    
     return {"status": "ok"}
 
 
@@ -58,6 +70,15 @@ def create_release(body: ReleaseCreateBody):
         return {"release_id": int(rid)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/v1/releases/backfill")
+def backfill_releases():
+    try:
+        result = model_handler.backfill_releases()
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
