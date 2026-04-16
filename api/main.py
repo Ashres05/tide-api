@@ -158,19 +158,19 @@ def weekly_marketshare(week_ending_date: str | None = None):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/v1/data/refresh_artifacts")
-def refresh_artifacts():
-    try:
-        model_handler.refresh_artifacts()
-        return {"ok": True}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+# @app.get("/v1/data/refresh_artifacts")
+# def refresh_artifacts():
+#     try:
+#         model_handler.refresh_artifacts()
+#         return {"ok": True}
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/v1/data/refresh_current_data")
-def refresh_current_data():
-    try:
-        model_handler.refresh_current_data()
-        return {"ok": True}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+# @app.get("/v1/data/refresh_current_data")
+# def refresh_current_data():
+#     try:
+#         model_handler.refresh_current_data()
+#         return {"ok": True}
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))

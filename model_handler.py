@@ -362,6 +362,43 @@ def get_known_vols(
     return [float(x) for x in vals.to_list()]
 
 
+def get_known_component_vols(
+    release_id: int,
+) -> Dict[str, List[float]]:
+    """
+    Pull per-component weekly actuals for a release from SQLite, ordered by week end.
+    Returns {"streams": [...], "sales": [...], "songs": [...]}.
+    """
+    _verify_id(release_id)
+
+    sql = (
+        f"SELECT WEEK_ENDING_DATE, "
+        f"       STREAMING_EQUIVALENT, PRODUCT_SALES, SONG_SALE_EQUIVALENT "
+        f"FROM {MARKETSHARE_RELEASE_METRICS_TABLE} "
+        f"WHERE RELEASE_ID = ? "
+        f"ORDER BY date(WEEK_ENDING_DATE) ASC;"
+    )
+
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        df = pd.read_sql_query(sql, conn, params=(int(release_id),))
+
+    result: Dict[str, List[float]] = {"streams": [], "sales": [], "songs": []}
+    if df.empty:
+        return result
+
+    for col, key in [
+        ("STREAMING_EQUIVALENT", "streams"),
+        ("PRODUCT_SALES", "sales"),
+        ("SONG_SALE_EQUIVALENT", "songs"),
+    ]:
+        if col in df.columns:
+            vals = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+            vals = vals.replace([float("inf"), float("-inf")], 0.0)
+            result[key] = [float(x) for x in vals.to_list()]
+
+    return result
+
+
 def get_marketshare_actuals() -> pd.DataFrame:
     """
     Returns the year-to-date observed marketshare timeline from MARKETSHARE_YTD,
@@ -506,11 +543,16 @@ def _sqlite_row_to_release_map(row: sqlite3.Row) -> dict:
     rid = row["RELEASE_ID"] if "RELEASE_ID" in row.keys() else None
 
     known_vols: List[float] = []
+    component_vols: Dict[str, List[float]] = {"streams": [], "sales": [], "songs": []}
     if mrelg_id and rid is not None:
         try:
             known_vols = get_known_vols(int(rid))
         except Exception:
             known_vols = []
+        try:
+            component_vols = get_known_component_vols(int(rid))
+        except Exception:
+            component_vols = {"streams": [], "sales": [], "songs": []}
 
     rd = row["RELEASE_DATE"]
     date_str = rd if isinstance(rd, str) else str(rd)
@@ -523,12 +565,11 @@ def _sqlite_row_to_release_map(row: sqlite3.Row) -> dict:
                 f"Release {rid} has mrelg_id={mrelg_id!r} but no backfilled metrics yet "
                 "Ensure known_vols is populated."
             )
-        # Use peak week as fw_vol — known_vols[0] is often a partial week.
         fw_vol = float(max(known_vols)) if has_nonzero_known else expected_fw_vol
     else:
         fw_vol = expected_fw_vol
 
-    return {
+    release_map: dict = {
         "mrelg_id": mrelg_id or None,
         "name": artist or title or "Unknown",
         "artist": artist or "",
@@ -544,6 +585,15 @@ def _sqlite_row_to_release_map(row: sqlite3.Row) -> dict:
         "avg_historical_w1_product_ratio": float(row["AVG_HISTORICAL_W1_PRODUCT_RATIO"] or 0),
         "product_ratio_coefficient": float(row["PRODUCT_RATIO_COEFFICIENT"] or 0),
     }
+
+    if component_vols["streams"]:
+        release_map["known_streams"] = component_vols["streams"]
+    if component_vols["sales"]:
+        release_map["known_sales"] = component_vols["sales"]
+    if component_vols["songs"]:
+        release_map["known_songs"] = component_vols["songs"]
+
+    return release_map
 
 
 def _is_real_number(value: object) -> bool:

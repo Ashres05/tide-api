@@ -168,7 +168,10 @@ def generate_archetype_decay_curve(
         fw_songs = 0.0
 
     # Extract global tuning params
-    radius = float(release_dict.get("peak_sim_log_radius", 0.35))
+    radius_raw = release_dict.get("peak_sim_log_radius")
+    radius: Optional[float] = None
+    if radius_raw not in (None, ""):
+        radius = float(radius_raw)
     min_sub = int(release_dict.get("peak_sim_min_subset_releases", 10))
     log_std = float(release_dict.get("peak_sim_spread_threshold_log_std", 0.25))
     min_art = int(release_dict.get("peak_sim_min_artist_releases", 20))
@@ -177,6 +180,14 @@ def generate_archetype_decay_curve(
         stream_floor_override = float(stream_floor_override)
 
     def _get_curve(known, fw, artifacts, force_floor) -> List[float]:
+        sim_tuning_kwargs = {
+            "peak_sim_min_subset_releases": min_sub,
+            "peak_sim_spread_threshold_log_std": log_std,
+            "peak_sim_min_artist_releases": min_art,
+        }
+        if radius is not None:
+            sim_tuning_kwargs["peak_sim_log_radius"] = radius
+
         if not known and fw == 0:
             return [0.0] * num_weeks
         if known:
@@ -185,9 +196,8 @@ def generate_archetype_decay_curve(
                     artist=artist, genre=genre,
                     actuals_weekly_streams=np.array(known, dtype=float),
                     artifacts=artifacts, end_week=num_weeks,
-                    peak_sim_log_radius=radius, peak_sim_min_subset_releases=min_sub,
-                    peak_sim_spread_threshold_log_std=log_std, peak_sim_min_artist_releases=min_art,
-                    stream_floor=force_floor
+                    stream_floor=force_floor,
+                    **sim_tuning_kwargs,
                 )
                 return pred_df["pred_weekly_streams"].tolist()
             except Exception as e:
@@ -197,8 +207,7 @@ def generate_archetype_decay_curve(
             pred_df, _ = simulate_future_drop(
                 artist=artist, peak_volume=fw, peak_week=1.0, genre=genre,
                 artifacts=artifacts, stream_floor=force_floor,
-                peak_sim_log_radius=radius, peak_sim_min_subset_releases=min_sub,
-                peak_sim_spread_threshold_log_std=log_std, peak_sim_min_artist_releases=min_art,
+                **sim_tuning_kwargs,
             )
             return pred_df["pred_weekly_streams"].iloc[:num_weeks].tolist()
         except Exception as e:
