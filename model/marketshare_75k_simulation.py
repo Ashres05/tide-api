@@ -144,7 +144,7 @@ def generate_archetype_decay_curve(
     num_weeks: int = 52,
 ) -> List[float]:
     known_vols = release_dict.get("known_vols") or []
-    fw_vol = known_vols[0] if known_vols else release_dict.get("fw_vol", 0)
+    fw_vol = max(known_vols) if known_vols else release_dict.get("fw_vol", 0)
 
     artist_name = release_dict.get("name", "Unknown")
     fallback_cluster = release_dict.get("cluster", 0)
@@ -277,7 +277,7 @@ def run_archetype_scenario(
 
     def inject_volume(label_col: str, release_dict: dict, drop_date: Any, release_name: str) -> Optional[pd.DataFrame]:
         if release_dict.get("known_vols"):
-            fw_vol = release_dict["known_vols"][0]
+            fw_vol = max(release_dict["known_vols"])
         else:
             fw_vol = release_dict.get("fw_vol", 0)
         if pd.isna(drop_date) or not drop_date or fw_vol == 0:

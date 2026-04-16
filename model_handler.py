@@ -30,6 +30,7 @@ RELEASE_UPDATE_QUERY = "release_update.sql"
 RELEASE_DELETE_QUERY = "release_delete.sql"
 RELEASE_GET_QUERY = "release_get.sql"
 RELEASE_GET_ALL_QUERY = "release_get_all.sql"
+MARKETSHARE_ACTUALS_QUERY = "select_marketshare_actuals.sql"
 MRELG_METADATA_QUERY = "query_mrelg_id.sql"
 RELEASE_BACKFILL_QUERY = "query_release_backfill.sql"
 
@@ -354,6 +355,37 @@ def get_known_vols_from_sqlite(
     return [float(x) for x in vals.to_list()]
 
 
+def get_marketshare_actuals() -> pd.DataFrame:
+    """
+    Returns the year-to-date observed marketshare timeline from MARKETSHARE_YTD,
+    reshaped to match the unified_ytd schema. Rows tagged Data_Type='Actual'.
+    """
+    query = load_sql(MARKETSHARE_ACTUALS_QUERY)
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        df = pd.read_sql_query(query, conn)
+    if df.empty:
+        return pd.DataFrame(
+            columns=[
+                "Week Ending Date", "Owner", "Total_Market_AE_Volume",
+                "Active_Share", "Data_Type", "Unified_YTD_Share",
+                "YTD_Share_Upper", "YTD_Share_Lower",
+            ]
+        )
+    out = pd.DataFrame(
+        {
+            "Week Ending Date": df["WEEK_ENDING_DATE"].astype(str),
+            "Owner": df["LABEL_NAME"].astype(str),
+            "Total_Market_AE_Volume": pd.to_numeric(df["ALBUM_EQUIVALENT"], errors="coerce").fillna(0),
+            "Active_Share": pd.to_numeric(df["ALBUM_EQUIVALENT_SHARE"], errors="coerce").fillna(0),
+            "Data_Type": "Actual",
+            "Unified_YTD_Share": pd.to_numeric(df["ALBUM_EQUIVALENT_SHARE"], errors="coerce").fillna(0),
+        }
+    )
+    out["YTD_Share_Upper"] = out["Unified_YTD_Share"]
+    out["YTD_Share_Lower"] = out["Unified_YTD_Share"]
+    return out
+
+
 def get_marketshare_forecasts(week_ending_date: str | None = None) -> pd.DataFrame:
     """
     Takes in a week ending date and returns the marketshare forecasts for that week.
@@ -474,12 +506,13 @@ def _sqlite_row_to_release_map(row: sqlite3.Row) -> dict:
                 f"Release {rid} has mrelg_id={mrelg_id!r} but no backfilled metrics yet "
                 "Ensure known_vols is populated."
             )
-        # Prefer observed actuals when available; otherwise use expected.
-        fw_vol = float(known_vols[0]) if has_nonzero_known else expected_fw_vol
+        # Use peak week as fw_vol — known_vols[0] is often a partial week.
+        fw_vol = float(max(known_vols)) if has_nonzero_known else expected_fw_vol
     else:
         fw_vol = expected_fw_vol
 
     return {
+        "mrelg_id": mrelg_id or None,
         "name": artist or title or "Unknown",
         "artist": artist or "",
         "title": title or "",
