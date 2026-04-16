@@ -139,6 +139,13 @@ def weekly_release(release_id: int, week_ending_date: str | None = None):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/v1/marketshare/actuals")
+def actuals_marketshare():
+    try:
+        payload = model_handler.df_to_json(model_handler.get_marketshare_actuals())
+        return Response(content=payload, media_type="application/json")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/v1/marketshare/weekly")
 def weekly_marketshare(week_ending_date: str | None = None):

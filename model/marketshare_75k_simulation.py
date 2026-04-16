@@ -135,8 +135,6 @@ def _adjust_tail_weights_for_empirical_w2(
     return out
 
 
-from .all_data_archetypes_simulator_ae import simulate_future_drop, fit_backfill_forecast, SimulatorArtifacts
-
 def generate_archetype_decay_curve(
     release_dict: dict,
     artifacts_streams: SimulatorArtifacts,
@@ -147,7 +145,6 @@ def generate_archetype_decay_curve(
     artist = release_dict.get("name", release_dict.get("artist", "Unknown"))
     genre = release_dict.get("genre")
     
-    # 1. Extract explicit granular actuals (if provided in JSON)
     known_streams = release_dict.get("known_streams", [])
     known_sales = release_dict.get("known_sales", [])
     known_songs = release_dict.get("known_songs", [])
@@ -156,15 +153,14 @@ def generate_archetype_decay_curve(
     fw_sales = float(release_dict.get("fw_sales", 0.0))
     fw_songs = float(release_dict.get("fw_songs", 0.0))
     
-    # 2. Fallback: Split old Total AE inputs based on Product Ratio
-    known_vols = release_dict.get("known_vols", [])
-    fw_vol = float(release_dict.get("fw_vol", 0.0))
+    known_vols = release_dict.get("known_vols") or []
+    fw_vol = max(known_vols) if known_vols else float(release_dict.get("fw_vol", 0.0))
     prod_ratio = float(release_dict.get("avg_historical_w1_product_ratio", 0.0))
     
     if not known_streams and known_vols:
         known_streams = [v * (1.0 - prod_ratio) for v in known_vols]
         known_sales = [v * prod_ratio for v in known_vols]
-        known_songs = [0.0 for _ in known_vols] # Negligible for macro
+        known_songs = [0.0 for _ in known_vols]
         
     if fw_streams == 0 and fw_vol > 0:
         fw_streams = fw_vol * (1.0 - prod_ratio)
@@ -262,7 +258,7 @@ def run_archetype_scenario(
     df_tracker = pd.DataFrame({"Week Ending Date": tracker_dates})
 
     def inject_volume(label_col: str, release_dict: dict, drop_date: Any, release_name: str) -> Optional[pd.DataFrame]:
-        fw_vol = release_dict["known_vols"][0] if release_dict.get("known_vols") else release_dict.get("fw_vol", 0)
+        fw_vol = max(release_dict["known_vols"]) if release_dict.get("known_vols") else release_dict.get("fw_vol", 0)
         if pd.isna(drop_date) or not drop_date or fw_vol == 0:
             return None
             
