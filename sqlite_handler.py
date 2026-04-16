@@ -3,8 +3,6 @@ import sqlite3
 import pandas as pd
 
 # TODO: Add a cron job to run this script every week.
-# TODO: Verify that the script is working correctly, specifically the merging of the 
-#  marketshare_release_metrics_data with the expected_releases_data.
 
 # Database name
 DATABASE_NAME = 'marketshare_data.db'
@@ -25,6 +23,7 @@ EXPECTED_RELEASES_QUERY = 'release_get_all.sql'
 INSERT_WEEKLY_MARKETSHARE = 'insert_weekly_marketshare.sql'
 INSERT_YTD_MARKETSHARE = 'insert_ytd_marketshare.sql'
 INSERT_MARKETSHARE_RELEASE_METRICS = 'insert_marketshare_release_metrics.sql'
+
 
 def update_sqlite_main() -> None:
     """

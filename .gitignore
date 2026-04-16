@@ -11,5 +11,8 @@ secrets/
 artifacts_75k/
 archetypes_artifacts/
 
-# Ignore database
+# Ignore data
 marketshare_data.db
+*.csv
+*.parquet
+data/

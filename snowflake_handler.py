@@ -1,5 +1,5 @@
 # TODO: Make this a script that can be run automatically every day to update the data in 
-# Snowflake from the local SQLite database.
+# Snowflake from the local SQLite database. It will serve as a backup of the release data in SQLite.
 
 def update_snowflake_main() -> None:
     pass

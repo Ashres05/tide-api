@@ -33,24 +33,15 @@ from sklearn.linear_model import Ridge
 
 import lightgbm as lgb
 
-try:
-    from .marketshare_75k_simulation import (
-        ARCHETYPE_MULTIPLIERS,
-        DISTRIBUTIONS,
-        GLOBAL_PRODUCT_COEF,
-        PRODUCT_M52_PENALTY_CAP,
-        W2_RETENTION_BLEND_K,
-        dna_lookup_to_jsonable,
-    )
-except ImportError:
-    from marketshare_75k_simulation import (
-        ARCHETYPE_MULTIPLIERS,
-        DISTRIBUTIONS,
-        GLOBAL_PRODUCT_COEF,
-        PRODUCT_M52_PENALTY_CAP,
-        W2_RETENTION_BLEND_K,
-        dna_lookup_to_jsonable,
-    )
+from .marketshare_75k_simulation import (
+    ARCHETYPE_MULTIPLIERS,
+    DISTRIBUTIONS,
+    GLOBAL_PRODUCT_COEF,
+    #PRODUCT_M52_PENALTY_CAP,
+    W2_RETENTION_BLEND_K,
+    dna_lookup_to_jsonable,
+)
+from .all_data_archetypes_simulator_ae import train as train_archetype_model
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -196,7 +187,7 @@ def train_lgbm_prophet(df_model: pd.DataFrame) -> Tuple[lgb.LGBMRegressor, Dict[
         
     return production_lgbm, production_prophet_models
 
-def conformal_e90_2026(
+def conformal_e80_2026(
     df_model: pd.DataFrame,
     production_lgbm: lgb.LGBMRegressor,
     production_prophet_models: Dict[str, Any],
@@ -236,7 +227,7 @@ def conformal_e90_2026(
         return 0.82
         
     all_errors = pd.concat(ensemble_errors, ignore_index=True)
-    return float(np.percentile(all_errors, 90))
+    return float(np.percentile(all_errors, 80))
 
 
 def forecast_baseline_future(
@@ -729,7 +720,7 @@ def product_artist_profiles(product_csv: Path) -> Dict[str, float]:
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Train and export 75k marketshare artifacts.")
-    p.add_argument("--data-dir", type=Path, default=Path(__file__).resolve().parent / "data")
+    p.add_argument("--data-dir", type=Path, default=Path(__file__).resolve().parent / "Data")
     p.add_argument(
         "--full65-path",
         type=Path,
@@ -770,9 +761,9 @@ def main() -> None:
 
     df_model = prepare_df_model(wk_minus)
     production_lgbm, production_prophet_models = train_lgbm_prophet(df_model)
-    e90 = conformal_e90_2026(df_model, production_lgbm, production_prophet_models)
-    e_score = e90
-    logger.info("Conformal 90th percentile E: %.4f (used as E_score for YTD bands)", e_score)
+    e80 = conformal_e80_2026(df_model, production_lgbm, production_prophet_models)
+    e_score = e80
+    logger.info("Conformal 80th percentile E: %.4f (used as E_score for YTD bands)", e_score)
 
     future_label_df, future_market_volumes = forecast_baseline_future(
         df_model, production_lgbm, production_prophet_models, args.end_of_year
@@ -882,11 +873,11 @@ def main() -> None:
 
     meta = {
         "GLOBAL_PRODUCT_COEF": GLOBAL_PRODUCT_COEF,
-        "PRODUCT_M52_PENALTY_CAP": PRODUCT_M52_PENALTY_CAP,
+        #"PRODUCT_M52_PENALTY_CAP": PRODUCT_M52_PENALTY_CAP,
         "product_regression_target": args.product_regression_target,
         "W2_RETENTION_BLEND_K": W2_RETENTION_BLEND_K,
         "E_score": e_score,
-        "e90_conformal": e90,
+        "e80_conformal": e80,
         "forecast_year": args.forecast_year,
         "target_labels": TARGET_LABELS,
         "spike_features": spike_features,
@@ -896,6 +887,194 @@ def main() -> None:
         json.dump(meta, f, indent=2)
 
     logger.info("Wrote artifacts to %s", art_dir)
+
+
+def train_artifacts_main() -> None:
+    """
+    The main function from train_marketshare_artifacts.py without command line arguments to train marketshare artifacts.
+    Will create necessary parquets and JSON files for model artifacts.
+    """
+    # --- Hardcoded Configuration ---
+    base_path = Path(__file__).resolve().parent
+    data_dir = (base_path / "data").expanduser().resolve()
+    art_dir = (base_path / "artifacts_75k").expanduser().resolve()
+    full65_path = None  # Set to a Path object if you want a specific file, else defaults to data_dir / "full65+.csv"
+    end_of_year = "2026-12-31"
+    forecast_year = 2026
+    product_regression_target = "m52_multiplier"
+    product_regression_min_n = 25
+    product_ridge_alpha = 2.0
+    # -------------------------------
+    
+    art_dir.mkdir(parents=True, exist_ok=True)
+
+    a_list_wk = pd.read_csv(data_dir / "alist_75k.csv")
+    big_release_flag = pd.read_csv(data_dir / "bigreleaseflag_75k.csv")
+    weekly_amg_int = load_weekly_amg_int(data_dir)
+    wk_minus = build_wk_minus(weekly_amg_int, a_list_wk)
+
+    df_model = prepare_df_model(wk_minus)
+    production_lgbm, production_prophet_models = train_lgbm_prophet(df_model)
+    e80 = conformal_e80_2026(df_model, production_lgbm, production_prophet_models)
+    e_score = e80
+    logger.info("Conformal 80th percentile E: %.4f (used as E_score for YTD bands)", e_score)
+
+    future_label_df, future_market_volumes = forecast_baseline_future(
+        df_model, production_lgbm, production_prophet_models, end_of_year
+    )
+    final_forecast = pd.merge(future_label_df, future_market_volumes, on="Week Ending Date", how="inner")
+
+    df_2026_base = wk_minus[wk_minus["Week Ending Date"] >= "2026-01-08"].copy()
+    df_2026_base = df_2026_base[df_2026_base["Owner"].isin(TARGET_LABELS)].sort_values(
+        ["Owner", "Week Ending Date"]
+    ).reset_index(drop=True)
+    df_2026_base["Baseline_Weekly_Share"] = (
+        df_2026_base["AE_Volume"] / df_2026_base["Total_Market_AE_Volume"]
+    ) * 100
+    df_2026_base["Weighted_Numerator"] = df_2026_base["Baseline_Weekly_Share"] * df_2026_base["Total_Market_AE_Volume"]
+    df_2026_base["Cum_Numerator"] = df_2026_base.groupby("Owner")["Weighted_Numerator"].cumsum()
+    df_2026_base["Cum_Denominator"] = df_2026_base.groupby("Owner")["Total_Market_AE_Volume"].cumsum()
+    df_2026_base["Baseline_YTD_Share"] = df_2026_base["Cum_Numerator"] / df_2026_base["Cum_Denominator"]
+
+    last_actual_date = df_2026_base["Week Ending Date"].max()
+    ytd_bank = {}
+    for label in TARGET_LABELS:
+        latest_row = df_2026_base[
+            (df_2026_base["Owner"] == label) & (df_2026_base["Week Ending Date"] == last_actual_date)
+        ].iloc[0]
+        ytd_bank[label] = {
+            "Banked_Numerator": float(latest_row["Cum_Numerator"]),
+            "Banked_Denominator": float(latest_row["Cum_Denominator"]),
+            "Current_YTD_Share": float(latest_row["Baseline_YTD_Share"]),
+        }
+
+    ytd_projections = build_ytd_projections(df_2026_base, ytd_bank, final_forecast, e_score=e_score)
+
+    weekly_enriched = enrich_weekly_for_spike(weekly_amg_int, a_list_wk, big_release_flag, wk_minus)
+    spike_engine, df_full, spike_features = train_spike_and_df_full(weekly_enriched, ytd_projections)
+
+    # Market volume for future weeks (Prophet on total market) — reuse series from forecast_baseline_future
+    market_history = df_model[["Week Ending Date", "Total_Market_AE_Volume"]].drop_duplicates().sort_values(
+        "Week Ending Date"
+    )
+    market_prophet_train = market_history.rename(columns={"Week Ending Date": "ds", "Total_Market_AE_Volume": "y"})
+    market_model = Prophet(yearly_seasonality=3, weekly_seasonality=False, daily_seasonality=False)
+    market_model.fit(market_prophet_train.dropna())
+    last_date = pd.to_datetime(df_model["Week Ending Date"].max())
+    remaining_weeks = pd.date_range(
+        start=last_date + pd.Timedelta(days=7), end=pd.to_datetime(end_of_year), freq="W-THU"
+    )
+    full_fc = market_model.predict(pd.DataFrame({"ds": remaining_weeks}))
+    df_full = attach_total_market_volume(df_full, weekly_amg_int, full_fc[["ds", "yhat"]])
+
+    actuals_2026 = build_actuals_2026(weekly_amg_int)
+
+    full65 = (Path(full65_path).expanduser().resolve() if full65_path else data_dir / "full65+.csv")
+    artist_w2_retention: Dict[str, Dict[str, float]] = {}
+    project_to_cluster: Dict[str, int] = {}
+    mrelg_to_cluster: Dict[str, int] = {}
+    if full65.exists():
+        artist_dna_lookup, kmeans_model, project_to_cluster, mrelg_to_cluster = kmeans_and_dna(full65)
+        joblib.dump(kmeans_model, art_dir / "kmeans_archetype_75k.pkl")
+        artist_w2_retention = build_artist_w2_retention(full65)
+    else:
+        logger.warning("Missing %s — skipping K-Means / DNA (empty artist_dna_lookup)", full65)
+        artist_dna_lookup = {}
+
+    product_csv = data_dir / "product25k+_release_date.csv"
+    cluster_product_coef: Dict[int, float] = {}
+    cluster_product_meta: Dict[str, Any] = {}
+    if product_csv.exists():
+        artist_profile_dict = product_artist_profiles(product_csv)
+        if project_to_cluster or mrelg_to_cluster:
+            cluster_product_coef, cluster_product_meta = fit_cluster_product_coefficients(
+                product_csv,
+                project_to_cluster,
+                mrelg_to_cluster,
+                global_fallback=GLOBAL_PRODUCT_COEF,
+                target=product_regression_target,
+                min_cluster_n=product_regression_min_n,
+                ridge_alpha=product_ridge_alpha,
+            )
+        else:
+            logger.warning("No project_to_cluster map — skipping cluster product regression")
+    else:
+        logger.warning("Missing %s — artist_profile_dict empty", product_csv)
+        artist_profile_dict = {}
+
+    joblib.dump(production_lgbm, art_dir / "production_lgbm_75k.pkl")
+    joblib.dump(production_prophet_models, art_dir / "production_prophet_models_75k.pkl")
+    joblib.dump(spike_engine, art_dir / "production_spike_engine.pkl")
+
+    df_full.to_parquet(art_dir / "df_full.parquet", index=False)
+    actuals_2026.to_parquet(art_dir / "actuals_2026.parquet", index=False)
+
+    with open(art_dir / "artist_profile_dict.json", "w", encoding="utf-8") as f:
+        json.dump({str(k): float(v) for k, v in artist_profile_dict.items()}, f, indent=2)
+    with open(art_dir / "artist_dna_lookup.json", "w", encoding="utf-8") as f:
+        json.dump(dna_lookup_to_jsonable(artist_dna_lookup), f, indent=2)
+    with open(art_dir / "artist_w2_retention.json", "w", encoding="utf-8") as f:
+        json.dump({str(k): v for k, v in artist_w2_retention.items()}, f, indent=2)
+    with open(art_dir / "distributions.json", "w", encoding="utf-8") as f:
+        json.dump(DISTRIBUTIONS, f, indent=2)
+    if not cluster_product_coef:
+        cluster_product_coef = {c: float(GLOBAL_PRODUCT_COEF) for c in (0, 1, 2, 3)}
+    with open(art_dir / "cluster_product_coef.json", "w", encoding="utf-8") as f:
+        json.dump({str(k): float(v) for k, v in sorted(cluster_product_coef.items())}, f, indent=2)
+    if cluster_product_meta:
+        with open(art_dir / "cluster_product_regression.json", "w", encoding="utf-8") as f:
+            json.dump(cluster_product_meta, f, indent=2)
+
+    meta = {
+        "GLOBAL_PRODUCT_COEF": GLOBAL_PRODUCT_COEF,
+        #"PRODUCT_M52_PENALTY_CAP": PRODUCT_M52_PENALTY_CAP,
+        "product_regression_target": product_regression_target,
+        "W2_RETENTION_BLEND_K": W2_RETENTION_BLEND_K,
+        "E_score": e_score,
+        "e80_conformal": e80,
+        "forecast_year": forecast_year,
+        "target_labels": TARGET_LABELS,
+        "spike_features": spike_features,
+        "end_of_year": end_of_year,
+    }
+    with open(art_dir / "metadata.json", "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+    logger.info("Wrote artifacts to %s", art_dir)
+
+    # Train per-metric archetype decay models (streams / sales / songs).
+    # Each run reads the same parquet but trains on a different metric column,
+    # writing its artifacts to model/archetypes_artifacts/<metric_name>/.
+    parquet_path = data_dir / "streams_product_songs_ae_compressed.parquet"
+    if parquet_path.exists():
+        archetypes_base = base_path / "archetypes_artifacts"
+        for metric, subdir in [
+            ("streaming_equivalent", "streams"),
+            ("product_sales", "sales"),
+            ("song_sale_equivalent", "songs"),
+        ]:
+            out_dir = archetypes_base / subdir
+            logger.info("Training archetype decay model for metric=%s → %s", metric, out_dir)
+            archetype_args = argparse.Namespace(
+                parquet_path=str(parquet_path),
+                out_dir=str(out_dir),
+                metric=metric,
+                horizon_weeks=78,
+                n_clusters=4,
+                random_state=42,
+                kmeans_batch_size=2048,
+                max_tracks_for_features=None,
+                sanity_artist=None,
+                sanity_peak_volume=None,
+                sanity_peak_week=None,
+                sanity_genre=None,
+            )
+            train_archetype_model(archetype_args)
+        logger.info("Wrote archetype artifacts to %s", archetypes_base)
+    else:
+        logger.warning(
+            "Skipping archetype decay training — parquet not found: %s", parquet_path
+        )
 
 
 if __name__ == "__main__":

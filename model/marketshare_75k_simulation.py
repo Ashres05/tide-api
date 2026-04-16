@@ -17,18 +17,15 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-
+from .all_data_archetypes_simulator_ae import simulate_future_drop, fit_backfill_forecast, SimulatorArtifacts
 logger = logging.getLogger(__name__)
 
 # --- Static coefficients & tables (also persisted in artifacts) ---
 
 GLOBAL_PRODUCT_COEF = -0.61
 
-# Persisted in training metadata; bounds product-driven adjustment in M52 space (see notebook lineage).
-PRODUCT_M52_PENALTY_CAP = 1.0
-
 # When full65+ supplies median W2/W1 per artist, blend toward it; alpha = min(1, n_releases / K).
-W2_RETENTION_BLEND_K = 4.0
+W2_RETENTION_BLEND_K = 4.0 # 4 or more releases means we fully trust artist history and note archetype curve
 
 ARCHETYPE_MULTIPLIERS = {
     0: {"Bear": 3.35, "Base": 6.20, "Bull": 7.72},
@@ -138,264 +135,216 @@ def _adjust_tail_weights_for_empirical_w2(
     return out
 
 
+from .all_data_archetypes_simulator_ae import simulate_future_drop, fit_backfill_forecast, SimulatorArtifacts
+
 def generate_archetype_decay_curve(
     release_dict: dict,
-    artist_dna_lookup: Dict[str, Dict[Any, float]],
+    artifacts_streams: SimulatorArtifacts,
+    artifacts_sales: SimulatorArtifacts,
+    artifacts_songs: SimulatorArtifacts,
     num_weeks: int = 52,
 ) -> List[float]:
-    known_vols = release_dict.get("known_vols") or []
-    fw_vol = known_vols[0] if known_vols else release_dict.get("fw_vol", 0)
+    artist = release_dict.get("name", release_dict.get("artist", "Unknown"))
+    genre = release_dict.get("genre")
+    
+    # 1. Extract explicit granular actuals (if provided in JSON)
+    known_streams = release_dict.get("known_streams", [])
+    known_sales = release_dict.get("known_sales", [])
+    known_songs = release_dict.get("known_songs", [])
+    
+    fw_streams = float(release_dict.get("fw_streams", 0.0))
+    fw_sales = float(release_dict.get("fw_sales", 0.0))
+    fw_songs = float(release_dict.get("fw_songs", 0.0))
+    
+    # 2. Fallback: Split old Total AE inputs based on Product Ratio
+    known_vols = release_dict.get("known_vols", [])
+    fw_vol = float(release_dict.get("fw_vol", 0.0))
+    prod_ratio = float(release_dict.get("avg_historical_w1_product_ratio", 0.0))
+    
+    if not known_streams and known_vols:
+        known_streams = [v * (1.0 - prod_ratio) for v in known_vols]
+        known_sales = [v * prod_ratio for v in known_vols]
+        known_songs = [0.0 for _ in known_vols] # Negligible for macro
+        
+    if fw_streams == 0 and fw_vol > 0:
+        fw_streams = fw_vol * (1.0 - prod_ratio)
+        fw_sales = fw_vol * prod_ratio
+        fw_songs = 0.0
 
-    artist_name = release_dict.get("name", "Unknown")
-    fallback_cluster = release_dict.get("cluster", 0)
-    if isinstance(fallback_cluster, str) and not fallback_cluster.isdigit():
-        fallback_cluster = 0
-    else:
-        fallback_cluster = int(fallback_cluster) if fallback_cluster is not None else 0
+    # Extract global tuning params
+    radius = float(release_dict.get("peak_sim_log_radius", 0.35))
+    min_sub = int(release_dict.get("peak_sim_min_subset_releases", 10))
+    log_std = float(release_dict.get("peak_sim_spread_threshold_log_std", 0.25))
+    min_art = int(release_dict.get("peak_sim_min_artist_releases", 20))
+    stream_floor_override = release_dict.get("stream_floor", None)
+    if stream_floor_override is not None:
+        stream_floor_override = float(stream_floor_override)
 
-    weights = artist_dna_lookup.get(artist_name, {fallback_cluster: 1.0})
+    def _get_curve(known, fw, artifacts, force_floor) -> List[float]:
+        if not known and fw == 0:
+            return [0.0] * num_weeks
+        if known:
+            try:
+                pred_df, _ = fit_backfill_forecast(
+                    artist=artist, genre=genre,
+                    actuals_weekly_streams=np.array(known, dtype=float),
+                    artifacts=artifacts, end_week=num_weeks,
+                    peak_sim_log_radius=radius, peak_sim_min_subset_releases=min_sub,
+                    peak_sim_spread_threshold_log_std=log_std, peak_sim_min_artist_releases=min_art,
+                    stream_floor=force_floor
+                )
+                return pred_df["pred_weekly_streams"].tolist()
+            except Exception as e:
+                logger.warning(f"Backfill failed for {artist}: {e}. Falling back to day-0 sim.")
+                fw = float(known[0])
+        try:
+            pred_df, _ = simulate_future_drop(
+                artist=artist, peak_volume=fw, peak_week=1.0, genre=genre,
+                artifacts=artifacts, stream_floor=force_floor,
+                peak_sim_log_radius=radius, peak_sim_min_subset_releases=min_sub,
+                peak_sim_spread_threshold_log_std=log_std, peak_sim_min_artist_releases=min_art,
+            )
+            return pred_df["pred_weekly_streams"].iloc[:num_weeks].tolist()
+        except Exception as e:
+            logger.error(f"Simulation failed for {artist}: {e}. Returning zeros.")
+            return [0.0] * num_weeks
 
-    scenario = release_dict.get("scenario", "Base")
-    target_fy_vol = release_dict.get("fy_vol", None)
-    product_ratio = float(release_dict.get("avg_historical_w1_product_ratio", 0.0))
-    product_coef = float(release_dict.get("product_ratio_coefficient", GLOBAL_PRODUCT_COEF))
+    # 3. Generate the 3 component curves independently!
+    curve_streams = _get_curve(known_streams, fw_streams, artifacts_streams, force_floor=stream_floor_override)
+    curve_sales = _get_curve(known_sales, fw_sales, artifacts_sales, force_floor=0.0)
+    curve_songs = _get_curve(known_songs, fw_songs, artifacts_songs, force_floor=0.0)
+    
+    # 4. Stack them up
+    combined = [curve_streams[i] + curve_sales[i] + curve_songs[i] for i in range(num_weeks)]
 
-    if num_weeks <= 0:
-        return []
-    if fw_vol == 0:
-        return [0] * num_weeks
-
-    if target_fy_vol is not None and target_fy_vol > fw_vol:
-        total_tail_vol = float(target_fy_vol) - float(fw_vol)
-    else:
-        m52_sum = 0.0
-        for c_id, weight in weights.items():
-            cid = int(c_id) if not isinstance(c_id, str) or str(c_id).isdigit() else 0
-            m_val = ARCHETYPE_MULTIPLIERS.get(cid, ARCHETYPE_MULTIPLIERS[0]).get(scenario, 6.20)
-            m52_sum += m_val * float(weight)
-        dynamic_m52 = max(1.0, m52_sum + (product_ratio * product_coef))
-        total_tail_vol = float(fw_vol) * (dynamic_m52 - 1.0)
-
-    raw_curve = get_weighted_archetype_curve(weights, 52)
-    tail_raw = raw_curve[1:]
-    tw = tail_raw / tail_raw.sum()
-    tw = _adjust_tail_weights_for_empirical_w2(tw, total_tail_vol, float(fw_vol), release_dict)
-    weekly_tail_volumes = total_tail_vol * tw
-    theo_curve = [float(fw_vol)] + weekly_tail_volumes.tolist()
-
+    # 5. Boundary-aligned splice: use exact actuals for weeks 1..K, then
+    #    rescale the model forecast from week K+1 onward so that its level at
+    #    the boundary matches the last observed actual, preventing a jump.
     if known_vols:
-        k = len(known_vols)
-        if k >= num_weeks:
-            return [float(x) for x in known_vols[:num_weeks]]
-        last_known = float(known_vols[-1])
-        theo_equivalent = theo_curve[k - 1]
-        correction_ratio = last_known / theo_equivalent if theo_equivalent > 0 else 1.0
-        correction_ratio = min(max(correction_ratio, 0.5), 2.0)
-        remaining_theo = theo_curve[k:num_weeks]
-        smoothed_remaining = [vol * correction_ratio for vol in remaining_theo]
-        return [float(x) for x in known_vols] + smoothed_remaining
+        K = min(len(known_vols), len(combined))
+        if K > 0 and K < len(combined):
+            last_actual = float(known_vols[K - 1])
+            model_at_boundary = combined[K - 1]
+            if abs(model_at_boundary) > 1e-12:
+                scale = last_actual / model_at_boundary
+                for i in range(K, len(combined)):
+                    combined[i] = combined[i] * scale
+        for i in range(K):
+            combined[i] = float(known_vols[i])
 
-    return theo_curve[:num_weeks]
-
-
-def calibrate_mid_flight_release(
-    release_dict: dict,
-    anchor_date: pd.Timestamp,
-    artist_dna_lookup: Dict[str, Dict[Any, float]],
-) -> dict:
-    if "todate_vol" not in release_dict or release_dict.get("fw_vol", 0) == 0:
-        return release_dict
-
-    drop_date = pd.to_datetime(release_dict["date"])
-    if drop_date > anchor_date:
-        return release_dict
-
-    weeks_live = (anchor_date - drop_date).days // 7 + 1
-    if weeks_live <= 1 or release_dict["todate_vol"] <= release_dict["fw_vol"]:
-        return release_dict
-
-    fw_vol = release_dict["fw_vol"]
-    todate_vol = release_dict["todate_vol"]
-    artist_name = release_dict.get("name", "Unknown")
-
-    if artist_name in artist_dna_lookup:
-        weights = artist_dna_lookup[artist_name]
-        release_dict["cluster"] = "DNA Blend"
-    else:
-        assigned_cluster = release_dict.get("cluster")
-        if assigned_cluster is None or assigned_cluster == "Auto":
-            best_cluster = 0
-            min_error = float("inf")
-            for c in [0, 1, 2, 3]:
-                raw = get_weighted_archetype_curve({c: 1.0}, 52)
-                m52 = ARCHETYPE_MULTIPLIERS[c]["Base"]
-                theoretical_total_tail = fw_vol * (m52 - 1.0)
-                tail_weights = raw[1:] / raw[1:].sum()
-                pct_tail_completed = tail_weights[: (weeks_live - 1)].sum()
-                theoretical_todate = fw_vol + (theoretical_total_tail * pct_tail_completed)
-                error = abs(theoretical_todate - todate_vol)
-                if error < min_error:
-                    min_error = error
-                    best_cluster = c
-            assigned_cluster = best_cluster
-            release_dict["cluster"] = assigned_cluster
-            weights = {assigned_cluster: 1.0}
-        else:
-            weights = {int(assigned_cluster): 1.0}
-
-    raw_curve = get_weighted_archetype_curve(weights, 52)
-    tail_weights = raw_curve[1:] / raw_curve[1:].sum()
-    pct_tail_completed = tail_weights[: (weeks_live - 1)].sum()
-
-    if pct_tail_completed > 0:
-        actual_tail_to_date = todate_vol - fw_vol
-        projected_total_tail = actual_tail_to_date / pct_tail_completed
-        release_dict["fy_vol"] = fw_vol + projected_total_tail
-
-    return release_dict
-
+    return combined
 
 def run_archetype_scenario(
     release_calendar: List[dict],
     df_full: pd.DataFrame,
     actuals_2026: pd.DataFrame,
-    artist_dna_lookup: Dict[str, Dict[Any, float]],
+    #artifacts: SimulatorArtifacts, 
+    artifacts_streams: SimulatorArtifacts, 
+    artifacts_sales: SimulatorArtifacts,   
+    artifacts_songs: SimulatorArtifacts,
     e_score: float = 0.8,
-    volume_threshold: float = 20000,
+    volume_threshold: float = 75000,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    
     max_hist_date = actuals_2026["Week Ending Date"].max()
     fut_sim = df_full[
         (df_full["Week Ending Date"] > max_hist_date) & (df_full["Week Ending Date"].dt.year == 2026)
     ].copy()
     fut_dates = fut_sim["Week Ending Date"].sort_values().unique()
 
-    fut_sim["Injected_AMG"] = 0.0
-    fut_sim["Injected_Int"] = 0.0
-    fut_sim["Injected_Oth"] = 0.0
+    # --- NEW: Create a separate timeline for the frontend tracker ---
+    tracker_dates = df_full[df_full["Week Ending Date"].dt.year == 2026]["Week Ending Date"].sort_values().unique()
 
-    df_tracker = pd.DataFrame({"Week Ending Date": fut_dates})
+    for col in ["Injected_AMG", "Injected_Int", "Injected_Oth"]:
+        fut_sim[col] = 0.0
+
+    # --- UPDATE: Assign the full year to the tracker ---
+    df_tracker = pd.DataFrame({"Week Ending Date": tracker_dates})
 
     def inject_volume(label_col: str, release_dict: dict, drop_date: Any, release_name: str) -> Optional[pd.DataFrame]:
-        if release_dict.get("known_vols"):
-            fw_vol = release_dict["known_vols"][0]
-        else:
-            fw_vol = release_dict.get("fw_vol", 0)
+        fw_vol = release_dict["known_vols"][0] if release_dict.get("known_vols") else release_dict.get("fw_vol", 0)
         if pd.isna(drop_date) or not drop_date or fw_vol == 0:
             return None
+            
         req_date = pd.to_datetime(drop_date)
-        full_curve = generate_archetype_decay_curve(release_dict, artist_dna_lookup, 52)
+        full_curve = generate_archetype_decay_curve(
+            release, 
+            artifacts_streams, 
+            artifacts_sales, 
+            artifacts_songs, 
+            52
+        )
+        
         temp_curve_rows = []
-        for current_date in fut_dates:
+        # --- UPDATE: Loop through the full year instead of just the future ---
+        for current_date in tracker_dates:
             days_since = (current_date - req_date).days
             if 0 <= days_since < 364:
                 week_idx = days_since // 7
                 if week_idx < len(full_curve):
                     weekly_vol = full_curve[week_idx]
                     temp_curve_rows.append({"Week Ending Date": current_date, release_name: weekly_vol})
-                    if weekly_vol >= volume_threshold:
+                    
+                    # --- UPDATE: Only inject into marketshare if the date is in the future! ---
+                    if weekly_vol >= volume_threshold and current_date > max_hist_date:
                         mask = fut_sim["Week Ending Date"] == current_date
                         fut_sim.loc[mask, label_col] += weekly_vol
-        if temp_curve_rows:
-            return pd.DataFrame(temp_curve_rows)
-        return None
+        return pd.DataFrame(temp_curve_rows) if temp_curve_rows else None
 
-    cluster_names = {
-        0: "Standard",
-        1: "Burnout",
-        2: "Supernova",
-        3: "Sticky",
-        "Auto": "Auto",
-        "DNA Blend": "DNA Blend",
-    }
+    volume_report_data = []
+    end_of_year_date = tracker_dates.max()
+
     volume_report_data = []
     end_of_year_date = fut_dates.max()
-    anchor_date = actuals_2026["Week Ending Date"].max()
 
-    for i, raw_release in enumerate(release_calendar):
-        release = calibrate_mid_flight_release(raw_release, anchor_date, artist_dna_lookup)
-        if release["label"] == "Atlantic Music Group":
-            target_col = "Injected_AMG"
-        elif release["label"] == "Interscope/Geffen/A&M":
-            target_col = "Injected_Int"
-        else:
-            target_col = "Injected_Oth"
-
-        cluster_id = release.get("cluster")
-        if cluster_id is None or cluster_id == "Auto":
-            cluster_id = get_inferred_cluster(release)
-            release["cluster"] = cluster_id
-
-        genre_name = release.get("genre", "Unknown Genre")
-        cluster_desc = cluster_names.get(cluster_id, str(cluster_id))
+    for i, release in enumerate(release_calendar):
+        lbl = release.get("label", "")
+        target_col = "Injected_AMG" if lbl == "Atlantic Music Group" else "Injected_Int" if lbl == "Interscope/Geffen/A&M" else "Injected_Oth"
+        
         release_name = release.get("name", f"Release_{i+1}")
-        logger.info(
-            "Injecting: %s | %s | %s | Cluster: %s",
-            release_name,
-            release["label"],
-            genre_name,
-            cluster_desc,
-        )
+        logger.info(f"Injecting: {release_name} | {lbl} | {release.get('genre', 'Unknown Genre')}")
 
-        artist_curve = inject_volume(target_col, release, release["date"], release_name)
-        full_curve = generate_archetype_decay_curve(release, artist_dna_lookup, 52)
-        drop_dt = pd.to_datetime(release["date"])
-        if drop_dt <= end_of_year_date:
-            weeks_active = (end_of_year_date - drop_dt).days // 7 + 1
-            weeks_active = min(max(0, weeks_active), 52)
-            cy_total = sum(full_curve[:weeks_active])
-        else:
-            cy_total = 0
-        volume_report_data.append(
-            {
-                "Artist / Release": release_name,
-                "Drop Date": release["date"],
-                "Cluster": cluster_desc,
-                "2026 CY Volume": cy_total,
-            }
+        artist_curve = inject_volume(target_col, release, release.get("date"), release_name)
+        full_curve = generate_archetype_decay_curve(
+            release, 
+            artifacts_streams, 
+            artifacts_sales, 
+            artifacts_songs, 
+            52
         )
+        
+        drop_dt = pd.to_datetime(release.get("date"))
+        cy_total = 0
+        if drop_dt <= end_of_year_date:
+            weeks_active = min(max(0, (end_of_year_date - drop_dt).days // 7 + 1), 52)
+            cy_total = sum(full_curve[:weeks_active])
+            
+        volume_report_data.append({
+            "Artist / Release": release_name,
+            "Drop Date": release.get("date"),
+            "Cluster": "Dynamic Mixture", 
+            "2026 CY Volume": cy_total,
+        })
         if artist_curve is not None:
             df_tracker = df_tracker.merge(artist_curve, on="Week Ending Date", how="left")
 
     df_tracker = df_tracker.fillna(0)
 
-    fut_sim["Sim_Total_Market_AE_Volume"] = (
-        fut_sim["Total_Market_AE_Volume"]
-        + fut_sim["Injected_AMG"]
-        + fut_sim["Injected_Int"]
-        + fut_sim["Injected_Oth"]
-    )
+    # --- Marketshare Calculations (Untouched) ---
+    fut_sim["Sim_Total_Market_AE_Volume"] = fut_sim["Total_Market_AE_Volume"] + fut_sim["Injected_AMG"] + fut_sim["Injected_Int"] + fut_sim["Injected_Oth"]
     fut_sim["Base_Num"] = fut_sim["Predicted_Baseline_Share"] * fut_sim["Total_Market_AE_Volume"]
-    fut_sim["Sim_AMG_Num"] = np.where(
-        fut_sim["Owner"] == "Atlantic Music Group",
-        fut_sim["Base_Num"] + (fut_sim["Injected_AMG"] * 100),
-        fut_sim["Base_Num"],
-    )
-    fut_sim["Sim_Int_Num"] = np.where(
-        fut_sim["Owner"] == "Interscope/Geffen/A&M",
-        fut_sim["Base_Num"] + (fut_sim["Injected_Int"] * 100),
-        fut_sim["Base_Num"],
-    )
-    fut_sim["Active_Share"] = np.where(
-        fut_sim["Owner"] == "Atlantic Music Group",
-        fut_sim["Sim_AMG_Num"] / fut_sim["Sim_Total_Market_AE_Volume"],
-        fut_sim["Sim_Int_Num"] / fut_sim["Sim_Total_Market_AE_Volume"],
-    )
-    fut_sim = fut_sim.drop(columns=["Total_Market_AE_Volume"]).rename(
-        columns={"Sim_Total_Market_AE_Volume": "Total_Market_AE_Volume"}
-    )
+    fut_sim["Sim_AMG_Num"] = np.where(fut_sim["Owner"] == "Atlantic Music Group", fut_sim["Base_Num"] + (fut_sim["Injected_AMG"] * 100), fut_sim["Base_Num"])
+    fut_sim["Sim_Int_Num"] = np.where(fut_sim["Owner"] == "Interscope/Geffen/A&M", fut_sim["Base_Num"] + (fut_sim["Injected_Int"] * 100), fut_sim["Base_Num"])
+    fut_sim["Active_Share"] = np.where(fut_sim["Owner"] == "Atlantic Music Group", fut_sim["Sim_AMG_Num"] / fut_sim["Sim_Total_Market_AE_Volume"], fut_sim["Sim_Int_Num"] / fut_sim["Sim_Total_Market_AE_Volume"])
+    
+    fut_sim = fut_sim.drop(columns=["Total_Market_AE_Volume"]).rename(columns={"Sim_Total_Market_AE_Volume": "Total_Market_AE_Volume"})
     fut_sim["Data_Type"] = "Forecast"
 
-    hist_stack = actuals_2026[
-        ["Week Ending Date", "Owner", "Total_Market_AE_Volume", "AE_Share"]
-    ].copy().rename(columns={"AE_Share": "Active_Share"})
+    hist_stack = actuals_2026[["Week Ending Date", "Owner", "Total_Market_AE_Volume", "AE_Share"]].copy().rename(columns={"AE_Share": "Active_Share"})
     hist_stack["Data_Type"] = "Actual"
-    # Duplicate label×week rows (often from merged CSVs) double-count in cumulative YTD and zig-zag the chart.
-    hist_stack = hist_stack.drop_duplicates(
-        subset=["Owner", "Week Ending Date", "Data_Type"], keep="last"
-    )
+    hist_stack = hist_stack.drop_duplicates(subset=["Owner", "Week Ending Date", "Data_Type"], keep="last")
 
-    common_cols = ["Week Ending Date", "Owner", "Total_Market_AE_Volume", "Active_Share", "Data_Type"]
-    df_unified = pd.concat([hist_stack, fut_sim[common_cols]], ignore_index=True)
+    df_unified = pd.concat([hist_stack, fut_sim[["Week Ending Date", "Owner", "Total_Market_AE_Volume", "Active_Share", "Data_Type"]]], ignore_index=True)
     df_unified = df_unified.sort_values(by=["Owner", "Week Ending Date"]).reset_index(drop=True)
 
     df_unified["Weighted_Numerator"] = df_unified["Active_Share"] * df_unified["Total_Market_AE_Volume"]
@@ -404,19 +353,10 @@ def run_archetype_scenario(
     df_unified["Unified_YTD_Share"] = (df_unified["Cum_Numerator"] / df_unified["Cum_Denominator"]).round(4)
     df_unified["YTD_Share_Upper"] = df_unified["Unified_YTD_Share"]
     df_unified["YTD_Share_Lower"] = df_unified["Unified_YTD_Share"]
+    
     forecast_mask = df_unified["Data_Type"] == "Forecast"
-    df_unified.loc[forecast_mask, "YTD_Share_Upper"] = (
-        df_unified.loc[forecast_mask, "Unified_YTD_Share"] + e_score
-    )
-    df_unified.loc[forecast_mask, "YTD_Share_Lower"] = (
-        df_unified.loc[forecast_mask, "Unified_YTD_Share"] - e_score
-    )
-
-    if release_calendar:
-        volume_report = pd.DataFrame(volume_report_data).sort_values(
-            by="2026 CY Volume", ascending=False
-        ).reset_index(drop=True)
-        logger.info("Injected release volume report:\n%s", volume_report.to_string())
+    df_unified.loc[forecast_mask, "YTD_Share_Upper"] = df_unified.loc[forecast_mask, "Unified_YTD_Share"] + e_score
+    df_unified.loc[forecast_mask, "YTD_Share_Lower"] = df_unified.loc[forecast_mask, "Unified_YTD_Share"] - e_score
 
     return df_unified, df_tracker
 
@@ -458,15 +398,18 @@ def auto_enrich_w2_retention(
 def auto_enrich_calendar(
     release_calendar: List[dict],
     profile_dict: Dict[str, float],
-    global_coef: float,
     match_threshold: float = 0.8,
 ) -> List[dict]:
+    """
+    Fuzzy-match artist names to attach avg_historical_w1_product_ratio from profile_dict.
+
+    Does not set product_ratio_coefficient; that comes from per-release overrides or
+    cluster_product_coef / GLOBAL_PRODUCT_COEF in generate_archetype_decay_curve.
+    """
     enriched: List[dict] = []
     known_artists = list(profile_dict.keys())
     for release in release_calendar:
         enriched_release = dict(release)
-        if "product_ratio_coefficient" not in enriched_release:
-            enriched_release["product_ratio_coefficient"] = global_coef
         if "avg_historical_w1_product_ratio" in enriched_release:
             enriched.append(enriched_release)
             continue
@@ -480,6 +423,18 @@ def auto_enrich_calendar(
             enriched_release["avg_historical_w1_product_ratio"] = 0.0
         enriched.append(enriched_release)
     return enriched
+
+
+def cluster_product_coef_from_jsonable(d: Dict[str, Any]) -> Dict[int, float]:
+    """Restore cluster -> coefficient from JSON (string keys from json.dump)."""
+
+    def _cluster_key(k: Any) -> int:
+        if isinstance(k, int):
+            return k
+        s = str(k).strip()
+        return int(float(s)) if "." in s else int(s)
+
+    return {_cluster_key(k): float(v) for k, v in d.items()}
 
 
 def dna_lookup_to_jsonable(d: Dict[str, Dict[Any, float]]) -> Dict[str, Dict[str, float]]:

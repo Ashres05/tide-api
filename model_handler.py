@@ -1,7 +1,4 @@
-# TODO: Create CRUD endpoints for the Tide API.
-# TODO: Upload API to EC2 instance.
 from __future__ import annotations
-
 import json
 import math
 import numbers
@@ -10,7 +7,6 @@ from datetime import datetime, date
 from pathlib import Path
 from typing import Any, Dict, List
 import pandas as pd
-
 from sqlite_handler import DATABASE_NAME
 from model.marketshare_75k_simulation import DISTRIBUTIONS
 from snowflake_conn import load_sql
@@ -18,8 +14,17 @@ from model.forecast_engine_server import ForecastEngine
 from sqlite_handler import update_sqlite_main
 from snowflake_conn import get_snowflake_connection
 
+# TODO: Upload API to EC2 instance.
+# TODO: Make delete_release() function delete all release data from SQLite.
+
 # Default training output: model/train_marketshare_artifacts.py writes here (not repo-root artifacts_75k).
 ARTIFACTS_DIR = Path(__file__).resolve().parent / "model" / "artifacts_75k"
+
+# Archetype decay artifact dirs — written by train_model.py via all_data_archetypes_simulator_ae.train().
+_ARCHETYPES_BASE = Path(__file__).resolve().parent / "model" / "archetypes_artifacts"
+ARCHETYPES_STREAMS_DIR = _ARCHETYPES_BASE / "streams"
+ARCHETYPES_SALES_DIR   = _ARCHETYPES_BASE / "sales"
+ARCHETYPES_SONGS_DIR   = _ARCHETYPES_BASE / "songs"
 
 # SQLite table name for observed per-release metrics (populated by sqlite_handler.py)
 MARKETSHARE_RELEASE_METRICS_TABLE = "MARKETSHARE_RELEASE_METRICS"
@@ -136,6 +141,7 @@ def _create_backfilled_release(
     genre = mrelg_metadata["GENRE"].iloc[0]
 
     # Temporary adjustment to genres to ensure they are in the distribution.
+    # TODO: Remove this once the right genres are in query_mrelg_id.sql
     genre_aliases = {
         "Alt. Rock": "Rock",
         "R&B": "R&B/Hip-Hop",
@@ -330,7 +336,7 @@ def get_all_releases_series_json() -> str:
     return json.dumps(get_all_releases())
 
 
-def get_known_vols_from_sqlite(
+def get_known_vols(
     release_id: int,
 ) -> List[float]:
     """
@@ -338,6 +344,7 @@ def get_known_vols_from_sqlite(
     """
     _verify_id(release_id)
 
+    # TODO: Replace with query_known_vols_sqlite.sql, not a priority.
     sql = (
         f"SELECT WEEK_ENDING_DATE, ALBUM_EQUIVALENT "
         f"FROM {MARKETSHARE_RELEASE_METRICS_TABLE} "
@@ -370,7 +377,12 @@ def get_marketshare_forecasts(week_ending_date: str | None = None) -> pd.DataFra
     _verify_parquet_file(df_full)
 
     # Simulate the releases and return the marketshare forecasts for the week ending date.
-    forecasts = ForecastEngine(artifacts_dir=ARTIFACTS_DIR).simulate(releases)
+    forecasts = ForecastEngine(
+        artifacts_dir=ARTIFACTS_DIR,
+        streams_dir=ARCHETYPES_STREAMS_DIR,
+        sales_dir=ARCHETYPES_SALES_DIR,
+        songs_dir=ARCHETYPES_SONGS_DIR,
+    ).simulate(releases)
     unified_ytd = pd.DataFrame(forecasts["unified_ytd"])
     if unified_ytd.empty:
         return unified_ytd
@@ -398,7 +410,12 @@ def get_release_forecasts(id: int, week_ending_date: str | None = None) -> pd.Da
     _verify_parquet_file(df_full)
 
     # Simulate the release and return the forecasts for the week ending date.
-    forecasts = ForecastEngine(artifacts_dir=ARTIFACTS_DIR).simulate([release])
+    forecasts = ForecastEngine(
+        artifacts_dir=ARTIFACTS_DIR,
+        streams_dir=ARCHETYPES_STREAMS_DIR,
+        sales_dir=ARCHETYPES_SALES_DIR,
+        songs_dir=ARCHETYPES_SONGS_DIR,
+    ).simulate([release])
     weekly_injections = pd.DataFrame(forecasts["weekly_injections"])
     if weekly_injections.empty:
         return weekly_injections
@@ -459,7 +476,7 @@ def _sqlite_row_to_release_map(row: sqlite3.Row) -> dict:
     known_vols: List[float] = []
     if mrelg_id and rid is not None:
         try:
-            known_vols = get_known_vols_from_sqlite(int(rid))
+            known_vols = get_known_vols(int(rid))
         except Exception:
             known_vols = []
 

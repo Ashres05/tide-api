@@ -1,16 +1,22 @@
 from __future__ import annotations
-
-import json
+import sys
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Response, status
 from pydantic import BaseModel, Field
 
-import model_handler
+try:
+    import model_handler
+except ModuleNotFoundError:
+    # Allow direct execution via `python api/main.py` by adding the repo root.
+    repo_root = Path(__file__).resolve().parents[1]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    import model_handler
 
 app = FastAPI(title="Tide Marketshare API", version="1.0.0")
 
-# TODO: Stop adding releases to model if older than 18 months
-
+# TODO: Stop adding release data to model if older than 18 months
 
 @app.get("/")
 def root():
@@ -133,6 +139,7 @@ def weekly_release(release_id: int, week_ending_date: str | None = None):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/v1/marketshare/weekly")
 def weekly_marketshare(week_ending_date: str | None = None):
     try:
@@ -144,15 +151,19 @@ def weekly_marketshare(week_ending_date: str | None = None):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# @app.get("/v1/releases/{release_id}/series")
-# def weekly_series(release_id: int):
-#     """
-#     Convenience endpoint returning parallel arrays for decay + label marketshare.
-#     """
-#     try:
-#         payload = model_handler.get_release_weekly_decay_and_marketshare_json(release_id)
-#         return Response(content=json.dumps(payload), media_type="application/json")
-#     except ValueError as e:
-#         raise HTTPException(status_code=400, detail=str(e))
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
+@app.get("/v1/data/refresh_artifacts")
+def refresh_artifacts():
+    try:
+        model_handler.refresh_artifacts()
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v1/data/refresh_current_data")
+def refresh_current_data():
+    try:
+        model_handler.refresh_current_data()
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

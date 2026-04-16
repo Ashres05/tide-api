@@ -37,18 +37,21 @@ from urllib.parse import urlparse
 import pandas as pd
 
 try:
+    from .all_data_archetypes_simulator_ae import load_artifacts, SimulatorArtifacts
     from .marketshare_75k_simulation import (
-        GLOBAL_PRODUCT_COEF,
         auto_enrich_calendar,
         auto_enrich_w2_retention,
+        cluster_product_coef_from_jsonable,
         dna_lookup_from_jsonable,
         run_archetype_scenario,
     )
 except ImportError:
+    # Support direct script execution from within the `model` directory.
+    from all_data_archetypes_simulator_ae import load_artifacts, SimulatorArtifacts
     from marketshare_75k_simulation import (
-        GLOBAL_PRODUCT_COEF,
         auto_enrich_calendar,
         auto_enrich_w2_retention,
+        cluster_product_coef_from_jsonable,
         dna_lookup_from_jsonable,
         run_archetype_scenario,
     )
@@ -66,14 +69,13 @@ def _df_to_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
 
 
 class ForecastEngine:
-    def __init__(self, artifacts_dir: Path):
+    def __init__(self, artifacts_dir: Path, streams_dir: Path, sales_dir: Path, songs_dir: Path):
         self.artifacts_dir = Path(artifacts_dir).expanduser().resolve()
+        self.streams_dir = Path(streams_dir).expanduser().resolve()
+        self.sales_dir = Path(sales_dir).expanduser().resolve()
+        self.songs_dir = Path(songs_dir).expanduser().resolve()
         self.df_full: pd.DataFrame = pd.DataFrame()
         self.actuals_2026: pd.DataFrame = pd.DataFrame()
-        self.artist_dna_lookup: Dict[str, Dict[int, float]] = {}
-        self.artist_profile_dict: Dict[str, float] = {}
-        self.artist_w2_retention: Dict[str, Dict[str, Any]] = {}
-        self.metadata: Dict[str, Any] = {}
         self.e_score_default: float = 0.82
         self._load()
 
@@ -87,69 +89,29 @@ class ForecastEngine:
             if col in self.actuals_2026.columns:
                 self.actuals_2026[col] = pd.to_datetime(self.actuals_2026[col])
 
-        dna_path = d / "artist_dna_lookup.json"
-        if dna_path.exists():
-            with open(dna_path, encoding="utf-8") as f:
-                self.artist_dna_lookup = dna_lookup_from_jsonable(json.load(f))
-
-        prof_path = d / "artist_profile_dict.json"
-        if prof_path.exists():
-            with open(prof_path, encoding="utf-8") as f:
-                raw = json.load(f)
-                self.artist_profile_dict = {str(k): float(v) for k, v in raw.items()}
-
-        w2_path = d / "artist_w2_retention.json"
-        if w2_path.exists():
-            with open(w2_path, encoding="utf-8") as f:
-                self.artist_w2_retention = {str(k): v for k, v in json.load(f).items()}
+        # Load all 3 decay engines!
+        self.artifacts_streams = load_artifacts(str(self.streams_dir))
+        self.artifacts_sales = load_artifacts(str(self.sales_dir))
+        self.artifacts_songs = load_artifacts(str(self.songs_dir))
 
         meta_path = d / "metadata.json"
         if meta_path.exists():
             with open(meta_path, encoding="utf-8") as f:
-                self.metadata = json.load(f)
-                self.e_score_default = float(self.metadata.get("E_score", self.e_score_default))
+                self.e_score_default = float(json.load(f).get("E_score", self.e_score_default))
 
-        logger.info(
-            "Loaded artifacts from %s (df_full %s rows, actuals %s rows)",
-            d,
-            len(self.df_full),
-            len(self.actuals_2026),
-        )
-
-    def simulate(
-        self,
-        release_calendar: List[dict],
-        e_score: Optional[float] = None,
-        volume_threshold: float = 20000,
-        enrich_product_ratios: bool = True,
-        enrich_w2_retention: bool = True,
-    ) -> Dict[str, Any]:
+    def simulate(self, release_calendar: List[dict], e_score: Optional[float] = None, volume_threshold: float = 20000, **kwargs):
         es = float(e_score) if e_score is not None else self.e_score_default
         cal = [dict(x) for x in release_calendar]
 
-        if enrich_product_ratios and self.artist_profile_dict:
-            cal = auto_enrich_calendar(
-                cal,
-                profile_dict=self.artist_profile_dict,
-                global_coef=float(self.metadata.get("GLOBAL_PRODUCT_COEF", GLOBAL_PRODUCT_COEF)),
-            )
-
-        if enrich_w2_retention and self.artist_w2_retention:
-            cal = auto_enrich_w2_retention(cal, self.artist_w2_retention)
-
         df_out, tracker = run_archetype_scenario(
-            cal,
-            self.df_full,
-            self.actuals_2026,
-            self.artist_dna_lookup,
-            e_score=es,
-            volume_threshold=volume_threshold,
+            cal, self.df_full, self.actuals_2026,
+            self.artifacts_streams, self.artifacts_sales, self.artifacts_songs,
+            e_score=es, volume_threshold=volume_threshold,
         )
         return {
             "unified_ytd": _df_to_records(df_out),
             "weekly_injections": _df_to_records(tracker),
         }
-
 
 def make_handler(engine: ForecastEngine):
     class Handler(BaseHTTPRequestHandler):
@@ -219,7 +181,7 @@ def main() -> None:
         type=Path,
         default=Path(__file__).resolve().parent / "artifacts_75k",
     )
-    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--decay-artifacts-dir", type=Path, default=Path(__file__).resolve().parent / "archetypes_artifacts" / "streams") 
     ap.add_argument("--port", type=int, default=8765)
     args = ap.parse_args()
 
