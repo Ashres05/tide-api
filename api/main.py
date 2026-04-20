@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import sys
 from pathlib import Path
 
@@ -43,6 +44,9 @@ class ReleaseCreateBody(BaseModel):
     scenario: str
     known_vols: list[float] = Field(default_factory=list)
     fw_vol: float = 0.0
+    fw_streams: float = 0.0
+    fw_songs: float = 0.0
+    fw_sales: float = 0.0
     fy_vol: float = 0.0
     avg_historical_w1_product_ratio: float = 0.3
     product_ratio_coefficient: float = 0.3

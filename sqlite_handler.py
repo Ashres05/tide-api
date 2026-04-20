@@ -7,6 +7,37 @@ import pandas as pd
 # Database name
 DATABASE_NAME = 'marketshare_data.db'
 
+
+def ensure_expected_releases_fw_columns(conn: sqlite3.Connection) -> None:
+    """
+    Add first-week component AE columns if missing (older DBs pre-date UI breakdown).
+    Safe to call on every connection; no-op when columns already exist.
+
+    Uses try/ignore duplicate so concurrent callers or a schema already updated by
+    CREATE TABLE do not raise sqlite3.OperationalError.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='EXPECTED_RELEASES'"
+    )
+    if cur.fetchone() is None:
+        return
+    for col, ddl in (
+        ("FW_STREAMS", "REAL NOT NULL DEFAULT 0"),
+        ("FW_SONGS", "REAL NOT NULL DEFAULT 0"),
+        ("FW_SALES", "REAL NOT NULL DEFAULT 0"),
+    ):
+        cur.execute("PRAGMA table_info(EXPECTED_RELEASES)")
+        existing = {row[1] for row in cur.fetchall()}
+        if col in existing:
+            continue
+        try:
+            cur.execute(f"ALTER TABLE EXPECTED_RELEASES ADD COLUMN {col} {ddl}")
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                raise
+
+
 # Create table queries
 CREATE_EXPECTED_RELEASES_TABLE = 'create_expected_releases_table.sql'
 CREATE_MARKETSHARE_RELEASE_METRICS_TABLE = 'create_marketshare_release_metrics.sql'
@@ -37,6 +68,7 @@ def update_sqlite_main() -> None:
 
     # Create tables
     cursor.execute(load_sql(CREATE_EXPECTED_RELEASES_TABLE))
+    ensure_expected_releases_fw_columns(sqlite_conn)
     cursor.execute(load_sql(CREATE_WEEKLY_MARKETSHARE_TABLE))
     cursor.execute(load_sql(CREATE_YTD_MARKETSHARE_TABLE))
     cursor.execute(load_sql(CREATE_MARKETSHARE_RELEASE_METRICS_TABLE))

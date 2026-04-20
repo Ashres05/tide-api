@@ -7,7 +7,7 @@ from datetime import datetime, date
 from pathlib import Path
 from typing import Any, Dict, List
 import pandas as pd
-from sqlite_handler import DATABASE_NAME
+from sqlite_handler import DATABASE_NAME, ensure_expected_releases_fw_columns
 from model.marketshare_75k_simulation import DISTRIBUTIONS
 from snowflake_conn import load_sql
 from model.forecast_engine_server import ForecastEngine
@@ -50,6 +50,9 @@ _RELEASE_FIELD_KEYS = frozenset(
         "scenario",
         "known_vols",
         "fw_vol",
+        "fw_streams",
+        "fw_songs",
+        "fw_sales",
         "fy_vol",
         "avg_historical_w1_product_ratio",
         "product_ratio_coefficient",
@@ -68,12 +71,29 @@ _REQUIRED_NONEMPTY_STR = (
 
 _REAL_NUMERIC_FIELDS = (
     "fw_vol",
+    "fw_streams",
+    "fw_songs",
+    "fw_sales",
     "fy_vol",
     "avg_historical_w1_product_ratio",
     "product_ratio_coefficient",
 )
 
 _ALLOWED_SCENARIOS = frozenset[str]({"Bear", "Base", "Bull"})
+
+GLOBAL_FORECAST_ENGINE = None
+
+def get_engine():
+    """Instantiates the engine once, and returns it for all future calls."""
+    global GLOBAL_FORECAST_ENGINE
+    if GLOBAL_FORECAST_ENGINE is None:
+        GLOBAL_FORECAST_ENGINE = ForecastEngine(
+            artifacts_dir=ARTIFACTS_DIR,
+            streams_dir=ARCHETYPES_STREAMS_DIR,
+            sales_dir=ARCHETYPES_SALES_DIR,
+            songs_dir=ARCHETYPES_SONGS_DIR,
+        )
+    return GLOBAL_FORECAST_ENGINE
 
 
 def create_release(
@@ -86,7 +106,11 @@ def create_release(
     genre: str, 
     scenario: str, 
     fw_vol: float, 
+    fw_streams: float = 0.0,
+    fw_songs: float = 0.0,
+    fw_sales: float = 0.0,
     fy_vol: float = 0.0, 
+    known_vols: list[float] | None = None,
     avg_historical_w1_product_ratio: float = 0.3, 
     product_ratio_coefficient: float = 0.3,
     cluster: int = 0,
@@ -96,7 +120,8 @@ def create_release(
     Creates a new release in the database.
     Returns the release ID.
     """
-            
+    if known_vols is None:
+        known_vols = []
     _verify_release_fields(locals())
 
     params = (
@@ -107,6 +132,9 @@ def create_release(
         release_date,
         genre,
         fw_vol,
+        fw_streams,
+        fw_songs,
+        fw_sales,
         scenario,
         fy_vol,
         avg_historical_w1_product_ratio,
@@ -116,6 +144,7 @@ def create_release(
     try:
         query = load_sql(RELEASE_CREATE_QUERY)
         with sqlite3.connect(DATABASE_NAME) as conn:
+            ensure_expected_releases_fw_columns(conn)
             cursor = conn.cursor()
             id = cursor.execute(query, params).fetchone()[0]
             conn.commit()
@@ -234,7 +263,11 @@ def update_release(
     genre: str, 
     scenario: str, 
     fw_vol: float = 0.0, 
+    fw_streams: float = 0.0,
+    fw_songs: float = 0.0,
+    fw_sales: float = 0.0,
     fy_vol: float = 0.0, 
+    known_vols: list[float] | None = None,
     avg_historical_w1_product_ratio: float = 0.3, 
     product_ratio_coefficient: float = 0.3,
     cluster: int = 0,
@@ -243,6 +276,8 @@ def update_release(
     """Updates a release in the database."""
 
     _verify_id(id)
+    if known_vols is None:
+        known_vols = []
     _verify_release_fields(locals())
 
     params = (
@@ -253,6 +288,9 @@ def update_release(
         release_date,
         genre,
         fw_vol,
+        fw_streams,
+        fw_songs,
+        fw_sales,
         scenario,
         fy_vol,
         avg_historical_w1_product_ratio,
@@ -263,6 +301,7 @@ def update_release(
     try:
         query = load_sql(RELEASE_UPDATE_QUERY)
         with sqlite3.connect(DATABASE_NAME) as conn:
+            ensure_expected_releases_fw_columns(conn)
             cursor = conn.cursor()
             cursor.execute(query, params)
             conn.commit()
@@ -293,6 +332,7 @@ def get_release(id: int) -> dict:
     query = load_sql(RELEASE_GET_QUERY)
     try:
         with sqlite3.connect(DATABASE_NAME) as conn:
+            ensure_expected_releases_fw_columns(conn)
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute(query, (id,))
@@ -446,12 +486,7 @@ def get_marketshare_forecasts(week_ending_date: str | None = None) -> pd.DataFra
     _verify_parquet_file(df_full)
 
     # Simulate the releases and return the marketshare forecasts for the week ending date.
-    forecasts = ForecastEngine(
-        artifacts_dir=ARTIFACTS_DIR,
-        streams_dir=ARCHETYPES_STREAMS_DIR,
-        sales_dir=ARCHETYPES_SALES_DIR,
-        songs_dir=ARCHETYPES_SONGS_DIR,
-    ).simulate(releases)
+    forecasts = get_engine().simulate(releases)
     unified_ytd = pd.DataFrame(forecasts["unified_ytd"])
     if unified_ytd.empty:
         return unified_ytd
@@ -479,12 +514,7 @@ def get_release_forecasts(id: int, week_ending_date: str | None = None) -> pd.Da
     _verify_parquet_file(df_full)
 
     # Simulate the release and return the forecasts for the week ending date.
-    forecasts = ForecastEngine(
-        artifacts_dir=ARTIFACTS_DIR,
-        streams_dir=ARCHETYPES_STREAMS_DIR,
-        sales_dir=ARCHETYPES_SALES_DIR,
-        songs_dir=ARCHETYPES_SONGS_DIR,
-    ).simulate([release])
+    forecasts = get_engine().simulate([release])
     weekly_injections = pd.DataFrame(forecasts["weekly_injections"])
     if weekly_injections.empty:
         return weekly_injections
@@ -529,6 +559,7 @@ def df_to_json(
 def _get_all_release_rows() -> List[sqlite3.Row]:
     query = load_sql(RELEASE_GET_ALL_QUERY)
     with sqlite3.connect(DATABASE_NAME) as conn:
+        ensure_expected_releases_fw_columns(conn)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute(query)
@@ -569,6 +600,17 @@ def _sqlite_row_to_release_map(row: sqlite3.Row) -> dict:
     else:
         fw_vol = expected_fw_vol
 
+    def _sql_float(col: str, default: float = 0.0) -> float:
+        if col not in row.keys():
+            return default
+        v = row[col]
+        if v is None:
+            return default
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return default
+
     release_map: dict = {
         "mrelg_id": mrelg_id or None,
         "name": artist or title or "Unknown",
@@ -579,6 +621,9 @@ def _sqlite_row_to_release_map(row: sqlite3.Row) -> dict:
         "genre": row["GENRE"],
         "cluster": int(row["CLUSTER"] or 0),
         "fw_vol": fw_vol,
+        "fw_streams": _sql_float("FW_STREAMS"),
+        "fw_songs": _sql_float("FW_SONGS"),
+        "fw_sales": _sql_float("FW_SALES"),
         "scenario": row["SCENARIO"],
         "known_vols": known_vols,
         "fy_vol": float(row["FY_VOL"] or 0),
@@ -610,6 +655,9 @@ def _verify_release_fields(inputs: dict) -> None:
     Raises ValueError if validation fails.
     """
     data = {k: inputs[k] for k in _RELEASE_FIELD_KEYS if k in inputs}
+    data.setdefault("known_vols", [])
+    for _fw in ("fw_streams", "fw_songs", "fw_sales"):
+        data.setdefault(_fw, 0.0)
 
     # Verify required fields are not empty.
     for field in _REQUIRED_NONEMPTY_STR:
@@ -644,10 +692,14 @@ def _verify_release_fields(inputs: dict) -> None:
         if math.isnan(xf) or math.isinf(xf):
             raise ValueError(f"Value {x} at index {i} is not a finite number.")
 
-    # Verify fw_vol is a positive number when known_vols is empty.
+    # Verify total first-week signal when known_vols is empty (combined AE and/or component AE).
     fw_vol = float(data["fw_vol"])
-    if len(known_vols) == 0 and fw_vol <= 0:
-        raise ValueError("Expected weekly volume must be positive when known volumes is empty.")
+    comp_w1 = float(data["fw_streams"]) + float(data["fw_songs"]) + float(data["fw_sales"])
+    if len(known_vols) == 0 and fw_vol <= 0 and comp_w1 <= 0:
+        raise ValueError(
+            "Expected weekly volume must be positive when known volumes is empty, "
+            "unless first-week streams / song / product AE components sum to a positive total."
+        )
 
     # Verify genre is in the distribution.
     genre = data["genre"]

@@ -162,7 +162,9 @@ def generate_archetype_decay_curve(
         known_sales = [v * prod_ratio for v in known_vols]
         known_songs = [0.0 for _ in known_vols]
         
-    if fw_streams == 0 and fw_vol > 0:
+    # Only derive W1 splits from fw_vol when no explicit component breakdown was given.
+    explicit_w1_components = (fw_streams > 0) or (fw_sales > 0) or (fw_songs > 0)
+    if not explicit_w1_components and fw_vol > 0:
         fw_streams = fw_vol * (1.0 - prod_ratio)
         fw_sales = fw_vol * prod_ratio
         fw_songs = 0.0
@@ -192,12 +194,14 @@ def generate_archetype_decay_curve(
             return [0.0] * num_weeks
         if known:
             try:
+                # fit_backfill_forecast does not accept peak_sim_* tuning args (simulate_future_drop does).
                 pred_df, _ = fit_backfill_forecast(
-                    artist=artist, genre=genre,
+                    artist=artist,
+                    genre=genre,
                     actuals_weekly_streams=np.array(known, dtype=float),
-                    artifacts=artifacts, end_week=num_weeks,
+                    artifacts=artifacts,
+                    end_week=num_weeks,
                     stream_floor=force_floor,
-                    **sim_tuning_kwargs,
                 )
                 return pred_df["pred_weekly_streams"].tolist()
             except Exception as e:
