@@ -11,8 +11,9 @@ from sqlite_handler import DATABASE_NAME, ensure_expected_releases_fw_columns
 from model.marketshare_75k_simulation import DISTRIBUTIONS
 from snowflake_conn import load_sql
 from model.forecast_engine_server import ForecastEngine
-from sqlite_handler import update_sqlite_main
 from snowflake_conn import get_snowflake_connection
+from sqlite_handler import update_sqlite_main
+from train_model import train_model_main
 
 # TODO: Upload API to EC2 instance.
 # TODO: Make delete_release() function delete all release data from SQLite.
@@ -523,6 +524,20 @@ def get_release_forecasts(id: int, week_ending_date: str | None = None) -> pd.Da
     else:
         mask = weekly_injections["Week Ending Date"].astype(str) == week_ending_date
         return weekly_injections.loc[mask]
+
+
+def refresh_data() -> None:
+    """
+    Refreshes the current data in the database.
+    """
+    update_sqlite_main()
+
+
+def train_model() -> None:
+    """
+    Trains the model.
+    """
+    train_model_main()
 
 
 def df_to_json(

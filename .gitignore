@@ -12,7 +12,7 @@ artifacts_75k/
 archetypes_artifacts/
 
 # Ignore data
-marketshare_data.db
+*.db
 *.csv
 *.parquet
 data/

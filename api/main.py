@@ -1,9 +1,9 @@
 from __future__ import annotations
-import os
 import sys
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Response, status
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 try:
@@ -18,6 +18,7 @@ except ModuleNotFoundError:
 app = FastAPI(title="Tide Marketshare API", version="1.0.0")
 
 # TODO: Stop adding release data to model if older than 18 months
+# TODO: When a release is oficially released but does not have a MRELG ID, give a warning to the user.
 
 @app.get("/")
 def root():
@@ -28,9 +29,13 @@ def root():
     }
 
 
+@app.get("/doc")
+def doc_redirect():
+    return RedirectResponse(url="/docs")
+
+
 @app.get("/health")
 def health():
-    
     return {"status": "ok"}
 
 
@@ -55,6 +60,23 @@ class ReleaseCreateBody(BaseModel):
 
 class ReleaseUpdateBody(ReleaseCreateBody):
     pass
+
+@app.get("/v1/data/refresh_data")
+def refresh_data():
+    try:
+        model_handler.refresh_data()
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v1/data/train_model")
+def train_model():
+    try:
+        model_handler.train_model()
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/v1/releases")
@@ -143,6 +165,7 @@ def weekly_release(release_id: int, week_ending_date: str | None = None):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/v1/marketshare/actuals")
 def actuals_marketshare():
     try:
@@ -150,6 +173,7 @@ def actuals_marketshare():
         return Response(content=payload, media_type="application/json")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/v1/marketshare/weekly")
 def weekly_marketshare(week_ending_date: str | None = None):
@@ -160,21 +184,3 @@ def weekly_marketshare(week_ending_date: str | None = None):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-# @app.get("/v1/data/refresh_artifacts")
-# def refresh_artifacts():
-#     try:
-#         model_handler.refresh_artifacts()
-#         return {"ok": True}
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
-
-
-# @app.get("/v1/data/refresh_current_data")
-# def refresh_current_data():
-#     try:
-#         model_handler.refresh_current_data()
-#         return {"ok": True}
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
