@@ -1,9 +1,4 @@
-WITH current_date AS (
-    SELECT
-        DATEADD(MONTH, -18, CURRENT_DATE()) AS cur_date
-),
-
-target_albums AS (
+WITH target_albums AS (
     SELECT
         mrg.mrelg_id,
         mrg.title,
@@ -39,12 +34,13 @@ debut_week_qualifiers AS (
     WHERE
         s.country_code = 'US'
         AND da.week_end_date BETWEEN '2018-01-01'
-        AND (SELECT cur_date FROM current_date)
+        AND DATEADD(MONTH, -18, CURRENT_DATE())
         AND a.first_sale_date BETWEEN DATEADD(DAY, -7, da.week_end_date)
         AND da.week_end_date
     GROUP BY
         ALL
 )
+
 SELECT
     dq.mrelg_id,
     dq.title,

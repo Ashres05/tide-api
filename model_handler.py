@@ -12,7 +12,6 @@ from model.marketshare_75k_simulation import DISTRIBUTIONS
 from snowflake_conn import load_sql
 from model.forecast_engine_server import ForecastEngine
 from snowflake_conn import get_snowflake_connection
-from sqlite_handler import update_sqlite_main
 from train_model import train_model_main
 
 # TODO: Upload API to EC2 instance.
@@ -524,13 +523,6 @@ def get_release_forecasts(id: int, week_ending_date: str | None = None) -> pd.Da
     else:
         mask = weekly_injections["Week Ending Date"].astype(str) == week_ending_date
         return weekly_injections.loc[mask]
-
-
-def refresh_data() -> None:
-    """
-    Refreshes the current data in the database.
-    """
-    update_sqlite_main()
 
 
 def train_model() -> None:

@@ -61,17 +61,9 @@ class ReleaseCreateBody(BaseModel):
 class ReleaseUpdateBody(ReleaseCreateBody):
     pass
 
+
 @app.get("/v1/data/refresh_data")
 def refresh_data():
-    try:
-        model_handler.refresh_data()
-        return {"ok": True}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/v1/data/train_model")
-def train_model():
     try:
         model_handler.train_model()
         return {"ok": True}
@@ -95,6 +87,15 @@ def list_releases():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/v1/releases/backfill")
+def backfill_releases():
+    try:
+        result = model_handler.backfill_releases()
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/v1/releases", status_code=status.HTTP_201_CREATED)
 def create_release(body: ReleaseCreateBody):
     try:
@@ -102,15 +103,6 @@ def create_release(body: ReleaseCreateBody):
         return {"release_id": int(rid)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/v1/releases/backfill")
-def backfill_releases():
-    try:
-        result = model_handler.backfill_releases()
-        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

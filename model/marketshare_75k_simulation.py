@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 
 GLOBAL_PRODUCT_COEF = -0.61
 
+NUM_WEEKS = 78 # Releases limited to 18 months
+
 # When full65+ supplies median W2/W1 per artist, blend toward it; alpha = min(1, n_releases / K).
 W2_RETENTION_BLEND_K = 4.0 # 4 or more releases means we fully trust artist history and note archetype curve
 
@@ -59,7 +61,7 @@ DISTRIBUTIONS = {
 }
 
 
-def get_weighted_archetype_curve(cluster_weights: Dict[Any, float], num_weeks: int = 52) -> np.ndarray:
+def get_weighted_archetype_curve(cluster_weights: Dict[Any, float], num_weeks: int = NUM_WEEKS) -> np.ndarray:
     t = np.arange(0, num_weeks)
     combined_raw = np.zeros(num_weeks, dtype=float)
     shapes = {
@@ -140,7 +142,7 @@ def generate_archetype_decay_curve(
     artifacts_streams: SimulatorArtifacts,
     artifacts_sales: SimulatorArtifacts,
     artifacts_songs: SimulatorArtifacts,
-    num_weeks: int = 52,
+    num_weeks: int = NUM_WEEKS,
 ) -> List[float]:
     artist = release_dict.get("name", release_dict.get("artist", "Unknown"))
     genre = release_dict.get("genre")
@@ -281,14 +283,14 @@ def run_archetype_scenario(
             artifacts_streams, 
             artifacts_sales, 
             artifacts_songs, 
-            52
+            NUM_WEEKS
         )
         
         temp_curve_rows = []
         # --- UPDATE: Loop through the full year instead of just the future ---
         for current_date in tracker_dates:
             days_since = (current_date - req_date).days
-            if 0 <= days_since < 364:
+            if 0 <= days_since < NUM_WEEKS * 7:
                 week_idx = days_since // 7
                 if week_idx < len(full_curve):
                     weekly_vol = full_curve[week_idx]
@@ -319,13 +321,13 @@ def run_archetype_scenario(
             artifacts_streams, 
             artifacts_sales, 
             artifacts_songs, 
-            52
+            NUM_WEEKS
         )
         
         drop_dt = pd.to_datetime(release.get("date"))
         cy_total = 0
         if drop_dt <= end_of_year_date:
-            weeks_active = min(max(0, (end_of_year_date - drop_dt).days // 7 + 1), 52)
+            weeks_active = min(max(0, (end_of_year_date - drop_dt).days // 7 + 1), NUM_WEEKS)
             cy_total = sum(full_curve[:weeks_active])
             
         volume_report_data.append({
