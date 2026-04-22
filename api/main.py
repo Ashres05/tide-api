@@ -176,3 +176,14 @@ def weekly_marketshare(week_ending_date: str | None = None):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v1/releases/{release_id}/global_streaming")
+def global_streaming_release(release_id: int):
+    try:
+        payload = model_handler.df_to_json(model_handler.get_global_streaming_forecast(release_id))
+        return Response(content=payload, media_type="application/json")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

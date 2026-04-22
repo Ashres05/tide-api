@@ -17,9 +17,9 @@ POST /simulate
       "enrich_w2_retention": true
     }
 
-  Simulation uses only the archetypal engine: cluster-weighted decay curves,
-  genre/label priors, artist DNA from training, Bear/Base/Bull multipliers, and
-  optional product-ratio enrichment and full65-based W2/W1 tail adjustment.
+  Simulation uses the archetypal engine: per-metric decay curves (streams / sales / songs),
+  genre/label priors, Bear/Base/Bull multipliers, and optional request-body enrichment
+  (product ratios, W2 retention) when provided.
 
   Response: JSON with keys unified_ytd and weekly_injections (per-release weekly volumes).
 """

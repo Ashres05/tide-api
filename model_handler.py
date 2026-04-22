@@ -3,16 +3,23 @@ import json
 import math
 import numbers
 import sqlite3
+import logging
+import pandas as pd
+
 from datetime import datetime, date
 from pathlib import Path
 from typing import Any, Dict, List
-import pandas as pd
 from sqlite_handler import DATABASE_NAME, ensure_expected_releases_fw_columns
 from model.marketshare_75k_simulation import DISTRIBUTIONS
 from snowflake_conn import load_sql
 from model.forecast_engine_server import ForecastEngine
-from snowflake_conn import get_snowflake_connection
+from snowflake_conn import get_snowflake_connection, Snowflake
 from train_model import train_model_main
+from sqlite_handler import update_sqlite_main
+from model.worldwide_streams_api import simulate_one_worldwide_streams
+
+# Set up logging.
+logger = logging.getLogger(__name__)
 
 # TODO: Upload API to EC2 instance.
 # TODO: Make delete_release() function delete all release data from SQLite.
@@ -25,6 +32,8 @@ _ARCHETYPES_BASE = Path(__file__).resolve().parent / "model" / "archetypes_artif
 ARCHETYPES_STREAMS_DIR = _ARCHETYPES_BASE / "streams"
 ARCHETYPES_SALES_DIR   = _ARCHETYPES_BASE / "sales"
 ARCHETYPES_SONGS_DIR   = _ARCHETYPES_BASE / "songs"
+ARCHETYPES_WORLDWIDE_STREAMS_DIR   = _ARCHETYPES_BASE / "worldwide_streams"
+
 
 # SQLite table name for observed per-release metrics (populated by sqlite_handler.py)
 MARKETSHARE_RELEASE_METRICS_TABLE = "MARKETSHARE_RELEASE_METRICS"
@@ -38,6 +47,7 @@ RELEASE_GET_ALL_QUERY = "release_get_all.sql"
 MARKETSHARE_ACTUALS_QUERY = "select_marketshare_actuals.sql"
 MRELG_METADATA_QUERY = "query_mrelg_id.sql"
 RELEASE_BACKFILL_QUERY = "query_release_backfill.sql"
+GLOBAL_STREAMING_QUERY = "query_release_global_streaming.sql"
 
 _RELEASE_FIELD_KEYS = frozenset(
     {
@@ -82,6 +92,8 @@ _REAL_NUMERIC_FIELDS = (
 _ALLOWED_SCENARIOS = frozenset[str]({"Bear", "Base", "Bull"})
 
 GLOBAL_FORECAST_ENGINE = None
+GLOBAL_WORLDWIDE_ARTIFACTS = None
+
 
 def get_engine():
     """Instantiates the engine once, and returns it for all future calls."""
@@ -94,6 +106,20 @@ def get_engine():
             songs_dir=ARCHETYPES_SONGS_DIR,
         )
     return GLOBAL_FORECAST_ENGINE
+
+
+def get_worldwide_artifacts():
+    """Loads worldwide-streams archetype artifacts once and returns them."""
+    global GLOBAL_WORLDWIDE_ARTIFACTS
+    if GLOBAL_WORLDWIDE_ARTIFACTS is None:
+        from model.all_data_archetypes_simulator_ae import load_artifacts
+        if not ARCHETYPES_WORLDWIDE_STREAMS_DIR.exists():
+            raise FileNotFoundError(
+                f"Worldwide streams artifacts not found at {ARCHETYPES_WORLDWIDE_STREAMS_DIR}. "
+                "Run training with --metric worldwide_streams first."
+            )
+        GLOBAL_WORLDWIDE_ARTIFACTS = load_artifacts(str(ARCHETYPES_WORLDWIDE_STREAMS_DIR))
+    return GLOBAL_WORLDWIDE_ARTIFACTS
 
 
 def create_release(
@@ -164,7 +190,9 @@ def _create_backfilled_release(
     Creates a new release in the database from a mrelg_id.
     Returns the release ID.
     """
-    mrelg_metadata = _verify_mrelg_id(mrelg_id)
+    with get_snowflake_connection() as sf:
+        mrelg_metadata = _verify_mrelg_id(mrelg_id, sf)
+    
     name = mrelg_metadata["TITLE"].iloc[0]
     artist = mrelg_metadata["DISPLAY_ARTIST"].iloc[0]
     release_date = _validate_date(mrelg_metadata["RELEASE_DATE"].iloc[0])
@@ -338,7 +366,7 @@ def get_release(id: int) -> dict:
             cursor.execute(query, (id,))
             row = cursor.fetchone()
             if row is None:
-                raise ValueError(f"No release found with id={id}.")
+                raise ValueError(f"No release found with id = {id}.")
             return _sqlite_row_to_release_map(row)
     except sqlite3.Error as e:
         raise sqlite3.Error(f"Error getting release: {e}") from e
@@ -772,11 +800,119 @@ def _verify_parquet_file(parquet_file: Path) -> None:
     return parquet_file
 
 
-def _verify_mrelg_id(mrelg_id: str) -> pd.DataFrame:
+def _verify_mrelg_id(mrelg_id: str, _sf: Snowflake) -> pd.DataFrame:
     """Verifies that the mrelg_id is a valid mrelg_id."""
-    with get_snowflake_connection() as sf:
-        query = load_sql(MRELG_METADATA_QUERY)
-        mrelg_metadata = sf.query(query.format(MRELG_ID=f"'{mrelg_id}'"))
-        if mrelg_metadata.empty:
-            raise ValueError(f"Invalid mrelg_id: {mrelg_id}")
-        return mrelg_metadata
+    query = load_sql(MRELG_METADATA_QUERY)
+    mrelg_metadata = _sf.query(query.format(MRELG_ID=f"'{mrelg_id}'"))
+    if mrelg_metadata.empty:
+        raise ValueError(f"Invalid mrelg_id: {mrelg_id}")
+    return mrelg_metadata
+
+
+def get_global_streaming_forecast(id: int) -> pd.DataFrame:
+    """
+    Returns a DataFrame of worldwide streaming forecasts for a single release.
+
+    Historical observed weeks fetched from Snowflake are passed as
+    known_worldwide_streams to anchor the archetype decay curve via
+    fit_backfill_forecast.  When no history exists yet (future release),
+    fw_streams (or fw_vol) is used as the cold-start peak volume.
+
+    Columns: release_id, mrelg_id, artist, title, week, week_ending_date,
+             data_type, pred_worldwide_streams, cumulative_worldwide_streams
+
+    data_type is "Actual" for observed weeks and "Forecast" for model-predicted weeks.
+    """
+    # Verify parameters.
+    _verify_id(id)
+    release = get_release(id)
+    mrelg_id = (release.get("mrelg_id") or "").strip()
+    if not mrelg_id:
+        raise ValueError(
+            f"Release {id} has no mrelg_id; worldwide streaming forecast requires "
+            "a Luminate release group ID."
+        )
+
+    # Get historical observed weeks from Snowflake.
+    with get_snowflake_connection() as _sf:
+        hist_df = _get_known_vols_global_streaming(mrelg_id, _sf)
+    if hist_df.empty:
+        raise ValueError(f"No historical observed weeks found for mrelg_id: {mrelg_id}")
+
+    # Extract ordered weekly raw stream counts; empty list = cold-start mode.
+    known: List[float] = []
+    if not hist_df.empty:
+        stream_col = next(
+            (c for c in hist_df.columns if "stream" in c.lower()),
+            hist_df.columns[-1],
+        )
+        series = pd.to_numeric(hist_df[stream_col], errors="coerce").fillna(0.0)
+        known = series.tolist()
+
+    # Cold-start peak: prefer fw_streams, fall back to fw_vol.
+    fw_peak = float(release.get("fw_streams") or 0.0) or float(release.get("fw_vol") or 0.0)
+    if not any(x > 0 for x in known) and fw_peak <= 0:
+        raise ValueError(
+            f"Release {id} ({mrelg_id}) has no observed worldwide stream history "
+            "and no fw_streams / fw_vol peak set. "
+            "Provide at least one observed week or set fw_streams > 0."
+        )
+
+    artifacts = get_worldwide_artifacts()
+    release_dict: Dict[str, Any] = {
+        "artist": release.get("artist") or release.get("name") or "",
+        "name": release.get("name") or "",
+        "genre": release.get("genre"),
+        "date": release.get("date"),
+        "known_worldwide_streams": known,
+        "fw_worldwide_streams": fw_peak,
+    }
+
+    result = simulate_one_worldwide_streams(release_dict, artifacts, end_week=int(artifacts.horizon_weeks))
+
+    n_known = len(known)
+    df = pd.DataFrame(result["weekly"])  # week, pred_worldwide_streams, cumulative_worldwide_streams
+
+    # --- week_ending_date -------------------------------------------------------
+    # Observed weeks: use real dates from hist_df (already ordered by week_end_date).
+    # Forecast weeks: extrapolate 7 days per week past the last known date.
+    # Cold-start (no hist_df): derive entirely from release date.
+    if not hist_df.empty:
+        date_col = next(c for c in hist_df.columns if "date" in c.lower())
+        hist_dates = pd.to_datetime(hist_df[date_col]).reset_index(drop=True)
+        last_known_date = hist_dates.iloc[-1]
+
+        def _week_to_date(week: int) -> str:
+            idx = week - 1
+            if idx < len(hist_dates):
+                return hist_dates.iloc[idx].strftime("%Y-%m-%d")
+            return (last_known_date + pd.Timedelta(weeks=(week - n_known))).strftime("%Y-%m-%d")
+    else:
+        release_date = pd.to_datetime(release.get("date"))
+
+        def _week_to_date(week: int) -> str:  # type: ignore[misc]
+            return (release_date + pd.Timedelta(weeks=week)).strftime("%Y-%m-%d")
+
+    df["week_ending_date"] = df["week"].apply(_week_to_date)
+
+    # --- data_type --------------------------------------------------------------
+    df["data_type"] = df["week"].apply(lambda w: "Actual" if w <= n_known else "Forecast")
+
+    # --- final column order -----------------------------------------------------
+    df.insert(0, "release_id", id)
+    df.insert(1, "mrelg_id", mrelg_id)
+    df.insert(2, "artist", release.get("artist") or "")
+    df.insert(3, "title", release.get("title") or release.get("name") or "")
+    # Place week_ending_date and data_type immediately after week
+    week_pos = df.columns.get_loc("week")
+    for col in ("data_type", "week_ending_date"):
+        df.insert(week_pos + 1, col, df.pop(col))
+
+    return df
+
+
+def _get_known_vols_global_streaming(mrelg_id: str, _sf: Snowflake) -> pd.DataFrame:
+    df = _sf.query(load_sql(GLOBAL_STREAMING_QUERY).replace("{MRELG_ID}", f"'{mrelg_id}'"))
+    if df.empty:
+        raise ValueError(f"No global streaming data found for mrelg_id: {mrelg_id}")
+    return df

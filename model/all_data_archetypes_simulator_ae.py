@@ -1013,7 +1013,9 @@ def fit_backfill_forecast(
 
     max_y = float(np.max(y_obs)) if len(y_obs) else 0.0
     if not np.isfinite(max_y) or max_y <= 0:
-        raise ValueError("Backfill actuals must contain at least one positive weekly streams value.")
+        raise ValueError(
+            "Backfill actuals must contain at least one positive weekly value (finite and > 0)."
+        )
     y_norm_target = y_obs / max_y
 
     observed_peak_week = int(np.argmax(y_obs)) + 1  # week index in 1..K
@@ -1593,7 +1595,7 @@ def load_artifacts(out_dir: str) -> SimulatorArtifacts:
 
 #def train(args: argparse.Namespace) -> None:
    # df = pd.read_parquet(args.parquet_path, engine="fastparquet")
-    #required_cols = {"MRELG_ID", "DISPLAY_ARTIST", "GENRES", "FIRST_SALE_DATE", "WEEK_END_DATE", "TARGET_METRIC", "TITLE"} # target_metric instead of weekly_streams
+    #required_cols = {"MRELG_ID", "DISPLAY_ARTIST", "GENRES", "FIRST_SALE_DATE", "WEEK_END_DATE", "TARGET_METRIC", "TITLE"} # target_metric instead of worldwide_streams
     #missing = required_cols - set(df.columns)
     #if missing:
      #   raise ValueError(f"Parquet missing required columns: {sorted(missing)}")
@@ -1603,7 +1605,14 @@ def load_artifacts(out_dir: str) -> SimulatorArtifacts:
 def train(args: argparse.Namespace) -> None:
     df = pd.read_parquet(args.parquet_path, engine="fastparquet")
     df.columns = [str(c).upper() for c in df.columns]
-    target_metric_col = args.metric.upper() # convert to all uppercase from cli
+    target_metric_col = args.metric.upper()  # convert to all uppercase from cli
+    # Raw worldwide weekly *counts* (not streaming_equivalent): parquet column WORLDWIDE_STREAMS
+    # when present; older extracts may use WEEKLY_STREAMS or STREAMING.
+    if target_metric_col == "WORLDWIDE_STREAMS":
+        for cand in ("WORLDWIDE_STREAMS", "WEEKLY_STREAMS", "STREAMING"):
+            if cand in df.columns:
+                target_metric_col = cand
+                break
     required_cols = {"MRELG_ID", "DISPLAY_ARTIST", "GENRES", "FIRST_SALE_DATE", "WEEK_END_DATE", target_metric_col, "TITLE"}
     missing = required_cols - set(df.columns)
     if missing:
@@ -2080,7 +2089,22 @@ def parse_args() -> argparse.Namespace:
     train_p.add_argument("--random-state", type=int, default=42)
     train_p.add_argument("--kmeans-batch-size", type=int, default=2048)
     train_p.add_argument("--max-tracks-for-features", type=int, default=None)
-    train_p.add_argument("--metric", type=str, required=True, choices=["product_sales", "streaming_equivalent", "song_sale_equivalent"]) # added for streams/prod
+    train_p.add_argument(
+        "--metric",
+        type=str,
+        required=True,
+        choices=[
+            "product_sales",
+            "streaming_equivalent",
+            "song_sale_equivalent",
+            "worldwide_streams",
+        ],
+        help=(
+            "Which column to train on (headers uppercased after load). "
+            "streaming_equivalent / product_sales / song_sale_equivalent = AE panel parquet only. "
+            "worldwide_streams = raw worldwide weekly counts (WORLDWIDE_STREAMS column, or legacy WEEKLY_STREAMS / STREAMING); not equivalents."
+        ),
+    )
 
     train_p.add_argument("--sanity-artist", type=str, default=None, help="If set, run a single simulation after training.")
     train_p.add_argument("--sanity-peak-volume", type=float, default=None)

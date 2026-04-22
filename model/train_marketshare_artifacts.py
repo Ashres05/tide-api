@@ -4,14 +4,14 @@ Weekly/monthly training job for 75k marketshare artifacts.
 
 Combines logic from `baselinemarket_75k.ipynb` (LGBM + Prophet + pkls) and
 `75k_parlay.ipynb` (market Prophet, baseline YTD, spike Ridge, df_full,
-actuals_2026, K-Means / artist DNA, product OLS, exported static tables).
+actuals_2026, exported static tables).
 
 Outputs (default: ./artifacts_75k/):
   production_lgbm_75k.pkl, production_prophet_models_75k.pkl,
   production_spike_engine.pkl,
   df_full.parquet, actuals_2026.parquet,
-  artist_profile_dict.json, artist_dna_lookup.json, artist_w2_retention.json,
-  cluster_product_coef.json, cluster_product_regression.json (when full65 + product CSV),
+  artist_profile_dict.json, artist_dna_lookup.json, artist_w2_retention.json (empty dicts),
+  cluster_product_coef.json (GLOBAL_PRODUCT_COEF per archetype cluster),
   distributions.json,
   metadata.json (E_score, paths, forecast horizon, etc.)
 """
@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -28,16 +29,13 @@ import joblib
 import numpy as np
 import pandas as pd
 from prophet import Prophet
-from sklearn.cluster import KMeans
 from sklearn.linear_model import Ridge
 
 import lightgbm as lgb
 
 from .marketshare_75k_simulation import (
-    ARCHETYPE_MULTIPLIERS,
     DISTRIBUTIONS,
     GLOBAL_PRODUCT_COEF,
-    #PRODUCT_M52_PENALTY_CAP,
     W2_RETENTION_BLEND_K,
     dna_lookup_to_jsonable,
 )
@@ -451,303 +449,12 @@ def build_actuals_2026(weekly_amg_int: pd.DataFrame) -> pd.DataFrame:
     return actuals_2026
 
 
-def _week_vol(g: pd.DataFrame, w: int) -> float:
-    s = g.loc[g["WEEKS_SINCE_RELEASE"] == w, "WEEKLY_EQUIVALENT_QUANTITY"]
-    return float(s.iloc[0]) if not s.empty else 0.0
-
-
-def _release_w2_over_w1_ratio(
-    g: pd.DataFrame,
-    min_w1_share_of_early_peak: float = 0.12,
-) -> Optional[float]:
-    """
-    Week-2 / first-week AE ratio for one release, robust to partial week 0 or partial week 1.
-
-    - If week 2 > week 1, week 1 is often a partial week: use max(week0..week3) as the
-      denominator and cap at 1.0 so we never treat a low week-1 bucket as "weak retention"
-      and inflate the artist median.
-    - Otherwise (normal week-2 drop): denominator is max(week0, week1) so abbreviated week 0
-      does not inflate v2/v1.
-    - When week 2 is not higher than week 1, drops releases where week 1 is an implausibly
-      small share of the early peak (likely mis-tagged weeks).
-    """
-    v0, v1, v2, v3 = (
-        _week_vol(g, 0),
-        _week_vol(g, 1),
-        _week_vol(g, 2),
-        _week_vol(g, 3),
-    )
-    if v2 <= 0:
-        return None
-    peak_early = max(v0, v1, v2, v3)
-    if peak_early <= 0:
-        return None
-
-    # Handle week-2 > week-1 first (partial week 1) before the "weak week 1" exclusion
-    if v2 > v1 * 1.005:
-        denom = max(v0, v1, v2, v3)
-        if denom <= 0:
-            return None
-        return float(min(v2 / denom, 1.0))
-
-    # Standard: first-week volume = max(week0, week1) to handle abbreviated week 0
-    if v1 > 0 and v1 < peak_early * min_w1_share_of_early_peak:
-        return None
-
-    equiv_w1 = max(v0, v1) if max(v0, v1) > 0 else v1
-    if equiv_w1 <= 0:
-        return None
-
-    return float(min(v2 / equiv_w1, 1.0))
-
-
-def build_artist_w2_retention(full65_path: Path) -> Dict[str, Dict[str, float]]:
-    """
-    Per DISPLAY_ARTIST: median W2 / first-week AE from full65+.
-
-    Weeks are WEEKS_SINCE_RELEASE indices (0–3 used for robustness). The first-week volume
-    is max(0,1) when both exist so abbreviated week 0 does not inflate retention; suspicious
-    rows are dropped (see _release_w2_over_w1_ratio).
-    """
-    df = pd.read_csv(
-        full65_path,
-        usecols=["DISPLAY_ARTIST", "MRELG_ID", "WEEKS_SINCE_RELEASE", "WEEKLY_EQUIVALENT_QUANTITY"],
-    )
-    df["WEEKLY_EQUIVALENT_QUANTITY"] = pd.to_numeric(df["WEEKLY_EQUIVALENT_QUANTITY"], errors="coerce")
-    df["WEEKS_SINCE_RELEASE"] = pd.to_numeric(df["WEEKS_SINCE_RELEASE"], errors="coerce")
-    df = df.dropna(subset=["WEEKS_SINCE_RELEASE", "WEEKLY_EQUIVALENT_QUANTITY"])
-    ratios: List[Dict[str, Any]] = []
-    for (artist, _mid), g in df.groupby(["DISPLAY_ARTIST", "MRELG_ID"], sort=False):
-        r = _release_w2_over_w1_ratio(g)
-        if r is None:
-            continue
-        ratios.append({"DISPLAY_ARTIST": str(artist), "ratio": r})
-    if not ratios:
-        logger.warning("build_artist_w2_retention: no valid W2/W1 ratios from %s", full65_path)
-        return {}
-    rdf = pd.DataFrame(ratios)
-    agg = rdf.groupby("DISPLAY_ARTIST", sort=False).agg(
-        median_w2_over_w1=("ratio", "median"),
-        n_releases=("ratio", "count"),
-    )
-    out: Dict[str, Dict[str, float]] = {}
-    for artist, row in agg.iterrows():
-        out[str(artist)] = {
-            "median_w2_over_w1": float(row["median_w2_over_w1"]),
-            "n_releases": int(row["n_releases"]),
-        }
-    logger.info("Built artist_w2_retention for %d artists from full65+", len(out))
-    return out
-
-
-def kmeans_and_dna(
-    full65_path: Path,
-) -> Tuple[Dict[str, Dict[int, float]], Any, Dict[str, int], Dict[str, int]]:
-    df_history = pd.read_csv(full65_path)
-    df_history["project_label"] = (
-        df_history["DISPLAY_ARTIST"].astype(str).fillna("")
-        + " - "
-        + df_history["TITLE"].astype(str).fillna("")
-    )
-    project_lifespans = df_history.groupby("project_label")["WEEKS_SINCE_RELEASE"].max()
-    mature_projects = project_lifespans[project_lifespans >= 52].index
-    df_mature = df_history[df_history["project_label"].isin(mature_projects)].copy()
-    df_52w = df_mature[df_mature["WEEKS_SINCE_RELEASE"] <= 52].copy()
-    shape_df = df_52w.pivot_table(
-        index="project_label",
-        columns="WEEKS_SINCE_RELEASE",
-        values="WEEKLY_EQUIVALENT_QUANTITY",
-        aggfunc="sum",
-    ).fillna(0)
-    album_peaks = shape_df.max(axis=1)
-    normalized_shapes = shape_df.div(album_peaks, axis=0)
-    normalized_shapes = normalized_shapes.replace([np.inf, -np.inf], np.nan).dropna()
-    num_clusters = 4
-    kmeans = KMeans(n_clusters=num_clusters, random_state=42, n_init=10)
-    cluster_labels = kmeans.fit_predict(normalized_shapes.to_numpy())
-    normalized_shapes = normalized_shapes.copy()
-    normalized_shapes["archetype_cluster"] = cluster_labels
-    historical_clusters = normalized_shapes[["archetype_cluster"]].reset_index()
-    features_with_clusters = df_history.merge(historical_clusters, on="project_label", how="left")
-
-    artist_cluster_probs = (
-        features_with_clusters.groupby(["DISPLAY_ARTIST", "archetype_cluster"], sort=False)
-        .agg(count=("MRELG_ID", "nunique"))
-        .reset_index()
-    )
-    artist_cluster_probs["prob"] = artist_cluster_probs.groupby("DISPLAY_ARTIST")["count"].transform(
-        lambda x: x / x.sum()
-    )
-    fitted = set(map(int, ARCHETYPE_MULTIPLIERS.keys()))
-    artist_cluster_probs = artist_cluster_probs[artist_cluster_probs["archetype_cluster"].isin(fitted)]
-
-    artist_dna_lookup = artist_cluster_probs.groupby("DISPLAY_ARTIST").apply(
-        lambda x: dict(zip(x["archetype_cluster"], x["prob"]))
-    ).to_dict()
-    project_to_cluster = normalized_shapes["archetype_cluster"].astype(int).to_dict()
-    mrelg_rows = features_with_clusters.dropna(subset=["archetype_cluster"]).drop_duplicates(
-        subset=["MRELG_ID"], keep="first"
-    )
-    mrelg_to_cluster = {
-        str(r["MRELG_ID"]): int(r["archetype_cluster"]) for _, r in mrelg_rows.iterrows()
-    }
-    return artist_dna_lookup, kmeans, project_to_cluster, mrelg_to_cluster
-
-
-def _product_release_pivot(product_csv: Path) -> pd.DataFrame:
-    """Wide table per MRELG_ID with WEEKLY_ALBUM_EQUIVALENTS_w{k}, PRODUCT_SALES_w{k}."""
-    df = pd.read_csv(product_csv)
-    df["project_label"] = df["DISPLAY_ARTIST"].astype(str).fillna("") + " - " + df["TITLE"].astype(str).fillna("")
-    df_pivot = df.pivot_table(
-        index=["MRELG_ID", "project_label", "TITLE", "DISPLAY_ARTIST", "FIRST_SALE_DATE", "GENRES"],
-        columns="WEEKS_SINCE_RELEASE",
-        values=["WEEKLY_ALBUM_EQUIVALENTS", "PRODUCT_SALES"],
-    ).reset_index()
-    df_pivot.columns = [
-        f"{col[0]}_w{int(col[1])}" if col[1] else col[0] for col in df_pivot.columns.values
-    ]
-    return df_pivot
-
-
-def _row_m52_multiplier_from_pivot(row: pd.Series) -> float:
-    """Sum of first 52 weekly album-equivalent weeks (w0..w51) / week-1 AE."""
-    total = 0.0
-    for k in range(0, 52):
-        col = f"WEEKLY_ALBUM_EQUIVALENTS_w{k}"
-        if col in row.index and pd.notna(row[col]):
-            total += float(row[col])
-    w1_col = "WEEKLY_ALBUM_EQUIVALENTS_w1"
-    if w1_col not in row.index or pd.isna(row[w1_col]) or float(row[w1_col]) <= 0:
-        return float("nan")
-    return total / float(row[w1_col])
-
-
-def fit_cluster_product_coefficients(
-    product_csv: Path,
-    project_to_cluster: Dict[str, int],
-    mrelg_to_cluster: Dict[str, int],
-    global_fallback: float = GLOBAL_PRODUCT_COEF,
-    min_cluster_n: int = 25,
-    ridge_alpha: float = 2.0,
-    target: str = "m52_multiplier",
-) -> Tuple[Dict[int, float], Dict[str, Any]]:
-    """
-    Per-cluster Ridge: target ~ intercept + w1_product_ratio.
-    target='m52_multiplier': observed 52-week AE sum / W1 AE (aligned with archetype M52 scale).
-    target='w2_retention': W2 AE / W1 AE (different units; coef still used as M52 penalty scale).
-    """
-    df_pivot = _product_release_pivot(product_csv)
-    df_pivot["w1_product_ratio"] = df_pivot["PRODUCT_SALES_w1"] / df_pivot["WEEKLY_ALBUM_EQUIVALENTS_w1"]
-    df_pivot["w1_product_ratio"] = df_pivot["w1_product_ratio"].replace([np.inf, -np.inf], np.nan)
-    if target == "m52_multiplier":
-        df_pivot["y_target"] = df_pivot.apply(_row_m52_multiplier_from_pivot, axis=1)
-    elif target == "w2_retention":
-        df_pivot["y_target"] = df_pivot["WEEKLY_ALBUM_EQUIVALENTS_w2"] / df_pivot["WEEKLY_ALBUM_EQUIVALENTS_w1"]
-        df_pivot["y_target"] = df_pivot["y_target"].replace([np.inf, -np.inf], np.nan)
-    else:
-        raise ValueError(f"Unknown product regression target: {target}")
-
-    mid = df_pivot["MRELG_ID"].astype(str)
-    df_pivot["archetype_cluster"] = mid.map(mrelg_to_cluster)
-    miss = df_pivot["archetype_cluster"].isna()
-    if miss.any():
-        df_pivot.loc[miss, "archetype_cluster"] = df_pivot.loc[miss, "project_label"].map(project_to_cluster)
-    sub = df_pivot.dropna(subset=["y_target", "w1_product_ratio", "archetype_cluster"]).copy()
-    sub["w1_product_ratio"] = sub["w1_product_ratio"].clip(lower=0.0, upper=1.0)
-    sub["archetype_cluster"] = sub["archetype_cluster"].astype(int)
-
-    coefs: Dict[int, float] = {}
-    meta_per_cluster: Dict[str, Any] = {}
-    for c in sorted(sub["archetype_cluster"].unique()):
-        if c not in (0, 1, 2, 3):
-            continue
-        chunk = sub[sub["archetype_cluster"] == c]
-        n = len(chunk)
-        if n < min_cluster_n:
-            coefs[int(c)] = float(global_fallback)
-            meta_per_cluster[str(c)] = {"n": n, "slope": None, "fallback": True}
-            logger.warning(
-                "Cluster %s: only %d releases for product regression — using GLOBAL_PRODUCT_COEF",
-                c,
-                n,
-            )
-            continue
-        X = chunk[["w1_product_ratio"]].to_numpy(dtype=float)
-        y = chunk["y_target"].to_numpy(dtype=float)
-        model = Ridge(alpha=ridge_alpha)
-        model.fit(X, y)
-        slope = float(model.coef_[0])
-        coefs[int(c)] = slope
-        meta_per_cluster[str(c)] = {
-            "n": n,
-            "slope": slope,
-            "intercept": float(model.intercept_),
-            "fallback": False,
-        }
-
-    for c in (0, 1, 2, 3):
-        coefs.setdefault(c, float(global_fallback))
-
-    summary = {
-        "target": target,
-        "ridge_alpha": float(ridge_alpha),
-        "min_cluster_n": int(min_cluster_n),
-        "global_fallback": global_fallback,
-        "per_cluster": meta_per_cluster,
-        "n_rows_used": int(len(sub)),
-    }
-    logger.info("Cluster product coefficients: %s", coefs)
-    return coefs, summary
-
-
-def product_artist_profiles(product_csv: Path) -> Dict[str, float]:
-    df_pivot = _product_release_pivot(product_csv)
-    df_pivot["w1_product_ratio"] = df_pivot["PRODUCT_SALES_w1"] / df_pivot["WEEKLY_ALBUM_EQUIVALENTS_w1"]
-    df_pivot["w2_retention_rate"] = df_pivot["WEEKLY_ALBUM_EQUIVALENTS_w2"] / df_pivot["WEEKLY_ALBUM_EQUIVALENTS_w1"]
-    df_pivot.fillna({"w1_product_ratio": 0, "w2_retention_rate": 0}, inplace=True)
-    valid_profiles = df_pivot.dropna(subset=["w1_product_ratio"])
-    artist_profiles = valid_profiles.groupby("DISPLAY_ARTIST").agg(
-        avg_historical_w1_product_ratio=("w1_product_ratio", "mean"),
-        recorded_albums=("MRELG_ID", "count"),
-    ).reset_index()
-    profile_dict = pd.Series(
-        artist_profiles["avg_historical_w1_product_ratio"].values,
-        index=artist_profiles["DISPLAY_ARTIST"],
-    ).to_dict()
-    logger.info("Built artist_profile_dict with %d artists", len(profile_dict))
-    return profile_dict
-
-
 def main() -> None:
     p = argparse.ArgumentParser(description="Train and export 75k marketshare artifacts.")
     p.add_argument("--data-dir", type=Path, default=Path(__file__).resolve().parent / "Data")
-    p.add_argument(
-        "--full65-path",
-        type=Path,
-        default=None,
-        help="Optional path to full65+.csv (default: <data-dir>/full65+.csv). Used for DNA, KMeans, and W2 retention.",
-    )
     p.add_argument("--artifacts-dir", type=Path, default=Path(__file__).resolve().parent / "artifacts_75k")
     p.add_argument("--end-of-year", type=str, default="2026-12-31")
     p.add_argument("--forecast-year", type=int, default=2026)
-    p.add_argument(
-        "--product-regression-target",
-        choices=("m52_multiplier", "w2_retention"),
-        default="m52_multiplier",
-        help="Target for per-cluster product Ridge regression on product25k+ data.",
-    )
-    p.add_argument(
-        "--product-regression-min-n",
-        type=int,
-        default=25,
-        help="Minimum releases per cluster to fit slope; else GLOBAL_PRODUCT_COEF for that cluster.",
-    )
-    p.add_argument(
-        "--product-ridge-alpha",
-        type=float,
-        default=2.0,
-        help="Ridge regularization for cluster product regressions.",
-    )
     args = p.parse_args()
 
     data_dir = args.data_dir.expanduser().resolve()
@@ -815,38 +522,11 @@ def main() -> None:
 
     actuals_2026 = build_actuals_2026(weekly_amg_int)
 
-    full65 = (args.full65_path.expanduser().resolve() if args.full65_path else data_dir / "full65+.csv")
+    # Per-archetype product tail uses GLOBAL_PRODUCT_COEF; streams/sales/songs come from separate archetype trains.
+    artist_dna_lookup: Dict[str, Dict[int, float]] = {}
     artist_w2_retention: Dict[str, Dict[str, float]] = {}
-    project_to_cluster: Dict[str, int] = {}
-    mrelg_to_cluster: Dict[str, int] = {}
-    if full65.exists():
-        artist_dna_lookup, kmeans_model, project_to_cluster, mrelg_to_cluster = kmeans_and_dna(full65)
-        joblib.dump(kmeans_model, art_dir / "kmeans_archetype_75k.pkl")
-        artist_w2_retention = build_artist_w2_retention(full65)
-    else:
-        logger.warning("Missing %s — skipping K-Means / DNA (empty artist_dna_lookup)", full65)
-        artist_dna_lookup = {}
-
-    product_csv = data_dir / "product25k+_release_date.csv"
-    cluster_product_coef: Dict[int, float] = {}
-    cluster_product_meta: Dict[str, Any] = {}
-    if product_csv.exists():
-        artist_profile_dict = product_artist_profiles(product_csv)
-        if project_to_cluster or mrelg_to_cluster:
-            cluster_product_coef, cluster_product_meta = fit_cluster_product_coefficients(
-                product_csv,
-                project_to_cluster,
-                mrelg_to_cluster,
-                global_fallback=GLOBAL_PRODUCT_COEF,
-                target=args.product_regression_target,
-                min_cluster_n=args.product_regression_min_n,
-                ridge_alpha=args.product_ridge_alpha,
-            )
-        else:
-            logger.warning("No project_to_cluster map — skipping cluster product regression")
-    else:
-        logger.warning("Missing %s — artist_profile_dict empty", product_csv)
-        artist_profile_dict = {}
+    artist_profile_dict: Dict[str, float] = {}
+    cluster_product_coef = {c: float(GLOBAL_PRODUCT_COEF) for c in (0, 1, 2, 3)}
 
     joblib.dump(production_lgbm, art_dir / "production_lgbm_75k.pkl")
     joblib.dump(production_prophet_models, art_dir / "production_prophet_models_75k.pkl")
@@ -863,18 +543,12 @@ def main() -> None:
         json.dump({str(k): v for k, v in artist_w2_retention.items()}, f, indent=2)
     with open(art_dir / "distributions.json", "w", encoding="utf-8") as f:
         json.dump(DISTRIBUTIONS, f, indent=2)
-    if not cluster_product_coef:
-        cluster_product_coef = {c: float(GLOBAL_PRODUCT_COEF) for c in (0, 1, 2, 3)}
     with open(art_dir / "cluster_product_coef.json", "w", encoding="utf-8") as f:
         json.dump({str(k): float(v) for k, v in sorted(cluster_product_coef.items())}, f, indent=2)
-    if cluster_product_meta:
-        with open(art_dir / "cluster_product_regression.json", "w", encoding="utf-8") as f:
-            json.dump(cluster_product_meta, f, indent=2)
 
     meta = {
         "GLOBAL_PRODUCT_COEF": GLOBAL_PRODUCT_COEF,
         #"PRODUCT_M52_PENALTY_CAP": PRODUCT_M52_PENALTY_CAP,
-        "product_regression_target": args.product_regression_target,
         "W2_RETENTION_BLEND_K": W2_RETENTION_BLEND_K,
         "E_score": e_score,
         "e80_conformal": e80,
@@ -898,12 +572,8 @@ def train_artifacts_main() -> None:
     base_path = Path(__file__).resolve().parent
     data_dir = (base_path / "data").expanduser().resolve()
     art_dir = (base_path / "artifacts_75k").expanduser().resolve()
-    full65_path = None  # Set to a Path object if you want a specific file, else defaults to data_dir / "full65+.csv"
     end_of_year = "2026-12-31"
     forecast_year = 2026
-    product_regression_target = "m52_multiplier"
-    product_regression_min_n = 25
-    product_ridge_alpha = 2.0
     # -------------------------------
     
     art_dir.mkdir(parents=True, exist_ok=True)
@@ -969,38 +639,10 @@ def train_artifacts_main() -> None:
 
     actuals_2026 = build_actuals_2026(weekly_amg_int)
 
-    full65 = (Path(full65_path).expanduser().resolve() if full65_path else data_dir / "full65+.csv")
+    artist_dna_lookup: Dict[str, Dict[int, float]] = {}
     artist_w2_retention: Dict[str, Dict[str, float]] = {}
-    project_to_cluster: Dict[str, int] = {}
-    mrelg_to_cluster: Dict[str, int] = {}
-    if full65.exists():
-        artist_dna_lookup, kmeans_model, project_to_cluster, mrelg_to_cluster = kmeans_and_dna(full65)
-        joblib.dump(kmeans_model, art_dir / "kmeans_archetype_75k.pkl")
-        artist_w2_retention = build_artist_w2_retention(full65)
-    else:
-        logger.warning("Missing %s — skipping K-Means / DNA (empty artist_dna_lookup)", full65)
-        artist_dna_lookup = {}
-
-    product_csv = data_dir / "product25k+_release_date.csv"
-    cluster_product_coef: Dict[int, float] = {}
-    cluster_product_meta: Dict[str, Any] = {}
-    if product_csv.exists():
-        artist_profile_dict = product_artist_profiles(product_csv)
-        if project_to_cluster or mrelg_to_cluster:
-            cluster_product_coef, cluster_product_meta = fit_cluster_product_coefficients(
-                product_csv,
-                project_to_cluster,
-                mrelg_to_cluster,
-                global_fallback=GLOBAL_PRODUCT_COEF,
-                target=product_regression_target,
-                min_cluster_n=product_regression_min_n,
-                ridge_alpha=product_ridge_alpha,
-            )
-        else:
-            logger.warning("No project_to_cluster map — skipping cluster product regression")
-    else:
-        logger.warning("Missing %s — artist_profile_dict empty", product_csv)
-        artist_profile_dict = {}
+    artist_profile_dict: Dict[str, float] = {}
+    cluster_product_coef = {c: float(GLOBAL_PRODUCT_COEF) for c in (0, 1, 2, 3)}
 
     joblib.dump(production_lgbm, art_dir / "production_lgbm_75k.pkl")
     joblib.dump(production_prophet_models, art_dir / "production_prophet_models_75k.pkl")
@@ -1017,18 +659,12 @@ def train_artifacts_main() -> None:
         json.dump({str(k): v for k, v in artist_w2_retention.items()}, f, indent=2)
     with open(art_dir / "distributions.json", "w", encoding="utf-8") as f:
         json.dump(DISTRIBUTIONS, f, indent=2)
-    if not cluster_product_coef:
-        cluster_product_coef = {c: float(GLOBAL_PRODUCT_COEF) for c in (0, 1, 2, 3)}
     with open(art_dir / "cluster_product_coef.json", "w", encoding="utf-8") as f:
         json.dump({str(k): float(v) for k, v in sorted(cluster_product_coef.items())}, f, indent=2)
-    if cluster_product_meta:
-        with open(art_dir / "cluster_product_regression.json", "w", encoding="utf-8") as f:
-            json.dump(cluster_product_meta, f, indent=2)
 
     meta = {
         "GLOBAL_PRODUCT_COEF": GLOBAL_PRODUCT_COEF,
         #"PRODUCT_M52_PENALTY_CAP": PRODUCT_M52_PENALTY_CAP,
-        "product_regression_target": product_regression_target,
         "W2_RETENTION_BLEND_K": W2_RETENTION_BLEND_K,
         "E_score": e_score,
         "e80_conformal": e80,
@@ -1042,11 +678,11 @@ def train_artifacts_main() -> None:
 
     logger.info("Wrote artifacts to %s", art_dir)
 
-    # Train per-metric archetype decay models (streams / sales / songs).
-    # Each run reads the same parquet but trains on a different metric column,
-    # writing its artifacts to model/archetypes_artifacts/<metric_name>/.
-    parquet_path = data_dir / "streams_product_songs_ae_compressed.parquet"
-    if parquet_path.exists():
+    # Archetype decay: two disjoint data sources (do not conflate).
+    # (1) AE panel parquet — album-equivalent weekly metrics (streaming equivalents, product sales, song sales).
+    # (2) worldwide_streams parquet — raw weekly counts only (separate file, separate artifact dir).
+    ae_archetypes_parquet = data_dir / "streams_product_songs_ae_compressed.parquet"
+    if ae_archetypes_parquet.exists():
         archetypes_base = base_path / "archetypes_artifacts"
         for metric, subdir in [
             ("streaming_equivalent", "streams"),
@@ -1054,9 +690,14 @@ def train_artifacts_main() -> None:
             ("song_sale_equivalent", "songs"),
         ]:
             out_dir = archetypes_base / subdir
-            logger.info("Training archetype decay model for metric=%s → %s", metric, out_dir)
+            logger.info(
+                "Archetype decay (AE panel %s): metric=%s → %s",
+                ae_archetypes_parquet.name,
+                metric,
+                out_dir,
+            )
             archetype_args = argparse.Namespace(
-                parquet_path=str(parquet_path),
+                parquet_path=str(ae_archetypes_parquet),
                 out_dir=str(out_dir),
                 metric=metric,
                 horizon_weeks=78,
@@ -1073,7 +714,48 @@ def train_artifacts_main() -> None:
         logger.info("Wrote archetype artifacts to %s", archetypes_base)
     else:
         logger.warning(
-            "Skipping archetype decay training — parquet not found: %s", parquet_path
+            "Skipping AE-panel archetype decay — parquet not found: %s", ae_archetypes_parquet
+        )
+
+    # worldwide_streams weekly counts (not streaming_equivalent): its own parquet and archetypes_artifacts/worldwide_streams/.
+    # Default: model/data/worldwide_streams_compressed.parquet
+    # Override: TIDE_WORLDWIDE_STREAMS_PARQUET=/path/to/file.parquet
+    worldwide_env = os.environ.get("TIDE_WORLDWIDE_STREAMS_PARQUET", "").strip()
+    worldwide_parquet = (
+        Path(worldwide_env).expanduser().resolve()
+        if worldwide_env
+        else (data_dir / "worldwide_streams_compressed.parquet")
+    )
+    if worldwide_parquet.exists():
+        archetypes_base = base_path / "archetypes_artifacts"
+        out_dir = archetypes_base / "worldwide_streams"
+        logger.info(
+            "Archetype decay (worldwide_streams %s): metric=worldwide_streams → %s",
+            worldwide_parquet.name,
+            out_dir,
+        )
+        archetype_args = argparse.Namespace(
+            parquet_path=str(worldwide_parquet),
+            out_dir=str(out_dir),
+            metric="worldwide_streams",
+            horizon_weeks=78,
+            n_clusters=4,
+            random_state=42,
+            kmeans_batch_size=2048,
+            max_tracks_for_features=None,
+            sanity_artist=None,
+            sanity_peak_volume=None,
+            sanity_peak_week=None,
+            sanity_genre=None,
+        )
+        train_archetype_model(archetype_args)
+        logger.info("Wrote worldwide_streams archetype artifacts to %s", out_dir)
+    else:
+        logger.info(
+            "Skipping worldwide_streams archetype training — parquet not found: %s "
+            "(not streaming_equivalent; place worldwide_streams_compressed.parquet under %s or set TIDE_WORLDWIDE_STREAMS_PARQUET)",
+            worldwide_parquet,
+            data_dir,
         )
 
 

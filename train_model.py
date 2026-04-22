@@ -16,6 +16,7 @@ BIG_RELEASE_FLAG_75K_QUERY = "query_model_big_release_flag.sql"
 
 # Query names for the model.
 MODEL_PARQUET_METRICS_QUERY = "query_model_parquet_metrics.sql"
+MODEL_PARQUET_METRICS_STREAMING_QUERY = "query_model_parquet_metrics_streaming.sql"
 
 def update_data_directory() -> None:
     """
@@ -37,11 +38,15 @@ def _update_parquet_metrics(sf: Snowflake) -> None:
     Updates: streams_product_songs_ae_compressed.parquet
     """
     df = sf.query(load_sql(MODEL_PARQUET_METRICS_QUERY))
-    if df.empty:
-        return
+    df_streaming = sf.query(load_sql(MODEL_PARQUET_METRICS_STREAMING_QUERY))
+
+    if not df.empty:
+        logger.info("train_model.py: Updated streams_product_songs_ae_compressed.parquet")
+        df.to_parquet(DATA_DIR / "streams_product_songs_ae_compressed.parquet", index=False)
     
-    logger.info("train_model.py: Updated streams_product_songs_ae_compressed.parquet")
-    df.to_parquet(DATA_DIR / "streams_product_songs_ae_compressed.parquet", index=False)
+    if not df_streaming.empty:
+        logger.info("train_model.py: Updated worldwide_streams_compressed.parquet.parquet")
+        df_streaming.to_parquet(DATA_DIR / "worldwide_streams_compressed.parquet.parquet", index=False)
 
 
 def _update_current_data(sf: Snowflake) -> None:
@@ -75,17 +80,6 @@ def _update_big_release_flag_75k(sf: Snowflake) -> None:
         return
     
     df.to_csv(DATA_DIR / "bigreleaseflag_75k.csv", index=False)
-
-
-def _update_model_parquet_metrics(sf: Snowflake) -> None:
-    """
-    Updates: streams_product_songs_ae_compressed.parquet
-    """
-    df = sf.query(load_sql(MODEL_PARQUET_METRICS_QUERY))
-    if df.empty:
-        return
-    
-    df.to_parquet(DATA_DIR / "streams_product_songs_ae_compressed.parquet", index=False)
 
 
 def train_model_main() -> None:

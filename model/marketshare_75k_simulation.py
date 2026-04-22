@@ -1,13 +1,15 @@
 """
 75k parlay simulation core: archetypal decay and enrichment.
 
-Uses K-Means cluster shapes, genre/label archetype priors (DISTRIBUTIONS), per-artist
-history (artist_dna_lookup), Bear/Base/Bull multipliers (ARCHETYPE_MULTIPLIERS), optional
-physical-product adjustment (GLOBAL_PRODUCT_COEF + artist_profile_dict), and release
-inputs (fw_vol, fy_vol, scenario, cluster, dates, known_vols).
+Uses genre/label archetype priors (DISTRIBUTIONS), Bear/Base/Bull multipliers
+(ARCHETYPE_MULTIPLIERS), trained archetype decay artifacts (streams / sales / songs),
+GLOBAL_PRODUCT_COEF for product tail scaling, and release inputs (fw_vol, fy_vol,
+scenario, cluster, dates, known_vols). Optional per-release fields (e.g. empirical W2,
+product ratio) may be supplied on the release dict when callers have external estimates.
 
 Extracted from `75k_parlay.ipynb`. Used by the training job and the forecast engine.
 """
+# TODO: release vs release_dict in inject_volume
 
 from __future__ import annotations
 
@@ -26,7 +28,7 @@ GLOBAL_PRODUCT_COEF = -0.61
 
 NUM_WEEKS = 78 # Releases limited to 18 months
 
-# When full65+ supplies median W2/W1 per artist, blend toward it; alpha = min(1, n_releases / K).
+# When release_dict supplies empirical_w2_over_w1, blend tail toward it; alpha = min(1, n_releases / K).
 W2_RETENTION_BLEND_K = 4.0 # 4 or more releases means we fully trust artist history and note archetype curve
 
 ARCHETYPE_MULTIPLIERS = {
@@ -101,8 +103,8 @@ def _adjust_tail_weights_for_empirical_w2(
     release_dict: dict,
 ) -> np.ndarray:
     """
-    Blend the archetype tail split toward historical W2/W1 from full65+ (week 2 vs week 1 AE),
-    while keeping total tail mass fixed. See train_marketshare_artifacts.build_artist_w2_retention.
+    Blend the archetype tail split toward release_dict empirical W2/W1 when present,
+    while keeping total tail mass fixed.
     """
     if release_dict.get("empirical_w2_over_w1") is None:
         return tw
@@ -378,7 +380,7 @@ def auto_enrich_w2_retention(
     match_threshold: float = 0.8,
 ) -> List[dict]:
     """
-    Attach empirical_w2_over_w1 and w2_retention_n_releases from full65+ aggregates when the
+    Attach empirical_w2_over_w1 and w2_retention_n_releases from w2_dict when the
     artist name fuzzy-matches keys in w2_dict (same pattern as product-ratio enrichment).
     """
     if not w2_dict:
