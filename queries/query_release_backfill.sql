@@ -37,7 +37,7 @@ mrelg_metrics AS (
 )
 SELECT
     s.mrelg_id,
-    s.label_group
+    s.label_group AS label_name
 FROM
     mrelg_metrics s
     QUALIFY ROW_NUMBER() OVER (

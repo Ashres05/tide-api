@@ -71,6 +71,15 @@ def refresh_data():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/v1/data/refresh_model")
+def refresh_model():
+    try:
+        model_handler.refresh_model()
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/v1/releases")
 def list_releases():
     """

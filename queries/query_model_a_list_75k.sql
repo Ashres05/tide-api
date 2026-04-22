@@ -10,6 +10,7 @@ WITH major_releases AS (
     WHERE
         s.country_code = 'US'
         AND m.compilation_type = 'Non Compilation'
+        AND s.report_date >= '2018-01-01'
         AND s.report_date <= DATEADD(MONTH, -18, CURRENT_DATE())
         AND s.report_date >= m.first_sale_date
     GROUP BY

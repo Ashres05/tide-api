@@ -14,7 +14,7 @@ from model.marketshare_75k_simulation import DISTRIBUTIONS
 from snowflake_conn import load_sql
 from model.forecast_engine_server import ForecastEngine
 from snowflake_conn import get_snowflake_connection, Snowflake
-from train_model import train_model_main
+from train_model import refresh_data, update_parquet_metrics
 from sqlite_handler import update_sqlite_main
 from model.worldwide_streams_api import simulate_one_worldwide_streams
 
@@ -557,7 +557,15 @@ def train_model() -> None:
     """
     Trains the model.
     """
-    train_model_main()
+    refresh_data()
+
+
+def refresh_model() -> None:
+    """
+    Refreshes the model.
+    """
+    with get_snowflake_connection() as sf:
+        update_parquet_metrics(sf)
 
 
 def df_to_json(
