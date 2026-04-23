@@ -1,3 +1,12 @@
+-- Phase 2: incremental refresh.
+-- {MIN_WEEK_END_DATE} is the max WEEK_END_DATE currently in alist_75k.csv,
+-- injected from Python ('2018-01-01' on cold start). The -2 day guard excludes
+-- the in-progress week so we never persist partial data.
+--
+-- NOTE: target_albums keeps the rolling 18-month qualifier (`first_sale_date >=
+-- -18mo`) unchanged — that's the "is this album less-than-18-months-old" test
+-- the user called out as the exception to the incremental scoping rule. We
+-- only tighten the *week* dimension on the performance/output side.
 WITH target_albums AS (
     SELECT
         m.mrelg_id,
@@ -13,7 +22,7 @@ WITH target_albums AS (
     WHERE
         m.compilation_type = 'Non Compilation'
         AND LOWER(prod.display_artist) NOT LIKE '%various%' 
-        -- 1. Inlined the 18-month calculation as a constant
+        -- rolling 18mo album-freshness qualifier (do NOT replace with MIN_WEEK_END_DATE)
         AND m.first_sale_date >= DATEADD(MONTH, -18, CURRENT_DATE())
     QUALIFY ROW_NUMBER() OVER (
         PARTITION BY m.mrelg_id
@@ -34,9 +43,13 @@ debut_week_performance AS (
             ON da.datename = s.report_date
     WHERE
         s.country_code = 'US'
-        -- 2. CRITICAL: Added explicit date filter on the fact table to force partition pruning
-        AND s.report_date >= DATEADD(MONTH, -18, CURRENT_DATE())
-        AND da.week_end_date >= DATEADD(MONTH, -18, CURRENT_DATE())
+        -- Tightened from -18mo to MIN_WEEK_END_DATE. Partition-prune the fact
+        -- table to only the weeks we don't already have on disk. Debut weeks
+        -- that landed before MIN_WEEK_END_DATE are already persisted in the
+        -- prior CSV row; the Python layer's dedupe keeps them.
+        AND s.report_date >= '{MIN_WEEK_END_DATE}'
+        AND da.week_end_date >= '{MIN_WEEK_END_DATE}'
+        AND DATEADD(DAY, -2, CURRENT_DATE()) > da.week_end_date
         AND a.first_sale_date BETWEEN DATEADD(DAY, -7, da.week_end_date) AND da.week_end_date
     GROUP BY
         da.week_end_date,
@@ -55,7 +68,6 @@ mrelg_to_distributor AS (
             ON i.mp_id = mp.mp_id
     WHERE
         i.country_code = 'US'
-        -- 3. Converted INNER JOIN on target_albums to a more efficient EXISTS (Semi-Join)
         AND EXISTS (
             SELECT 1 
             FROM target_albums a 

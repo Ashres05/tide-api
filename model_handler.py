@@ -558,6 +558,7 @@ def train_model() -> None:
     Trains the model.
     """
     refresh_data()
+    reload_artifacts()
 
 
 def refresh_model() -> None:
@@ -566,6 +567,153 @@ def refresh_model() -> None:
     """
     with get_snowflake_connection() as sf:
         update_parquet_metrics(sf)
+    reload_artifacts()
+
+
+_PARQUET_DIR = Path(__file__).resolve().parent / "model" / "data"
+_REQUIRED_PARQUETS = (
+    _PARQUET_DIR / "streams_product_songs_ae_compressed.parquet",
+    _PARQUET_DIR / "worldwide_streams_compressed.parquet",
+)
+
+
+def refresh_weekly(force_refresh_parquets: bool = False) -> dict:
+    """
+    Single weekly orchestration: (optionally) refresh parquets, refresh CSV
+    data and retrain, then backfill releases. This is what the weekly cron
+    should call — it replaces the prior pattern of invoking /refresh_model,
+    /refresh_data, and /releases/backfill separately (which made ordering
+    easy to get wrong).
+
+    Stage order:
+      1. update_parquet_metrics — AE + worldwide_streams parquets feed the
+         archetype KMeans step that train_artifacts_main runs. SKIPPED when
+         both parquet files already exist on disk, because the two queries
+         that back this stage scan Luminate from 2018 to present and take
+         multiple minutes each. The parquets change infrequently; force a
+         refresh by passing force_refresh_parquets=True or by calling the
+         dedicated /v1/data/refresh_model endpoint.
+      2. refresh_data — pulls the three CSVs (incremental since Phase 2) and
+         retrains LGBM / Prophet / Ridge and (if parquets exist) archetype
+         decay models.
+      3. backfill_releases — inserts any new mrelg_ids into SQLite and
+         refreshes per-release historical metrics used by /weekly forecasts.
+
+    Returns a per-stage summary. Stage 1 failures are non-fatal (archetype
+    training falls back to whatever parquets are already on disk); stages 2
+    and 3 re-raise so the job is marked failed.
+
+    Progress: each stage calls api.jobs.set_step() so the caller can
+    diagnose which phase is slow by polling GET /v1/jobs/{id}.steps. The
+    import is local to avoid a hard dependency on the api package when this
+    module is imported outside FastAPI (e.g. by a script). set_step() is a
+    no-op when not running under a JobManager.
+    """
+    from api.jobs import set_step
+
+    summary: Dict[str, Any] = {"stages": {}}
+
+    set_step("refresh_parquets:start")
+    t0 = _now()
+    missing = [p for p in _REQUIRED_PARQUETS if not p.is_file()]
+    if not force_refresh_parquets and not missing:
+        existing = [p.name for p in _REQUIRED_PARQUETS]
+        logger.info(
+            "refresh_weekly: skipping parquet refresh (found %s). "
+            "Call refresh_weekly(force_refresh_parquets=True) or /refresh_model "
+            "to rebuild.",
+            existing,
+        )
+        set_step("refresh_parquets:skipped")
+        summary["stages"]["refresh_parquets"] = {
+            "ok": True,
+            "skipped": True,
+            "reason": "parquets already exist on disk",
+            "paths": existing,
+            "elapsed_sec": _elapsed(t0),
+        }
+    else:
+        if force_refresh_parquets:
+            logger.info("refresh_weekly: force_refresh_parquets=True; rebuilding parquets")
+        else:
+            logger.info(
+                "refresh_weekly: parquet(s) missing, rebuilding: %s",
+                [str(p) for p in missing],
+            )
+        try:
+            with get_snowflake_connection() as sf:
+                update_parquet_metrics(sf)
+            summary["stages"]["refresh_parquets"] = {
+                "ok": True, "skipped": False, "elapsed_sec": _elapsed(t0),
+            }
+        except Exception as e:
+            logger.exception("refresh_weekly: refresh_parquets failed")
+            summary["stages"]["refresh_parquets"] = {
+                "ok": False,
+                "skipped": False,
+                "error": str(e),
+                "elapsed_sec": _elapsed(t0),
+            }
+
+    set_step("refresh_data:start")
+    t0 = _now()
+    try:
+        refresh_data()
+        summary["stages"]["refresh_data"] = {"ok": True, "elapsed_sec": _elapsed(t0)}
+    except Exception as e:
+        logger.exception("refresh_weekly: refresh_data failed")
+        summary["stages"]["refresh_data"] = {
+            "ok": False, "error": str(e), "elapsed_sec": _elapsed(t0),
+        }
+        set_step("reload_artifacts")
+        reload_artifacts()
+        raise
+
+    set_step("backfill_releases:start")
+    t0 = _now()
+    try:
+        backfill_result = backfill_releases()
+        summary["stages"]["backfill_releases"] = {
+            "ok": True, "elapsed_sec": _elapsed(t0), **backfill_result,
+        }
+    except Exception as e:
+        logger.exception("refresh_weekly: backfill_releases failed")
+        summary["stages"]["backfill_releases"] = {
+            "ok": False, "error": str(e), "elapsed_sec": _elapsed(t0),
+        }
+        set_step("reload_artifacts")
+        reload_artifacts()
+        raise
+
+    set_step("reload_artifacts")
+    reload_artifacts()
+    set_step("done")
+    return summary
+
+
+def _now() -> float:
+    import time as _t
+    return _t.perf_counter()
+
+
+def _elapsed(t0: float) -> float:
+    import time as _t
+    return round(_t.perf_counter() - t0, 2)
+
+
+def reload_artifacts() -> None:
+    """
+    Clear cached engine/artifacts so the next forecast request loads the
+    freshly written parquets/pkls from disk. Call after any data refresh.
+
+    Note: this only invalidates in-process caches. If the API is scaled out
+    to multiple workers (gunicorn -w N, multiple EC2 instances) each worker
+    has its own globals and will need an external reload signal. That's a
+    Phase 3 concern once artifacts move to S3.
+    """
+    global GLOBAL_FORECAST_ENGINE, GLOBAL_WORLDWIDE_ARTIFACTS
+    GLOBAL_FORECAST_ENGINE = None
+    GLOBAL_WORLDWIDE_ARTIFACTS = None
 
 
 def df_to_json(

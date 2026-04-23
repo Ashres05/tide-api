@@ -2,42 +2,42 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Response, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 try:
     import model_handler
+    from api.jobs import (
+        JobAlreadyRunningError,
+        get_manager,
+        require_api_key,
+    )
 except ModuleNotFoundError:
     # Allow direct execution via `python api/main.py` by adding the repo root.
     repo_root = Path(__file__).resolve().parents[1]
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
     import model_handler
+    from api.jobs import (  # noqa: E402
+        JobAlreadyRunningError,
+        get_manager,
+        require_api_key,
+    )
 
-app = FastAPI(title="Tide Marketshare API", version="1.0.0")
+app = FastAPI(title="Tide Marketshare API", version="1.1.0")
 
-# TODO: Stop adding release data to model if older than 18 months
-# TODO: When a release is oficially released but does not have a MRELG ID, give a warning to the user.
+# TODO: When a release is officially released but does not have a MRELG ID, give a warning to the user.
 
-@app.get("/")
-def root():
-    return {
-        "service": "Tide Marketshare API",
-        "health": "/health",
-        "docs": "/docs",
-    }
-
-
-@app.get("/doc")
-def doc_redirect():
-    return RedirectResponse(url="/docs")
+# TODO (Phase 3): Move CSV/parquet/artifact storage to S3.
+# TODO (Phase 4): Drop the duplicate Prophet market-model fit in train_artifacts_main.
+# TODO: Fix a misalignment between current's marketshare and api marketshare.
+# TODO: Add a search feature for revenue.
 
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
+# ---------------------------------------------------------------------------
+# Request models
+# ---------------------------------------------------------------------------
 
 class ReleaseCreateBody(BaseModel):
     mrelg_id: str | None = None
@@ -62,23 +62,157 @@ class ReleaseUpdateBody(ReleaseCreateBody):
     pass
 
 
-@app.get("/v1/data/refresh_data")
-def refresh_data():
+class JobAcceptedResponse(BaseModel):
+    job_id: str
+    name: str
+    status: str
+    status_url: str
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _dispatch(job_name: str, target) -> JobAcceptedResponse:
+    """
+    Submit a long-running admin task to the background job manager and return
+    the 202-style acceptance envelope. 409 on duplicate-run is the signal for
+    the cron to back off and try again on the next tick.
+    """
     try:
-        model_handler.train_model()
-        return {"ok": True}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        job = get_manager().submit(job_name, target)
+    except JobAlreadyRunningError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    return JobAcceptedResponse(
+        job_id=job.id,
+        name=job.name,
+        status=job.status,
+        status_url=f"/v1/jobs/{job.id}",
+    )
 
 
-@app.get("/v1/data/refresh_model")
-def refresh_model():
-    try:
-        model_handler.refresh_model()
-        return {"ok": True}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+# ---------------------------------------------------------------------------
+# Service endpoints
+# ---------------------------------------------------------------------------
 
+@app.get("/")
+def root():
+    return {
+        "service": "Tide Marketshare API",
+        "health": "/health",
+        "docs": "/docs",
+    }
+
+
+@app.get("/doc")
+def doc_redirect():
+    return RedirectResponse(url="/docs")
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Admin endpoints (async jobs)
+#
+# All admin endpoints are POST (state-changing), return 202 Accepted with a
+# job_id, and are guarded by the X-API-Key header when TIDE_API_KEY is set.
+# The actual work runs in a background thread so the HTTP request returns in
+# milliseconds regardless of Snowflake/training time.
+# ---------------------------------------------------------------------------
+
+# TODO: There may be edge cases where the week end dates are misaligned among the csvs. for each csv we update, grab its individual week end date and use that as the anchor.
+@app.post(
+    "/v1/data/refresh_weekly",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=JobAcceptedResponse,
+)
+def refresh_weekly(
+    force_refresh_parquets: bool = False,
+    _: None = Depends(require_api_key),
+) -> JobAcceptedResponse:
+    """
+    Weekly orchestration entrypoint. Call this once per week (the cron
+    target). Runs, in order: parquet refresh (skipped if both parquets
+    already exist), CSV refresh + retrain, release backfill.
+
+    The parquet stage is skipped by default because the two queries behind it
+    scan Luminate from 2018 to present and take several minutes each — the
+    parquets only need to be rebuilt when the schema or methodology changes.
+    Pass ?force_refresh_parquets=true to rebuild them anyway, or call
+    /v1/data/refresh_model for a parquet-only refresh.
+    """
+    return _dispatch(
+        "refresh_weekly",
+        lambda: model_handler.refresh_weekly(force_refresh_parquets=force_refresh_parquets),
+    )
+
+
+@app.post(
+    "/v1/data/refresh_data",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=JobAcceptedResponse,
+)
+def refresh_data(_: None = Depends(require_api_key)) -> JobAcceptedResponse:
+    """
+    Pull latest CSV inputs from Snowflake and retrain the forecast models.
+    Prefer /refresh_weekly for the cron — this endpoint is kept for targeted
+    manual refreshes (e.g. after re-running a single Snowflake query).
+    """
+    return _dispatch("refresh_data", model_handler.train_model)
+
+
+@app.post(
+    "/v1/data/refresh_model",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=JobAcceptedResponse,
+)
+def refresh_model(_: None = Depends(require_api_key)) -> JobAcceptedResponse:
+    """
+    Refresh the per-release AE and worldwide-streams parquets that feed the
+    archetype decay trainer. Prefer /refresh_weekly for normal operation.
+    """
+    return _dispatch("refresh_model", model_handler.refresh_model)
+
+
+@app.post(
+    "/v1/releases/backfill",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=JobAcceptedResponse,
+)
+def backfill_releases(_: None = Depends(require_api_key)) -> JobAcceptedResponse:
+    """
+    Pull any newly surfaced Luminate releases into the local SQLite store and
+    refresh per-release historical metrics. Result payload (inserted/skipped/
+    errors) is available on the completed job via GET /v1/jobs/{job_id}.
+    """
+    return _dispatch("backfill_releases", model_handler.backfill_releases)
+
+
+# ---------------------------------------------------------------------------
+# Job status endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/v1/jobs/{job_id}")
+def get_job(job_id: str):
+    job = get_manager().get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found.")
+    return job.to_dict()
+
+
+@app.get("/v1/jobs")
+def list_jobs(limit: int = 20):
+    if limit < 1 or limit > 200:
+        raise HTTPException(status_code=400, detail="limit must be in [1, 200].")
+    return [j.to_dict() for j in get_manager().list(limit=limit)]
+
+
+# ---------------------------------------------------------------------------
+# Release CRUD + forecast endpoints (read-only / per-release, stay synchronous)
+# ---------------------------------------------------------------------------
 
 @app.get("/v1/releases")
 def list_releases():
@@ -92,15 +226,6 @@ def list_releases():
             content=model_handler.get_all_releases_series_json(),
             media_type="application/json",
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/v1/releases/backfill")
-def backfill_releases():
-    try:
-        result = model_handler.backfill_releases()
-        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -120,7 +245,6 @@ def create_release(body: ReleaseCreateBody):
 def get_release(release_id: int):
     try:
         rel = model_handler.get_release(release_id)
-        # model_handler.get_release raises ValueError when missing
         return rel
     except ValueError as e:
         msg = str(e)
@@ -159,7 +283,9 @@ def delete_release(release_id: int):
 @app.get("/v1/releases/{release_id}/weekly")
 def weekly_release(release_id: int, week_ending_date: str | None = None):
     try:
-        payload = model_handler.df_to_json(model_handler.get_release_forecasts(release_id, week_ending_date))
+        payload = model_handler.df_to_json(
+            model_handler.get_release_forecasts(release_id, week_ending_date)
+        )
         return Response(content=payload, media_type="application/json")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -179,7 +305,9 @@ def actuals_marketshare():
 @app.get("/v1/marketshare/weekly")
 def weekly_marketshare(week_ending_date: str | None = None):
     try:
-        payload = model_handler.df_to_json(model_handler.get_marketshare_forecasts(week_ending_date))
+        payload = model_handler.df_to_json(
+            model_handler.get_marketshare_forecasts(week_ending_date)
+        )
         return Response(content=payload, media_type="application/json")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -190,7 +318,9 @@ def weekly_marketshare(week_ending_date: str | None = None):
 @app.get("/v1/releases/{release_id}/global_streaming")
 def global_streaming_release(release_id: int):
     try:
-        payload = model_handler.df_to_json(model_handler.get_global_streaming_forecast(release_id))
+        payload = model_handler.df_to_json(
+            model_handler.get_global_streaming_forecast(release_id)
+        )
         return Response(content=payload, media_type="application/json")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
