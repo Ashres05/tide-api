@@ -349,7 +349,7 @@ def run_archetype_scenario(
     fut_sim["Sim_AMG_Num"] = np.where(fut_sim["Owner"] == "Atlantic Music Group", fut_sim["Base_Num"] + (fut_sim["Injected_AMG"] * 100), fut_sim["Base_Num"])
     fut_sim["Sim_Int_Num"] = np.where(fut_sim["Owner"] == "Interscope/Geffen/A&M", fut_sim["Base_Num"] + (fut_sim["Injected_Int"] * 100), fut_sim["Base_Num"])
     fut_sim["Active_Share"] = np.where(fut_sim["Owner"] == "Atlantic Music Group", fut_sim["Sim_AMG_Num"] / fut_sim["Sim_Total_Market_AE_Volume"], fut_sim["Sim_Int_Num"] / fut_sim["Sim_Total_Market_AE_Volume"])
-    
+
     fut_sim = fut_sim.drop(columns=["Total_Market_AE_Volume"]).rename(columns={"Sim_Total_Market_AE_Volume": "Total_Market_AE_Volume"})
     fut_sim["Data_Type"] = "Forecast"
 

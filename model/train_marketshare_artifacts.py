@@ -106,6 +106,23 @@ def build_wk_minus(weekly_amg_int: pd.DataFrame, a_list_wk: pd.DataFrame) -> pd.
     weekly_amg_int["Week Ending Date"] = pd.to_datetime(weekly_amg_int["Week Ending Date"])
     a_list_wk = a_list_wk.copy()
     a_list_wk["WEEK_END_DATE"] = pd.to_datetime(a_list_wk["WEEK_END_DATE"])
+
+    # Train only on weeks covered by alist_75k so scrub volumes exist for every row.
+    # Earlier weeks would merge with AMG/INTERSCOPE albums = 0 and bias Prophet.
+    if not a_list_wk.empty:
+        min_scrub_week = a_list_wk["WEEK_END_DATE"].min()
+        before = len(weekly_amg_int)
+        weekly_amg_int = weekly_amg_int[
+            weekly_amg_int["Week Ending Date"] >= min_scrub_week
+        ].reset_index(drop=True)
+        dropped = before - len(weekly_amg_int)
+        if dropped:
+            logger.info(
+                "build_wk_minus: dropped %d weeks before alist_75k coverage (%s)",
+                dropped,
+                min_scrub_week.date().isoformat(),
+            )
+
     wk_minus = pd.merge(
         weekly_amg_int,
         a_list_wk,
@@ -175,14 +192,21 @@ def train_lgbm_prophet(df_model: pd.DataFrame) -> Tuple[lgb.LGBMRegressor, Dict[
     production_prophet_models: Dict[str, Any] = {}
     for label in df_model["Owner"].unique():
         label_df = df_model[df_model["Owner"] == label].copy()
-        
+
         prophet_train = label_df[["Week Ending Date", "AE_Share"]].rename(
             columns={"Week Ending Date": "ds", "AE_Share": "y"} # BACK TO SHARE
         )
-        prophet_model = Prophet(yearly_seasonality=2, weekly_seasonality=False, daily_seasonality=False)
+        # growth='flat': short scrubbed history + yearly seasonality otherwise
+        # extrapolates a spurious downward trend for Interscope baseline share.
+        prophet_model = Prophet(
+            yearly_seasonality=2,
+            weekly_seasonality=False,
+            daily_seasonality=False,
+            growth="flat",
+        )
         prophet_model.fit(prophet_train.dropna())
         production_prophet_models[label] = prophet_model
-        
+
     return production_lgbm, production_prophet_models
 
 def conformal_e80_2026(
@@ -341,6 +365,8 @@ def enrich_weekly_for_spike(
     w.loc[int_mask, "big_release_flag"] = w.loc[int_mask, "BIG_RELEASE_INTERSCOPE"].fillna(0)
     scrubbed_vols = wk_minus[["Week Ending Date", "Owner", "AE_Volume"]].rename(columns={"AE_Volume": "Baseline_Volume"})
     w = w.merge(scrubbed_vols, on=["Week Ending Date", "Owner"], how="left")
+    # Weeks before alist coverage have no wk_minus row: treat as zero A-list scrub.
+    w["Baseline_Volume"] = w["Baseline_Volume"].fillna(w["AE_Volume"])
     w["Historical_Baseline_Share"] = np.where(
         w["Total_Market_AE_Volume"] > 0,
         (w["Baseline_Volume"] / w["Total_Market_AE_Volume"]) * 100,

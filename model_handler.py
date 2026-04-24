@@ -10,7 +10,7 @@ from datetime import datetime, date
 from pathlib import Path
 from typing import Any, Dict, List
 from sqlite_handler import DATABASE_NAME, ensure_expected_releases_fw_columns
-from model.marketshare_75k_simulation import DISTRIBUTIONS
+from model.marketshare_75k_simulation import DISTRIBUTIONS, NUM_WEEKS
 from snowflake_conn import load_sql
 from model.forecast_engine_server import ForecastEngine
 from snowflake_conn import get_snowflake_connection, Snowflake
@@ -95,6 +95,74 @@ GLOBAL_FORECAST_ENGINE = None
 GLOBAL_WORLDWIDE_ARTIFACTS = None
 
 
+def _cap_weekly_series(values: List[float] | None, max_weeks: int) -> List[float]:
+    """Keep only the first ``max_weeks`` points (chronological SQLite order)."""
+    if not values:
+        return []
+    if len(values) <= max_weeks:
+        return [float(x) for x in values]
+    return [float(x) for x in values[:max_weeks]]
+
+
+def _sanitize_release_for_simulation(release_map: dict) -> dict:
+    """
+    Normalize per-release inputs before ``ForecastEngine.simulate``:
+    cap known weekly series to the same horizon as the archetype decay window
+    so ``fit_backfill_forecast`` never sees more actuals than ``end_week``.
+    """
+    for key in ("known_vols", "known_streams", "known_sales", "known_songs"):
+        if key in release_map and release_map[key]:
+            release_map[key] = _cap_weekly_series(release_map[key], NUM_WEEKS)
+    return release_map
+
+
+def _sanitize_forecast_engine_artifacts(engine: ForecastEngine) -> None:
+    """
+    In-memory cleanup of parquet-backed frames after load. Keeps files on disk
+    unchanged while fixing NaNs / dtypes that would break ``run_archetype_scenario``.
+    """
+    df = engine.df_full
+    if df is None or getattr(df, "empty", True):
+        return
+
+    wk_col = "Week Ending Date"
+    if wk_col in df.columns and not pd.api.types.is_datetime64_any_dtype(df[wk_col]):
+        df[wk_col] = pd.to_datetime(df[wk_col], errors="coerce")
+
+    if "Predicted_Baseline_Share" in df.columns:
+        if "Owner" in df.columns:
+            bad = df["Predicted_Baseline_Share"].isna()
+            if bad.any():
+                logger.warning(
+                    "df_full: repairing %d NaN Predicted_Baseline_Share cells (per-Owner ffill/bfill)",
+                    int(bad.sum()),
+                )
+                df["Predicted_Baseline_Share"] = (
+                    df.groupby("Owner", sort=False)["Predicted_Baseline_Share"]
+                    .transform(lambda s: s.ffill().bfill())
+                )
+        df["Predicted_Baseline_Share"] = pd.to_numeric(
+            df["Predicted_Baseline_Share"], errors="coerce"
+        ).fillna(0.0)
+
+    if "Final_Unified_Share" in df.columns and "Predicted_Baseline_Share" in df.columns:
+        mask = df["Final_Unified_Share"].isna()
+        if mask.any():
+            df.loc[mask, "Final_Unified_Share"] = df.loc[mask, "Predicted_Baseline_Share"]
+
+    for col in ("big_release_flag", "Incremental_Share"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+    act = engine.actuals_2026
+    if act is None or getattr(act, "empty", True):
+        return
+    if wk_col in act.columns and not pd.api.types.is_datetime64_any_dtype(act[wk_col]):
+        act[wk_col] = pd.to_datetime(act[wk_col], errors="coerce")
+    if "AE_Share" in act.columns:
+        act["AE_Share"] = pd.to_numeric(act["AE_Share"], errors="coerce").fillna(0.0)
+
+
 def get_engine():
     """Instantiates the engine once, and returns it for all future calls."""
     global GLOBAL_FORECAST_ENGINE
@@ -105,6 +173,7 @@ def get_engine():
             sales_dir=ARCHETYPES_SALES_DIR,
             songs_dir=ARCHETYPES_SONGS_DIR,
         )
+        _sanitize_forecast_engine_artifacts(GLOBAL_FORECAST_ENGINE)
     return GLOBAL_FORECAST_ENGINE
 
 
@@ -829,7 +898,7 @@ def _sqlite_row_to_release_map(row: sqlite3.Row) -> dict:
     if component_vols["songs"]:
         release_map["known_songs"] = component_vols["songs"]
 
-    return release_map
+    return _sanitize_release_for_simulation(release_map)
 
 
 def _is_real_number(value: object) -> bool:
