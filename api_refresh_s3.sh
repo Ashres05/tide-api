@@ -22,7 +22,7 @@
 #   S3_PULL_BEFORE_REFRESH   — default 1: aws s3 sync canonical model/data down before Python
 #                               (set 0 to skip if local CSVs are always source of truth)
 #   S3_PULL_ARTIFACTS        — default 0: if 1, also sync model/artifacts_75k from S3 before run (large)
-#   LOG_FILE                 — default $PROJECT_DIR/api_refresh_s3.log
+#   LOG_FILE                 — default $PROJECT_DIR/logs/api_refresh_s3.log
 #
 set -euo pipefail
 
@@ -44,7 +44,8 @@ else
 fi
 S3_PULL_BEFORE_REFRESH="${S3_PULL_BEFORE_REFRESH:-1}"
 S3_PULL_ARTIFACTS="${S3_PULL_ARTIFACTS:-0}"
-LOG_FILE="${LOG_FILE:-$PROJECT_DIR/api_refresh_s3.log}"
+LOG_FILE="${LOG_FILE:-$PROJECT_DIR/logs/api_refresh_s3.log}"
+mkdir -p "$(dirname "$LOG_FILE")"
 
 log() { echo "$*" | tee -a "$LOG_FILE"; }
 

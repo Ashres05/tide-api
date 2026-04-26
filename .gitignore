@@ -16,3 +16,6 @@ archetypes_artifacts/
 *.csv
 *.parquet
 data/
+
+# Ignore logs
+*.log

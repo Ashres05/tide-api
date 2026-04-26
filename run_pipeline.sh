@@ -19,7 +19,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${PROJECT_DIR:-$SCRIPT_DIR}"
 VENV_DIR="${VENV_DIR:-$PROJECT_DIR/venv}"
 ENV_FILE="${ENV_FILE:-$PROJECT_DIR/.env}"
-LOG_FILE="${LOG_FILE:-$PROJECT_DIR/pipeline.log}"
+LOG_FILE="${LOG_FILE:-$PROJECT_DIR/logs/pipeline.log}"
+mkdir -p "$(dirname "$LOG_FILE")"
 
 S3_BUCKET="${S3_BUCKET:-s3://parquetgarage}"
 # ISO-ish UTC timestamp for versioned uploads
