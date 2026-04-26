@@ -12,6 +12,7 @@ WITH prelim_query AS (
         s.country_code = 'AA'
         AND s.metric_category = 'Streams'
         AND s.service_type = 'OnDemand'
+	AND da.week_end_date >= {RELEASE_DATE}
         AND s.mrelg_id = {MRELG_ID}
         AND da.week_end_date < DATEADD(DAY, -2, CURRENT_DATE())
     GROUP BY
@@ -26,6 +27,5 @@ FROM prelim_query weekly
 WHERE
     NOT (
         weekly.rn = 1
-        AND week_after.global_streams / weekly.global_streams > 100 
-        -- streams week 2 are 100x greater
-    )
+        AND COALESCE(week_after.global_streams / NULLIF(weekly.global_streams, 0), 0) > 100        -- streams week 2 are 100x greater
+    ) // coalesce to avoid division by 0 and endpoint error

@@ -16,7 +16,9 @@ WITH mrelg_map AS (
         AND mrelg.release_type = 'Album'
     WHERE
         i.level_2_distributor IN ('Atlantic Music Group', 'Interscope/Geffen/A&M')
-        AND i.is_current = TRUE QUALIFY rn = 1
+        AND i.is_current = TRUE
+        {RELEASE_DATE_FILTER}
+        QUALIFY rn = 1
 ),
 mrelg_metrics AS (
     SELECT

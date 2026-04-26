@@ -45,6 +45,7 @@ RELEASE_DELETE_QUERY = "release_delete.sql"
 RELEASE_GET_QUERY = "release_get.sql"
 RELEASE_GET_ALL_QUERY = "release_get_all.sql"
 MARKETSHARE_ACTUALS_QUERY = "select_marketshare_actuals.sql"
+MARKETSHARE_WEEKLY_ACTUALS_QUERY = "select_marketshare_weekly_actuals.sql"
 MRELG_METADATA_QUERY = "query_mrelg_id.sql"
 RELEASE_BACKFILL_QUERY = "query_release_backfill.sql"
 GLOBAL_STREAMING_QUERY = "query_release_global_streaming.sql"
@@ -253,15 +254,28 @@ def _create_backfilled_release(
     mrelg_id: str,
     label_name: str,
     scenario: str = "Base",
-    fw_vol: float = 100000.0 # Default to 100,000 units for backfilled releases, this doesn't matter as backfilled releases will have known volumes.
+    fw_vol: float = 100000.0,  # Default; irrelevant once known_vols are loaded.
+    _sf: "Snowflake | None" = None,
 ) -> int:
     """
     Creates a new release in the database from a mrelg_id.
     Returns the release ID.
+
+    Pass _sf to reuse an existing Snowflake connection (avoids one connect per release).
     """
-    with get_snowflake_connection() as sf:
+    import contextlib
+
+    @contextlib.contextmanager
+    def _maybe_conn():
+        if _sf is not None:
+            yield _sf
+        else:
+            with get_snowflake_connection() as sf2:
+                yield sf2
+
+    with _maybe_conn() as sf:
         mrelg_metadata = _verify_mrelg_id(mrelg_id, sf)
-    
+
     name = mrelg_metadata["TITLE"].iloc[0]
     artist = mrelg_metadata["DISPLAY_ARTIST"].iloc[0]
     release_date = _validate_date(mrelg_metadata["RELEASE_DATE"].iloc[0])
@@ -281,10 +295,12 @@ def _create_backfilled_release(
 
     for col in metadata_cols:
         if col is None:
-            raise ValueError(f"MRELG ID {mrelg_id} has no {col} in the metadata. Try create_release() instead.")
+            raise ValueError(
+                f"MRELG ID {mrelg_id} has no {col} in the metadata. Try create_release() instead."
+            )
 
-    
-    return create_release(mrelg_id=mrelg_id, 
+    return create_release(
+        mrelg_id=mrelg_id,
         name=name,
         artist=artist,
         label_name=label_name,
@@ -295,56 +311,118 @@ def _create_backfilled_release(
         fy_vol=0.0,
         avg_historical_w1_product_ratio=0.3,
         product_ratio_coefficient=0.3,
-        cluster=0)
+        cluster=0,
+    )
 
 
-def backfill_releases() -> dict:
+def backfill_releases(
+    *,
+    run_sqlite_refresh: bool = True,
+) -> dict:
     """
     Backfills releases from Snowflake into the local SQLite database.
 
-    Returns a summary dict with counts and any per-release errors:
-        {"inserted": int, "skipped": int, "errors": [{"mrelg_id": str, "error": str}, ...]}
+    Returns a summary dict:
+        {"inserted": int, "skipped": int, "errors": [...]}
+
+    Incremental mode (default when EXPECTED_RELEASES already has rows):
+      Only queries Snowflake for albums whose release_date falls within the last
+      TIDE_BACKFILL_LOOKBACK_DAYS (default 90 days). Albums older than that are
+      already in SQLite.  Set TIDE_BACKFILL_FULL=1 to force a complete scan.
+
+    run_sqlite_refresh:
+      When True (default) and new releases were inserted, update_sqlite_main() is
+      called to pull their metrics into SQLite.  Pass False from the daily script
+      (sqlite_handler already ran immediately before) to skip the second refresh.
     """
-    query = load_sql(RELEASE_BACKFILL_QUERY)
-    
-    # Get the releases from Snowflake.
-    with get_snowflake_connection() as sf:
-        df = sf.query(query)
+    import os as _os
 
-    if df.empty:
-        return {"inserted": 0, "skipped": 0, "errors": []}
-
-    # Get the existing mrelg_ids from the SQLite database.
     existing_mrelg_ids = {
         (row["MRELG_ID"] or "").strip()
         for row in _get_all_release_rows()
         if "MRELG_ID" in row.keys() and row["MRELG_ID"]
     }
 
-    # Keep track of the number of inserted, skipped, and errors.
-    inserted = 0
-    skipped = 0
-    errors: list[dict] = []
+    full_refresh = _os.environ.get("TIDE_BACKFILL_FULL", "").strip().lower() in (
+        "1", "true", "yes"
+    )
+    lookback_days = int(_os.environ.get("TIDE_BACKFILL_LOOKBACK_DAYS", "90"))
 
-    for mrelg_id, label_name in df.itertuples(index=False, name=None):
-        if mrelg_id in existing_mrelg_ids:
-            # Skip if the release already exists in the database.
-            skipped += 1
-            continue
+    if existing_mrelg_ids and not full_refresh:
+        date_filter = (
+            f"AND mrelg.release_date >= DATEADD(day, -{int(lookback_days)}, CURRENT_DATE())"
+        )
+        logger.info(
+            "backfill_releases: incremental — querying albums released in last %d days "
+            "(TIDE_BACKFILL_FULL=1 for full scan)",
+            lookback_days,
+        )
+    else:
+        date_filter = ""
+        reason = "TIDE_BACKFILL_FULL=1" if full_refresh else "EXPECTED_RELEASES is empty"
+        logger.info("backfill_releases: full Snowflake scan (%s)", reason)
 
+    query = load_sql(RELEASE_BACKFILL_QUERY).replace("{RELEASE_DATE_FILTER}", date_filter)
+
+    logger.info("backfill_releases: running Snowflake query_release_backfill...")
+    # Single Snowflake connection reused for the candidate list AND per-release metadata.
+    with get_snowflake_connection() as sf:
+        df = sf.query(query)
+        logger.info("backfill_releases: Snowflake returned %d candidate rows", len(df))
+
+        if df.empty:
+            return {"inserted": 0, "skipped": 0, "errors": []}
+
+        pending = [
+            (mid, lbl)
+            for mid, lbl in df.itertuples(index=False, name=None)
+            if (mid or "").strip() not in existing_mrelg_ids
+        ]
+        skipped = len(df) - len(pending)
+        logger.info(
+            "backfill_releases: %d new / %d already in SQLite",
+            len(pending),
+            skipped,
+        )
+
+        inserted = 0
+        errors: list[dict] = []
+
+        for mrelg_id, label_name in pending:
+            try:
+                logger.info(
+                    "backfill_releases: inserting mrelg_id=%s label=%s",
+                    mrelg_id,
+                    label_name,
+                )
+                _create_backfilled_release(mrelg_id=mrelg_id, label_name=label_name, _sf=sf)
+                inserted += 1
+                existing_mrelg_ids.add(mrelg_id)
+            except Exception as e:
+                errors.append({"mrelg_id": mrelg_id, "error": str(e)})
+
+    if inserted > 0 and run_sqlite_refresh:
+        logger.info(
+            "backfill_releases: running update_sqlite_main() for %d new release(s)",
+            inserted,
+        )
         try:
-            # Create the release in the database.
-            _create_backfilled_release(mrelg_id=mrelg_id, label_name=label_name)
-            inserted += 1
-            existing_mrelg_ids.add(mrelg_id)
-        except Exception as e:
-            errors.append({"mrelg_id": mrelg_id, "error": str(e)})
-    try:
-        # Refresh SQLite data for backfilled releases.
-        if inserted > 0:
+            from sqlite_handler import update_sqlite_main
             update_sqlite_main()
-    except Exception as e:
-        errors.append({"stage": "update_sqlite_main", "error": str(e) + "\nWARNING: This means official weekly equivalent data for some releases may not be available at the moment."})
+        except Exception as e:
+            errors.append(
+                {
+                    "stage": "update_sqlite_main",
+                    "error": str(e)
+                    + "\nWARNING: weekly metric data for new releases may be missing.",
+                }
+            )
+    elif inserted > 0:
+        logger.info(
+            "backfill_releases: skipping update_sqlite_main (run_sqlite_refresh=False); "
+            "metrics for %d new release(s) picked up on next sqlite_handler run",
+            inserted,
+        )
 
     return {"inserted": inserted, "skipped": skipped, "errors": errors}
 
@@ -567,6 +645,99 @@ def get_marketshare_actuals() -> pd.DataFrame:
     return out
 
 
+def _sqlite_weekly_marketshare_observed() -> pd.DataFrame:
+    """
+    Weekly label AE volume and share from SQLite (Snowflake refresh via sqlite_handler).
+    Shares are normalized to percent points to match run_archetype_scenario / df_full.
+    """
+    query = load_sql(MARKETSHARE_WEEKLY_ACTUALS_QUERY)
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        raw = pd.read_sql_query(query, conn)
+    if raw.empty:
+        return pd.DataFrame(
+            columns=["Week Ending Date", "Owner", "Total_Market_AE_Volume", "Active_Share"]
+        )
+    wk = pd.to_datetime(raw["WEEK_ENDING_DATE"], errors="coerce")
+    owner = raw["LABEL_NAME"].astype(str)
+    vol = pd.to_numeric(raw["ALBUM_EQUIVALENT"], errors="coerce")
+    sh = pd.to_numeric(raw["ALBUM_EQUIVALENT_SHARE"], errors="coerce")
+    med = sh.dropna().median()
+    if pd.notna(med) and med <= 1.0:
+        sh = sh * 100.0
+    total = pd.Series(
+        pd.NA,
+        index=raw.index,
+        dtype="Float64",
+    )
+    ok = sh.abs() > 1e-9
+    total.loc[ok] = (vol.loc[ok] / (sh.loc[ok] / 100.0)).astype("Float64")
+    out = pd.DataFrame(
+        {
+            "Week Ending Date": wk,
+            "Owner": owner,
+            "Total_Market_AE_Volume": total,
+            "Active_Share": sh,
+        }
+    )
+    return out.dropna(subset=["Week Ending Date", "Owner"]).reset_index(drop=True)
+
+
+def _apply_sqlite_weekly_to_unified_ytd(unified_ytd: pd.DataFrame) -> pd.DataFrame:
+    """
+    Replace weekly Active_Share / Total_Market for weeks present in MARKETSHARE_WEEKLY
+    so /v1/marketshare/weekly matches live SQLite instead of stale actuals_2026.parquet.
+    Recomputes cumulative YTD columns the same way as run_archetype_scenario.
+    """
+    if unified_ytd.empty:
+        return unified_ytd
+    obs = _sqlite_weekly_marketshare_observed()
+    if obs.empty:
+        return unified_ytd
+
+    df = unified_ytd.copy()
+    df["_wk"] = pd.to_datetime(df["Week Ending Date"], errors="coerce")
+    obs = obs.copy()
+    obs["_wk"] = pd.to_datetime(obs["Week Ending Date"], errors="coerce")
+    patch = obs[["Owner", "_wk", "Active_Share", "Total_Market_AE_Volume"]].rename(
+        columns={
+            "Active_Share": "_sqlite_share",
+            "Total_Market_AE_Volume": "_sqlite_tot",
+        }
+    )
+    merged = df.merge(patch, on=["Owner", "_wk"], how="left")
+    hit = merged["_sqlite_share"].notna() & merged["_sqlite_tot"].notna()
+    merged.loc[hit, "Active_Share"] = merged.loc[hit, "_sqlite_share"]
+    merged.loc[hit, "Total_Market_AE_Volume"] = merged.loc[hit, "_sqlite_tot"]
+    merged.loc[hit, "Data_Type"] = "Actual"
+    merged = merged.drop(columns=["_sqlite_share", "_sqlite_tot"], errors="ignore")
+
+    merged = merged.sort_values(by=["Owner", "_wk"]).reset_index(drop=True)
+    merged["Active_Share"] = pd.to_numeric(merged["Active_Share"], errors="coerce").fillna(0.0)
+    merged["Total_Market_AE_Volume"] = pd.to_numeric(
+        merged["Total_Market_AE_Volume"], errors="coerce"
+    ).fillna(0.0)
+    merged["Weighted_Numerator"] = merged["Active_Share"] * merged["Total_Market_AE_Volume"]
+    merged["Cum_Numerator"] = merged.groupby("Owner", sort=False)["Weighted_Numerator"].cumsum()
+    merged["Cum_Denominator"] = merged.groupby("Owner", sort=False)["Total_Market_AE_Volume"].cumsum()
+    den = merged["Cum_Denominator"].replace(0, float("nan"))
+    merged["Unified_YTD_Share"] = (merged["Cum_Numerator"] / den).round(4)
+
+    eng = get_engine()
+    es = float(getattr(eng, "e_score_default", 0.82) or 0.82)
+    fc_mask = merged["Data_Type"].astype(str) == "Forecast"
+    merged.loc[~fc_mask, "YTD_Share_Upper"] = merged.loc[~fc_mask, "Unified_YTD_Share"]
+    merged.loc[~fc_mask, "YTD_Share_Lower"] = merged.loc[~fc_mask, "Unified_YTD_Share"]
+    merged.loc[fc_mask, "YTD_Share_Upper"] = merged.loc[fc_mask, "Unified_YTD_Share"] + es
+    merged.loc[fc_mask, "YTD_Share_Lower"] = merged.loc[fc_mask, "Unified_YTD_Share"] - es
+
+    wk_str = merged["_wk"].dt.strftime("%Y-%m-%d")
+    merged["Week Ending Date"] = wk_str.where(
+        merged["_wk"].notna(), merged["Week Ending Date"].astype(str)
+    )
+    merged = merged.drop(columns=["_wk"], errors="ignore")
+    return merged
+
+
 def get_marketshare_forecasts(week_ending_date: str | None = None) -> pd.DataFrame:
     """
     Takes in a week ending date and returns the marketshare forecasts for that week.
@@ -587,6 +758,7 @@ def get_marketshare_forecasts(week_ending_date: str | None = None) -> pd.DataFra
     unified_ytd = pd.DataFrame(forecasts["unified_ytd"])
     if unified_ytd.empty:
         return unified_ytd
+    unified_ytd = _apply_sqlite_weekly_to_unified_ytd(unified_ytd)
     if week_ending_date is None:
         return unified_ytd
     else:
@@ -1057,12 +1229,16 @@ def get_global_streaming_forecast(id: int) -> pd.DataFrame:
             f"Release {id} has no mrelg_id; worldwide streaming forecast requires "
             "a Luminate release group ID."
         )
+    release_date = _validate_date(release.get("date"))
 
     # Get historical observed weeks from Snowflake.
     with get_snowflake_connection() as _sf:
-        hist_df = _get_known_vols_global_streaming(mrelg_id, _sf)
+        hist_df = _get_known_vols_global_streaming(mrelg_id, release_date, _sf)
     if hist_df.empty:
         raise ValueError(f"No historical observed weeks found for mrelg_id: {mrelg_id}")
+
+    artifacts = get_worldwide_artifacts()
+    horizon_weeks = int(artifacts.horizon_weeks)
 
     # Extract ordered weekly raw stream counts; empty list = cold-start mode.
     known: List[float] = []
@@ -1073,6 +1249,18 @@ def get_global_streaming_forecast(id: int) -> pd.DataFrame:
         )
         series = pd.to_numeric(hist_df[stream_col], errors="coerce").fillna(0.0)
         known = series.tolist()
+        if len(known) > horizon_weeks:
+            logger.info(
+                "global_streaming: truncating observed weeks for release_id=%s mrelg_id=%s from %d to %d",
+                id,
+                mrelg_id,
+                len(known),
+                horizon_weeks,
+            )
+            # fit_backfill_forecast requires len(actuals) <= end_week <= horizon.
+            # Keep the earliest weeks (week 1..horizon) for a valid backfill fit.
+            known = known[:horizon_weeks]
+            hist_df = hist_df.iloc[:horizon_weeks].copy()
 
     # Cold-start peak: prefer fw_streams, fall back to fw_vol.
     fw_peak = float(release.get("fw_streams") or 0.0) or float(release.get("fw_vol") or 0.0)
@@ -1083,7 +1271,6 @@ def get_global_streaming_forecast(id: int) -> pd.DataFrame:
             "Provide at least one observed week or set fw_streams > 0."
         )
 
-    artifacts = get_worldwide_artifacts()
     release_dict: Dict[str, Any] = {
         "artist": release.get("artist") or release.get("name") or "",
         "name": release.get("name") or "",
@@ -1093,7 +1280,7 @@ def get_global_streaming_forecast(id: int) -> pd.DataFrame:
         "fw_worldwide_streams": fw_peak,
     }
 
-    result = simulate_one_worldwide_streams(release_dict, artifacts, end_week=int(artifacts.horizon_weeks))
+    result = simulate_one_worldwide_streams(release_dict, artifacts, end_week=horizon_weeks)
 
     n_known = len(known)
     df = pd.DataFrame(result["weekly"])  # week, pred_worldwide_streams, cumulative_worldwide_streams
@@ -1136,8 +1323,16 @@ def get_global_streaming_forecast(id: int) -> pd.DataFrame:
     return df
 
 
-def _get_known_vols_global_streaming(mrelg_id: str, _sf: Snowflake) -> pd.DataFrame:
-    df = _sf.query(load_sql(GLOBAL_STREAMING_QUERY).replace("{MRELG_ID}", f"'{mrelg_id}'"))
+def _get_known_vols_global_streaming(mrelg_id: str, release_date: str, _sf: Snowflake) -> pd.DataFrame:
+    sql = (
+        load_sql(GLOBAL_STREAMING_QUERY)
+        .replace("{MRELG_ID}", f"'{mrelg_id}'")
+        .replace("{RELEASE_DATE}", f"'{release_date}'")
+    )
+    df = _sf.query(sql)
     if df.empty:
-        raise ValueError(f"No global streaming data found for mrelg_id: {mrelg_id}")
+        raise ValueError(
+            f"No global streaming data found for mrelg_id: {mrelg_id} "
+            f"on/after release_date: {release_date}"
+        )
     return df

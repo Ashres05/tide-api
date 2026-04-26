@@ -29,6 +29,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from prophet import Prophet
+from sklearn.cluster import KMeans
 from sklearn.linear_model import Ridge
 
 import lightgbm as lgb
@@ -48,8 +49,47 @@ TARGET_LABELS = ["Atlantic Music Group", "Interscope/Geffen/A&M"]
 TRAINING_CATEGORIES = TARGET_LABELS
 
 
+def _normalize_current_data_year_column(current: pd.DataFrame) -> pd.DataFrame:
+    """Normalize Year/YEAR/year from Current_Data.csv to nullable int column ``Year``."""
+    for cand in ("Year", "YEAR", "year"):
+        if cand in current.columns:
+            out = current.rename(columns={cand: "Year"}) if cand != "Year" else current.copy()
+            out["Year"] = pd.to_numeric(out["Year"], errors="coerce").astype("Int64")
+            return out
+    return current
+
+
+def forecast_year_row_mask(df: pd.DataFrame, forecast_year: int) -> pd.Series:
+    """
+    Rows for chart/industry year ``forecast_year`` from Current_Data ``Year``,
+    not calendar week-ending date. Rows with null ``Year`` fall back to
+    ``Week Ending Date >= {forecast_year}-01-08``. If ``Year`` is absent or all-null,
+    use that date threshold only.
+    """
+    wk = pd.to_datetime(df["Week Ending Date"])
+    jan8 = pd.Timestamp(year=forecast_year, month=1, day=8)
+    legacy = wk >= jan8
+    if "Year" not in df.columns:
+        logger.warning(
+            "No Year column; using Week Ending Date >= %s for forecast_year=%s",
+            jan8.date().isoformat(),
+            forecast_year,
+        )
+        return legacy
+    yr = pd.to_numeric(df["Year"], errors="coerce")
+    if not yr.notna().any():
+        logger.warning(
+            "Year column all null; using Week Ending Date >= %s for forecast_year=%s",
+            jan8.date().isoformat(),
+            forecast_year,
+        )
+        return legacy
+    return (yr.notna() & (yr == forecast_year)) | (yr.isna() & legacy)
+
+
 def load_weekly_amg_int(data_dir: Path) -> pd.DataFrame:
     current = pd.read_csv(data_dir / "Current_Data.csv")
+    current = _normalize_current_data_year_column(current)
     if "RELEASE_AGE" in current.columns:
         ra = current["RELEASE_AGE"].astype(str).str.strip()
         n_before = len(current)
@@ -196,13 +236,10 @@ def train_lgbm_prophet(df_model: pd.DataFrame) -> Tuple[lgb.LGBMRegressor, Dict[
         prophet_train = label_df[["Week Ending Date", "AE_Share"]].rename(
             columns={"Week Ending Date": "ds", "AE_Share": "y"} # BACK TO SHARE
         )
-        # growth='flat': short scrubbed history + yearly seasonality otherwise
-        # extrapolates a spurious downward trend for Interscope baseline share.
         prophet_model = Prophet(
             yearly_seasonality=2,
             weekly_seasonality=False,
             daily_seasonality=False,
-            growth="flat",
         )
         prophet_model.fit(prophet_train.dropna())
         production_prophet_models[label] = prophet_model
@@ -213,6 +250,7 @@ def conformal_e80_2026(
     df_model: pd.DataFrame,
     production_lgbm: lgb.LGBMRegressor,
     production_prophet_models: Dict[str, Any],
+    forecast_year: int = 2026,
 ) -> float:
     backtest_raw = df_model[df_model["Week Ending Date"] >= "2025-11-01"].copy()
     backtest_raw = backtest_raw[backtest_raw["Owner"].isin(TARGET_LABELS)].sort_values(
@@ -224,7 +262,7 @@ def conformal_e80_2026(
     for label in TARGET_LABELS:
         df_label = backtest_raw[backtest_raw["Owner"] == label].copy()
                 
-        df_label = df_label[df_label["Week Ending Date"] >= "2026-01-08"].dropna()
+        df_label = df_label[forecast_year_row_mask(df_label, forecast_year)].dropna()
         if df_label.empty:
             continue
             
@@ -254,50 +292,82 @@ def conformal_e80_2026(
 
 def forecast_baseline_future(
     df_model: pd.DataFrame,
+    weekly_amg_int: pd.DataFrame,
     production_lgbm: lgb.LGBMRegressor,
     production_prophet_models: Dict[str, Any],
     end_of_year: str,
     week_freq: str = "W-THU",
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Returns (future_label_df, future_market_volumes)."""
+    """Returns (future_label_df, future_market_volumes) using an autoregressive loop."""
     last_date = pd.to_datetime(df_model["Week Ending Date"].max())
     end_dt = pd.to_datetime(end_of_year)
     remaining_weeks = pd.date_range(start=last_date + pd.Timedelta(days=7), end=end_dt, freq=week_freq)
-    future_label_df = pd.DataFrame()
-    for label in TARGET_LABELS:
-        label_history = df_model[df_model["Owner"] == label].sort_values("Week Ending Date")
-        last_4 = label_history.tail(4)
-        current_lag1_ae = last_4.iloc[-1]["AE_Volume"]
-        current_lag1_comp = last_4.iloc[-1]["Competitor_AE_Volume"]
-        current_roll4w_ae = last_4["AE_Volume"].mean()
-        current_roll4w_comp = last_4["Competitor_AE_Volume"].mean()
-        df_temp = pd.DataFrame({"Week Ending Date": remaining_weeks, "Owner": label})
-        df_temp["Owner"] = df_temp["Owner"].astype("category")
-        df_temp["Lag1_AE_Volume"] = current_lag1_ae
-        df_temp["Lag1_Competitor_Volume"] = current_lag1_comp
-        df_temp["Roll4W_AE_Volume"] = current_roll4w_ae
-        df_temp["Roll4W_Competitor_Volume"] = current_roll4w_comp
-        lgbm_features = df_temp[
-            ["Owner", "Lag1_AE_Volume", "Lag1_Competitor_Volume", "Roll4W_AE_Volume", "Roll4W_Competitor_Volume"]
-        ]
-        df_temp["LGBM_Share"] = production_lgbm.predict(lgbm_features)
-        prophet_future = df_temp[["Week Ending Date"]].rename(columns={"Week Ending Date": "ds"})
-        df_temp["Prophet_Share"] = production_prophet_models[label].predict(prophet_future)["yhat"].values
-        df_temp["Predicted_Weekly_Share"] = (df_temp["LGBM_Share"] + df_temp["Prophet_Share"]) / 2
-        future_label_df = pd.concat([future_label_df, df_temp], ignore_index=True)
 
-    wk_for_market = df_model  # use same df for distinct market timeline
-    market_history = wk_for_market[["Week Ending Date", "Total_Market_AE_Volume"]].drop_duplicates()
-    market_history = market_history.sort_values("Week Ending Date").reset_index(drop=True)
+    # 1. Forecast Total Market First (So we have the denominator)
+    market_history = weekly_amg_int[["Week Ending Date", "Total_Market_AE_Volume"]].drop_duplicates().sort_values("Week Ending Date")
     market_prophet_train = market_history.rename(columns={"Week Ending Date": "ds", "Total_Market_AE_Volume": "y"})
     market_model = Prophet(yearly_seasonality=3, weekly_seasonality=False, daily_seasonality=False)
     market_model.fit(market_prophet_train.dropna())
-    last_actual_date = market_history["Week Ending Date"].max()
     future_market = pd.DataFrame({"ds": remaining_weeks})
     market_forecast = market_model.predict(future_market)
     future_market_volumes = market_forecast[["ds", "yhat"]].rename(
         columns={"ds": "Week Ending Date", "yhat": "Predicted_Total_Market_Volume"}
     )
+
+    # 2. Autoregressive Loop for Labels
+    future_label_df = pd.DataFrame()
+    for label in TARGET_LABELS:
+        label_history = df_model[df_model["Owner"] == label].sort_values("Week Ending Date")
+        # Keep the last 4 weeks of volume in a list to seed the rolling averages
+        recent_vols = list(label_history.tail(4)["AE_Volume"].values)
+        recent_comp = list(label_history.tail(4)["Competitor_AE_Volume"].values)
+
+        temp_rows = []
+        for i, week_dt in enumerate(remaining_weeks):
+            # Calculate dynamic lags based on the running memory
+            current_lag1_ae = recent_vols[-1]
+            current_lag1_comp = recent_comp[-1]
+            current_roll4w_ae = sum(recent_vols[-4:]) / 4
+            current_roll4w_comp = sum(recent_comp[-4:]) / 4
+
+            # Predict LightGBM
+            lgbm_in = pd.DataFrame({
+                "Owner": [label],
+                "Lag1_AE_Volume": [current_lag1_ae],
+                "Lag1_Competitor_Volume": [current_lag1_comp],
+                "Roll4W_AE_Volume": [current_roll4w_ae],
+                "Roll4W_Competitor_Volume": [current_roll4w_comp]
+            })
+            lgbm_in["Owner"] = lgbm_in["Owner"].astype("category")
+            lgbm_pred = float(production_lgbm.predict(lgbm_in)[0])
+
+            # Predict Prophet
+            prophet_pred = float(production_prophet_models[label].predict(pd.DataFrame({"ds": [week_dt]}))["yhat"].iloc[0])
+
+            pred_weekly_share = (lgbm_pred + prophet_pred) / 2
+
+            temp_rows.append({
+                "Week Ending Date": week_dt,
+                "Owner": label,
+                "Lag1_AE_Volume": current_lag1_ae,
+                "Lag1_Competitor_Volume": current_lag1_comp,
+                "Roll4W_AE_Volume": current_roll4w_ae,
+                "Roll4W_Competitor_Volume": current_roll4w_comp,
+                "LGBM_Share": lgbm_pred,
+                "Prophet_Share": prophet_pred,
+                "Predicted_Weekly_Share": pred_weekly_share
+            })
+
+            # AUTOREGRESSION: Convert predicted share back to volume for next week's input
+            current_market_vol = future_market_volumes.iloc[i]["Predicted_Total_Market_Volume"]
+            new_ae_vol = (pred_weekly_share / 100) * current_market_vol
+            new_comp_vol = current_market_vol - new_ae_vol
+
+            recent_vols.append(new_ae_vol)
+            recent_comp.append(new_comp_vol)
+
+        future_label_df = pd.concat([future_label_df, pd.DataFrame(temp_rows)], ignore_index=True)
+
     return future_label_df, future_market_volumes
 
 
@@ -452,9 +522,10 @@ def attach_total_market_volume(
     return out
 
 
-def build_actuals_2026(weekly_amg_int: pd.DataFrame) -> pd.DataFrame:
+def build_actuals_2026(weekly_amg_int: pd.DataFrame, forecast_year: int = 2026) -> pd.DataFrame:
     actuals_2026 = weekly_amg_int[
-        (weekly_amg_int["Week Ending Date"] >= "2026-01-08") & (weekly_amg_int["Owner"].isin(TARGET_LABELS))
+        forecast_year_row_mask(weekly_amg_int, forecast_year)
+        & weekly_amg_int["Owner"].isin(TARGET_LABELS)
     ].copy()
     actuals_2026 = actuals_2026.sort_values(by=["Owner", "Week Ending Date"]).reset_index(drop=True)
     dup_n = actuals_2026.duplicated(subset=["Owner", "Week Ending Date"]).sum()
@@ -473,6 +544,204 @@ def build_actuals_2026(weekly_amg_int: pd.DataFrame) -> pd.DataFrame:
         actuals_2026["Cum_Numerator"] / actuals_2026["Cum_Denominator"]
     ).round(2)
     return actuals_2026
+
+
+def _week_vol(g: pd.DataFrame, w: int) -> float:
+    s = g.loc[g["WEEKS_SINCE_RELEASE"] == w, "TOTAL_ALBUM_EQUIVALENTS"]
+    return float(s.iloc[0]) if not s.empty else 0.0
+
+
+def _release_w2_over_w1_ratio(
+    g: pd.DataFrame,
+    min_w1_share_of_early_peak: float = 0.12,
+) -> Optional[float]:
+    """Robust W2/W1 ratio from AE parquet release history."""
+    v0, v1, v2, v3 = (
+        _week_vol(g, 0),
+        _week_vol(g, 1),
+        _week_vol(g, 2),
+        _week_vol(g, 3),
+    )
+    if v2 <= 0:
+        return None
+    peak_early = max(v0, v1, v2, v3)
+    if peak_early <= 0:
+        return None
+    if v2 > v1 * 1.005:
+        denom = max(v0, v1, v2, v3)
+        return float(min(v2 / denom, 1.0)) if denom > 0 else None
+    if v1 > 0 and v1 < peak_early * min_w1_share_of_early_peak:
+        return None
+    equiv_w1 = max(v0, v1) if max(v0, v1) > 0 else v1
+    if equiv_w1 <= 0:
+        return None
+    return float(min(v2 / equiv_w1, 1.0))
+
+
+def build_artist_w2_retention_from_ae_parquet(ae_parquet: Path) -> Dict[str, Dict[str, float]]:
+    cols = ["DISPLAY_ARTIST", "MRELG_ID", "WEEKS_SINCE_RELEASE", "TOTAL_ALBUM_EQUIVALENTS"]
+    df = pd.read_parquet(ae_parquet, columns=cols)
+    df["TOTAL_ALBUM_EQUIVALENTS"] = pd.to_numeric(df["TOTAL_ALBUM_EQUIVALENTS"], errors="coerce")
+    df["WEEKS_SINCE_RELEASE"] = pd.to_numeric(df["WEEKS_SINCE_RELEASE"], errors="coerce")
+    df = df.dropna(subset=["WEEKS_SINCE_RELEASE", "TOTAL_ALBUM_EQUIVALENTS"])
+    ratios: List[Dict[str, Any]] = []
+    for (artist, _mid), g in df.groupby(["DISPLAY_ARTIST", "MRELG_ID"], sort=False):
+        r = _release_w2_over_w1_ratio(g)
+        if r is not None:
+            ratios.append({"DISPLAY_ARTIST": str(artist), "ratio": r})
+    if not ratios:
+        return {}
+    rdf = pd.DataFrame(ratios)
+    agg = rdf.groupby("DISPLAY_ARTIST", sort=False).agg(
+        median_w2_over_w1=("ratio", "median"),
+        n_releases=("ratio", "count"),
+    )
+    out: Dict[str, Dict[str, float]] = {}
+    for artist, row in agg.iterrows():
+        out[str(artist)] = {
+            "median_w2_over_w1": float(row["median_w2_over_w1"]),
+            "n_releases": int(row["n_releases"]),
+        }
+    return out
+
+
+def _ae_release_pivot_from_parquet(ae_parquet: Path) -> pd.DataFrame:
+    cols = [
+        "MRELG_ID",
+        "TITLE",
+        "DISPLAY_ARTIST",
+        "GENRES",
+        "WEEKS_SINCE_RELEASE",
+        "PRODUCT_SALES",
+        "TOTAL_ALBUM_EQUIVALENTS",
+    ]
+    df = pd.read_parquet(ae_parquet, columns=cols)
+    df["WEEKS_SINCE_RELEASE"] = pd.to_numeric(df["WEEKS_SINCE_RELEASE"], errors="coerce")
+    df = df.dropna(subset=["WEEKS_SINCE_RELEASE"]).copy()
+    pivot = df.pivot_table(
+        index=["MRELG_ID", "TITLE", "DISPLAY_ARTIST", "GENRES"],
+        columns="WEEKS_SINCE_RELEASE",
+        values=["TOTAL_ALBUM_EQUIVALENTS", "PRODUCT_SALES"],
+        aggfunc="sum",
+    ).reset_index()
+    pivot.columns = [
+        f"{col[0]}_w{int(col[1])}" if col[1] != "" else col[0] for col in pivot.columns.values
+    ]
+    return pivot
+
+
+def kmeans_and_dna_from_ae_parquet(
+    ae_parquet: Path,
+) -> Tuple[Dict[str, Dict[int, float]], Any, Dict[str, int], Dict[str, int]]:
+    cols = ["MRELG_ID", "TITLE", "DISPLAY_ARTIST", "WEEKS_SINCE_RELEASE", "TOTAL_ALBUM_EQUIVALENTS"]
+    df = pd.read_parquet(ae_parquet, columns=cols)
+    df["project_label"] = df["DISPLAY_ARTIST"].astype(str).fillna("") + " - " + df["TITLE"].astype(str).fillna("")
+    lifespan = df.groupby("project_label")["WEEKS_SINCE_RELEASE"].max()
+    mature = lifespan[lifespan >= 52].index
+    df = df[df["project_label"].isin(mature)].copy()
+    df_52 = df[df["WEEKS_SINCE_RELEASE"] <= 52].copy()
+    shape_df = df_52.pivot_table(
+        index="project_label",
+        columns="WEEKS_SINCE_RELEASE",
+        values="TOTAL_ALBUM_EQUIVALENTS",
+        aggfunc="sum",
+    ).fillna(0)
+    peaks = shape_df.max(axis=1)
+    normalized = shape_df.div(peaks.replace(0, np.nan), axis=0).replace([np.inf, -np.inf], np.nan).dropna()
+    kmeans = KMeans(n_clusters=4, random_state=42, n_init=10)
+    labels = kmeans.fit_predict(normalized.to_numpy())
+    normalized = normalized.copy()
+    normalized["archetype_cluster"] = labels
+    historical = normalized[["archetype_cluster"]].reset_index()
+    features = df.merge(historical, on="project_label", how="left")
+    probs = (
+        features.groupby(["DISPLAY_ARTIST", "archetype_cluster"], sort=False)
+        .agg(count=("MRELG_ID", "nunique"))
+        .reset_index()
+    )
+    probs["prob"] = probs.groupby("DISPLAY_ARTIST")["count"].transform(lambda x: x / x.sum())
+    artist_dna_lookup = probs.groupby("DISPLAY_ARTIST").apply(
+        lambda x: dict(zip(x["archetype_cluster"], x["prob"]))
+    ).to_dict()
+    project_to_cluster = normalized["archetype_cluster"].astype(int).to_dict()
+    mrelg_rows = features.dropna(subset=["archetype_cluster"]).drop_duplicates(subset=["MRELG_ID"], keep="first")
+    mrelg_to_cluster = {str(r["MRELG_ID"]): int(r["archetype_cluster"]) for _, r in mrelg_rows.iterrows()}
+    return artist_dna_lookup, kmeans, project_to_cluster, mrelg_to_cluster
+
+
+def build_artist_profile_dict_from_ae_parquet(ae_parquet: Path) -> Dict[str, float]:
+    pvt = _ae_release_pivot_from_parquet(ae_parquet)
+    if "PRODUCT_SALES_w1" not in pvt.columns or "TOTAL_ALBUM_EQUIVALENTS_w1" not in pvt.columns:
+        return {}
+    pvt["w1_product_ratio"] = pvt["PRODUCT_SALES_w1"] / pvt["TOTAL_ALBUM_EQUIVALENTS_w1"]
+    pvt["w1_product_ratio"] = pvt["w1_product_ratio"].replace([np.inf, -np.inf], np.nan)
+    agg = pvt.dropna(subset=["w1_product_ratio"]).groupby("DISPLAY_ARTIST")["w1_product_ratio"].median()
+    return {str(k): float(v) for k, v in agg.items()}
+
+
+def _row_m52_multiplier_from_pivot(row: pd.Series) -> float:
+    total = 0.0
+    for k in range(0, 52):
+        col = f"TOTAL_ALBUM_EQUIVALENTS_w{k}"
+        if col in row.index and pd.notna(row[col]):
+            total += float(row[col])
+    w1_col = "TOTAL_ALBUM_EQUIVALENTS_w1"
+    if w1_col not in row.index or pd.isna(row[w1_col]) or float(row[w1_col]) <= 0:
+        return float("nan")
+    return total / float(row[w1_col])
+
+
+def fit_cluster_product_coefficients_from_ae_parquet(
+    ae_parquet: Path,
+    project_to_cluster: Dict[str, int],
+    mrelg_to_cluster: Dict[str, int],
+    global_fallback: float = GLOBAL_PRODUCT_COEF,
+    min_cluster_n: int = 25,
+    ridge_alpha: float = 2.0,
+) -> Tuple[Dict[int, float], Dict[str, Any]]:
+    pvt = _ae_release_pivot_from_parquet(ae_parquet)
+    if "PRODUCT_SALES_w1" not in pvt.columns or "TOTAL_ALBUM_EQUIVALENTS_w1" not in pvt.columns:
+        return {}, {}
+    pvt["w1_product_ratio"] = pvt["PRODUCT_SALES_w1"] / pvt["TOTAL_ALBUM_EQUIVALENTS_w1"]
+    pvt["w1_product_ratio"] = pvt["w1_product_ratio"].replace([np.inf, -np.inf], np.nan).clip(lower=0.0, upper=1.0)
+    pvt["y_target"] = pvt.apply(_row_m52_multiplier_from_pivot, axis=1)
+    mid = pvt["MRELG_ID"].astype(str)
+    pvt["archetype_cluster"] = mid.map(mrelg_to_cluster)
+    miss = pvt["archetype_cluster"].isna()
+    if miss.any():
+        pvt.loc[miss, "archetype_cluster"] = (
+            pvt.loc[miss, "DISPLAY_ARTIST"].astype(str).fillna("")
+            + " - "
+            + pvt.loc[miss, "TITLE"].astype(str).fillna("")
+        ).map(project_to_cluster)
+    sub = pvt.dropna(subset=["y_target", "w1_product_ratio", "archetype_cluster"]).copy()
+    sub["archetype_cluster"] = sub["archetype_cluster"].astype(int)
+
+    coefs: Dict[int, float] = {}
+    meta: Dict[str, Any] = {}
+    for c in sorted(sub["archetype_cluster"].unique()):
+        if c not in (0, 1, 2, 3):
+            continue
+        chunk = sub[sub["archetype_cluster"] == c]
+        n = len(chunk)
+        if n < min_cluster_n:
+            coefs[int(c)] = float(global_fallback)
+            meta[str(c)] = {"n": n, "slope": None, "fallback": True}
+            continue
+        X = chunk[["w1_product_ratio"]].to_numpy(dtype=float)
+        y = chunk["y_target"].to_numpy(dtype=float)
+        model = Ridge(alpha=ridge_alpha)
+        model.fit(X, y)
+        coefs[int(c)] = float(model.coef_[0])
+        meta[str(c)] = {
+            "n": n,
+            "slope": float(model.coef_[0]),
+            "intercept": float(model.intercept_),
+            "fallback": False,
+        }
+    for c in (0, 1, 2, 3):
+        coefs.setdefault(c, float(global_fallback))
+    return coefs, meta
 
 
 def main() -> None:
@@ -494,16 +763,18 @@ def main() -> None:
 
     df_model = prepare_df_model(wk_minus)
     production_lgbm, production_prophet_models = train_lgbm_prophet(df_model)
-    e80 = conformal_e80_2026(df_model, production_lgbm, production_prophet_models)
+    e80 = conformal_e80_2026(
+        df_model, production_lgbm, production_prophet_models, forecast_year=args.forecast_year
+    )
     e_score = e80
     logger.info("Conformal 80th percentile E: %.4f (used as E_score for YTD bands)", e_score)
 
     future_label_df, future_market_volumes = forecast_baseline_future(
-        df_model, production_lgbm, production_prophet_models, args.end_of_year
+        df_model, weekly_amg_int, production_lgbm, production_prophet_models, args.end_of_year
     )
     final_forecast = pd.merge(future_label_df, future_market_volumes, on="Week Ending Date", how="inner")
 
-    df_2026_base = wk_minus[wk_minus["Week Ending Date"] >= "2026-01-08"].copy()
+    df_2026_base = wk_minus[forecast_year_row_mask(wk_minus, args.forecast_year)].copy()  
     df_2026_base = df_2026_base[df_2026_base["Owner"].isin(TARGET_LABELS)].sort_values(
         ["Owner", "Week Ending Date"]
     ).reset_index(drop=True)
@@ -533,7 +804,7 @@ def main() -> None:
     spike_engine, df_full, spike_features = train_spike_and_df_full(weekly_enriched, ytd_projections)
 
     # Market volume for future weeks (Prophet on total market) — reuse series from forecast_baseline_future
-    market_history = df_model[["Week Ending Date", "Total_Market_AE_Volume"]].drop_duplicates().sort_values(
+    market_history = weekly_amg_int[["Week Ending Date", "Total_Market_AE_Volume"]].drop_duplicates().sort_values(
         "Week Ending Date"
     )
     market_prophet_train = market_history.rename(columns={"Week Ending Date": "ds", "Total_Market_AE_Volume": "y"})
@@ -546,13 +817,32 @@ def main() -> None:
     full_fc = market_model.predict(pd.DataFrame({"ds": remaining_weeks}))
     df_full = attach_total_market_volume(df_full, weekly_amg_int, full_fc[["ds", "yhat"]])
 
-    actuals_2026 = build_actuals_2026(weekly_amg_int)
+    actuals_2026 = build_actuals_2026(weekly_amg_int, forecast_year=args.forecast_year)
 
-    # Per-archetype product tail uses GLOBAL_PRODUCT_COEF; streams/sales/songs come from separate archetype trains.
+    ae_parquet = data_dir / "streams_product_songs_ae_compressed.parquet"
     artist_dna_lookup: Dict[str, Dict[int, float]] = {}
     artist_w2_retention: Dict[str, Dict[str, float]] = {}
     artist_profile_dict: Dict[str, float] = {}
-    cluster_product_coef = {c: float(GLOBAL_PRODUCT_COEF) for c in (0, 1, 2, 3)}
+    cluster_product_coef: Dict[int, float] = {}
+    cluster_product_meta: Dict[str, Any] = {}
+    if ae_parquet.exists():
+        try:
+            artist_dna_lookup, kmeans_model, project_to_cluster, mrelg_to_cluster = (
+                kmeans_and_dna_from_ae_parquet(ae_parquet)
+            )
+            joblib.dump(kmeans_model, art_dir / "kmeans_archetype_75k.pkl")
+            artist_w2_retention = build_artist_w2_retention_from_ae_parquet(ae_parquet)
+            artist_profile_dict = build_artist_profile_dict_from_ae_parquet(ae_parquet)
+            cluster_product_coef, cluster_product_meta = fit_cluster_product_coefficients_from_ae_parquet(
+                ae_parquet,
+                project_to_cluster,
+                mrelg_to_cluster,
+                global_fallback=GLOBAL_PRODUCT_COEF,
+            )
+        except Exception as e:
+            logger.warning("Parquet-derived enrichment failed (%s); using fallback globals.", e)
+    if not cluster_product_coef:
+        cluster_product_coef = {c: float(GLOBAL_PRODUCT_COEF) for c in (0, 1, 2, 3)}
 
     joblib.dump(production_lgbm, art_dir / "production_lgbm_75k.pkl")
     joblib.dump(production_prophet_models, art_dir / "production_prophet_models_75k.pkl")
@@ -571,6 +861,9 @@ def main() -> None:
         json.dump(DISTRIBUTIONS, f, indent=2)
     with open(art_dir / "cluster_product_coef.json", "w", encoding="utf-8") as f:
         json.dump({str(k): float(v) for k, v in sorted(cluster_product_coef.items())}, f, indent=2)
+    if cluster_product_meta:
+        with open(art_dir / "cluster_product_regression.json", "w", encoding="utf-8") as f:
+            json.dump(cluster_product_meta, f, indent=2)
 
     meta = {
         "GLOBAL_PRODUCT_COEF": GLOBAL_PRODUCT_COEF,
@@ -611,16 +904,18 @@ def train_artifacts_main() -> None:
 
     df_model = prepare_df_model(wk_minus)
     production_lgbm, production_prophet_models = train_lgbm_prophet(df_model)
-    e80 = conformal_e80_2026(df_model, production_lgbm, production_prophet_models)
+    e80 = conformal_e80_2026(
+        df_model, production_lgbm, production_prophet_models, forecast_year=forecast_year
+    )
     e_score = e80
     logger.info("Conformal 80th percentile E: %.4f (used as E_score for YTD bands)", e_score)
 
     future_label_df, future_market_volumes = forecast_baseline_future(
-        df_model, production_lgbm, production_prophet_models, end_of_year
+        df_model, weekly_amg_int, production_lgbm, production_prophet_models, end_of_year
     )
     final_forecast = pd.merge(future_label_df, future_market_volumes, on="Week Ending Date", how="inner")
 
-    df_2026_base = wk_minus[wk_minus["Week Ending Date"] >= "2026-01-08"].copy()
+    df_2026_base = wk_minus[forecast_year_row_mask(wk_minus, forecast_year)].copy()
     df_2026_base = df_2026_base[df_2026_base["Owner"].isin(TARGET_LABELS)].sort_values(
         ["Owner", "Week Ending Date"]
     ).reset_index(drop=True)
@@ -650,7 +945,7 @@ def train_artifacts_main() -> None:
     spike_engine, df_full, spike_features = train_spike_and_df_full(weekly_enriched, ytd_projections)
 
     # Market volume for future weeks (Prophet on total market) — reuse series from forecast_baseline_future
-    market_history = df_model[["Week Ending Date", "Total_Market_AE_Volume"]].drop_duplicates().sort_values(
+    market_history = weekly_amg_int[["Week Ending Date", "Total_Market_AE_Volume"]].drop_duplicates().sort_values(
         "Week Ending Date"
     )
     market_prophet_train = market_history.rename(columns={"Week Ending Date": "ds", "Total_Market_AE_Volume": "y"})
@@ -663,12 +958,32 @@ def train_artifacts_main() -> None:
     full_fc = market_model.predict(pd.DataFrame({"ds": remaining_weeks}))
     df_full = attach_total_market_volume(df_full, weekly_amg_int, full_fc[["ds", "yhat"]])
 
-    actuals_2026 = build_actuals_2026(weekly_amg_int)
+    actuals_2026 = build_actuals_2026(weekly_amg_int, forecast_year=forecast_year)
 
+    ae_parquet = data_dir / "streams_product_songs_ae_compressed.parquet"
     artist_dna_lookup: Dict[str, Dict[int, float]] = {}
     artist_w2_retention: Dict[str, Dict[str, float]] = {}
     artist_profile_dict: Dict[str, float] = {}
-    cluster_product_coef = {c: float(GLOBAL_PRODUCT_COEF) for c in (0, 1, 2, 3)}
+    cluster_product_coef: Dict[int, float] = {}
+    cluster_product_meta: Dict[str, Any] = {}
+    if ae_parquet.exists():
+        try:
+            artist_dna_lookup, kmeans_model, project_to_cluster, mrelg_to_cluster = (
+                kmeans_and_dna_from_ae_parquet(ae_parquet)
+            )
+            joblib.dump(kmeans_model, art_dir / "kmeans_archetype_75k.pkl")
+            artist_w2_retention = build_artist_w2_retention_from_ae_parquet(ae_parquet)
+            artist_profile_dict = build_artist_profile_dict_from_ae_parquet(ae_parquet)
+            cluster_product_coef, cluster_product_meta = fit_cluster_product_coefficients_from_ae_parquet(
+                ae_parquet,
+                project_to_cluster,
+                mrelg_to_cluster,
+                global_fallback=GLOBAL_PRODUCT_COEF,
+            )
+        except Exception as e:
+            logger.warning("Parquet-derived enrichment failed (%s); using fallback globals.", e)
+    if not cluster_product_coef:
+        cluster_product_coef = {c: float(GLOBAL_PRODUCT_COEF) for c in (0, 1, 2, 3)}
 
     joblib.dump(production_lgbm, art_dir / "production_lgbm_75k.pkl")
     joblib.dump(production_prophet_models, art_dir / "production_prophet_models_75k.pkl")
@@ -687,6 +1002,9 @@ def train_artifacts_main() -> None:
         json.dump(DISTRIBUTIONS, f, indent=2)
     with open(art_dir / "cluster_product_coef.json", "w", encoding="utf-8") as f:
         json.dump({str(k): float(v) for k, v in sorted(cluster_product_coef.items())}, f, indent=2)
+    if cluster_product_meta:
+        with open(art_dir / "cluster_product_regression.json", "w", encoding="utf-8") as f:
+            json.dump(cluster_product_meta, f, indent=2)
 
     meta = {
         "GLOBAL_PRODUCT_COEF": GLOBAL_PRODUCT_COEF,
@@ -787,3 +1105,4 @@ def train_artifacts_main() -> None:
 
 if __name__ == "__main__":
     main()
+

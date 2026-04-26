@@ -1,11 +1,16 @@
 from snowflake_conn import get_snowflake_connection, load_sql
 import sqlite3
 import pandas as pd
+import numpy as np
+from pathlib import Path
+import logging
 
 # TODO: Add a cron job to run this script every week.
 
 # Database name
-DATABASE_NAME = 'marketshare_data.db'
+DATABASE_NAME = str(Path(__file__).resolve().parent / 'marketshare_data.db')
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
 
 def ensure_expected_releases_fw_columns(conn: sqlite3.Connection) -> None:
@@ -56,17 +61,80 @@ INSERT_YTD_MARKETSHARE = 'insert_ytd_marketshare.sql'
 INSERT_MARKETSHARE_RELEASE_METRICS = 'insert_marketshare_release_metrics.sql'
 
 
+def _chunked(values: list[str], size: int) -> list[list[str]]:
+    return [values[i:i + size] for i in range(0, len(values), size)]
+
+
+def recompute_ytd_share_from_current_data(data_path: Path) -> pd.DataFrame:
+    """
+    Match current_data_test.py logic exactly:
+      1) Read Current_Data.csv
+      2) Use ALBUM_EQUIVALENT / ALBUM_EQUIVALENT_SHARE to estimate weekly total market
+      3) Compute YTD by label as cumulative(label weekly volume) / cumulative(total market)
+    Returns percent-point shares (e.g. 8.85).
+    """
+    current = pd.read_csv(data_path)
+    year_col = next((c for c in ("YEAR", "Year", "year") if c in current.columns), None)
+    if year_col is None:
+        return pd.DataFrame(columns=["YEAR", "WEEK_ENDING_DATE", "LABEL_NAME", "ALBUM_EQUIVALENT_SHARE"])
+
+    current["YEAR"] = pd.to_numeric(current[year_col], errors="coerce")
+    current["ALBUM_EQUIVALENT"] = pd.to_numeric(current["ALBUM_EQUIVALENT"], errors="coerce")
+    current["ALBUM_EQUIVALENT_SHARE"] = pd.to_numeric(current["ALBUM_EQUIVALENT_SHARE"], errors="coerce")
+
+    share_median = current["ALBUM_EQUIVALENT_SHARE"].dropna().median()
+    if pd.notna(share_median) and share_median > 1:
+        current["ALBUM_EQUIVALENT_SHARE"] = current["ALBUM_EQUIVALENT_SHARE"] / 100.0
+
+    current = current[
+        current["LABEL_NAME"].isin(["Atlantic Music Group", "Interscope/Geffen/A&M"])
+        & current["YEAR"].notna()
+        & current["ALBUM_EQUIVALENT"].notna()
+        & current["ALBUM_EQUIVALENT_SHARE"].notna()
+        & (current["ALBUM_EQUIVALENT_SHARE"] > 0)
+    ].copy()
+    if current.empty:
+        return pd.DataFrame(columns=["YEAR", "WEEK_ENDING_DATE", "LABEL_NAME", "ALBUM_EQUIVALENT_SHARE"])
+
+    current["WEEK_ENDING_DATE"] = pd.to_datetime(current["WEEK_ENDING_DATE"], errors="coerce")
+    current = current[current["WEEK_ENDING_DATE"].notna()].copy()
+    current["__total_market_est"] = current["ALBUM_EQUIVALENT"] / current["ALBUM_EQUIVALENT_SHARE"]
+
+    weekly_total = (
+        current.groupby(["YEAR", "WEEK_ENDING_DATE"], as_index=False)["__total_market_est"]
+        .median()
+        .rename(columns={"__total_market_est": "__weekly_total_market"})
+    )
+    label_weekly = (
+        current.groupby(["YEAR", "WEEK_ENDING_DATE", "LABEL_NAME"], as_index=False)["ALBUM_EQUIVALENT"]
+        .sum()
+        .rename(columns={"ALBUM_EQUIVALENT": "__label_weekly_volume"})
+    )
+    out = label_weekly.merge(weekly_total, on=["YEAR", "WEEK_ENDING_DATE"], how="inner")
+    out = out.sort_values(["LABEL_NAME", "YEAR", "WEEK_ENDING_DATE"]).reset_index(drop=True)
+    out["__cum_num"] = out.groupby(["LABEL_NAME", "YEAR"])["__label_weekly_volume"].cumsum()
+    out["__cum_den"] = out.groupby(["LABEL_NAME", "YEAR"])["__weekly_total_market"].cumsum()
+    out["ALBUM_EQUIVALENT_SHARE"] = (out["__cum_num"] / out["__cum_den"]) * 100.0
+    # Benchmark parity: truncate to 2 decimals (do not round).
+    out["ALBUM_EQUIVALENT_SHARE"] = np.trunc(out["ALBUM_EQUIVALENT_SHARE"] * 100) / 100
+    out["YEAR"] = out["YEAR"].astype(int)
+    out["WEEK_ENDING_DATE"] = out["WEEK_ENDING_DATE"].dt.strftime("%Y-%m-%d")
+    return out[["YEAR", "WEEK_ENDING_DATE", "LABEL_NAME", "ALBUM_EQUIVALENT_SHARE"]]
+
+
 def update_sqlite_main() -> None:
     """
     Loads the weekly and ytd marketshare data from Snowflake and saves it to SQLite database.
     The SQLite database is located in the data folder.
     Other SQLite database tables are currently not being updated by this script.
     """
+    logger.info("sqlite_handler: starting refresh (db=%s)", DATABASE_NAME)
     # Connect to SQLite database
     sqlite_conn = sqlite3.connect(DATABASE_NAME)
     cursor = sqlite_conn.cursor()
 
     # Create tables
+    logger.info("sqlite_handler: ensuring SQLite tables exist")
     cursor.execute(load_sql(CREATE_EXPECTED_RELEASES_TABLE))
     ensure_expected_releases_fw_columns(sqlite_conn)
     cursor.execute(load_sql(CREATE_WEEKLY_MARKETSHARE_TABLE))
@@ -77,6 +145,7 @@ def update_sqlite_main() -> None:
     expected_releases_columns = [d[0] for d in cursor.description]
     expected_releases_rows = cursor.fetchall()
     expected_releases_df = pd.DataFrame(expected_releases_rows, columns=expected_releases_columns)
+    logger.info("sqlite_handler: loaded %d expected releases from SQLite", len(expected_releases_df))
 
     def _snowflake_string_literal(value: str) -> str:
         return "'" + str(value).replace("'", "''") + "'"
@@ -89,20 +158,57 @@ def update_sqlite_main() -> None:
         .unique()
         .tolist()
     )
-    release_ids_str = ','.join(_snowflake_string_literal(rid) for rid in release_ids)
-
     # Get data from Snowflake
+    logger.info("sqlite_handler: querying Snowflake weekly/ytd marketshare tables")
     with get_snowflake_connection() as sf:
         weekly_marketshare_data = sf.query(load_sql(WEEKLY_MARKETSHARE_QUERY))
         ytd_marketshare_data = sf.query(load_sql(YTD_MARKETSHARE_QUERY))
+        logger.info(
+            "sqlite_handler: Snowflake rows weekly=%d ytd=%d",
+            len(weekly_marketshare_data),
+            len(ytd_marketshare_data),
+        )
 
-        if release_ids_str:
-            metrics_sql = load_sql(MARKETSHARE_RELEASE_METRICS_QUERY).replace(
-                '{RELEASE_IDS}', release_ids_str
+        if release_ids:
+            # Query in batches to avoid one very heavy, long-running Snowflake statement.
+            batch_size = 5
+            batches = _chunked(release_ids, batch_size)
+            metric_frames: list[pd.DataFrame] = []
+            logger.info(
+                "sqlite_handler: querying Snowflake release metrics for %d releases in %d batches (size=%d)",
+                len(release_ids),
+                len(batches),
+                batch_size,
             )
-            marketshare_release_metrics_data = sf.query(metrics_sql)
+            for idx, batch in enumerate(batches, start=1):
+                release_ids_str = ','.join(_snowflake_string_literal(rid) for rid in batch)
+                metrics_sql = load_sql(MARKETSHARE_RELEASE_METRICS_QUERY).replace(
+                    '{RELEASE_IDS}', release_ids_str
+                )
+                logger.info(
+                    "sqlite_handler: release metrics batch %d/%d (%d releases)",
+                    idx,
+                    len(batches),
+                    len(batch),
+                )
+                df_batch = sf.query(metrics_sql)
+                if not df_batch.empty:
+                    metric_frames.append(df_batch)
+            if metric_frames:
+                marketshare_release_metrics_data = pd.concat(metric_frames, ignore_index=True)
+            else:
+                marketshare_release_metrics_data = pd.DataFrame(
+                    columns=[
+                        'WEEK_ENDING_DATE', 'MRELG_ID', 'ALBUM_EQUIVALENT', 'PRODUCT_SALES',
+                        'SONG_SALE_EQUIVALENT', 'STREAMING_EQUIVALENT',
+                    ]
+                )
             marketshare_release_metrics_data = marketshare_release_metrics_data.rename(
                 columns=str.upper,
+            )
+            logger.info(
+                "sqlite_handler: Snowflake rows release_metrics=%d",
+                len(marketshare_release_metrics_data),
             )
             # After rename(columns=str.upper)
             if "WEEK_ENDING_DATE" in marketshare_release_metrics_data.columns:
@@ -121,7 +227,35 @@ def update_sqlite_main() -> None:
                 ]
             )
 
+    # Normalize date columns so sqlite3 does not rely on deprecated
+    # implicit date adapters in Python 3.12+.
+    if "WEEK_ENDING_DATE" in weekly_marketshare_data.columns:
+        weekly_marketshare_data["WEEK_ENDING_DATE"] = weekly_marketshare_data["WEEK_ENDING_DATE"].astype(str)
+    if "WEEK_ENDING_DATE" in ytd_marketshare_data.columns:
+        ytd_marketshare_data["WEEK_ENDING_DATE"] = ytd_marketshare_data["WEEK_ENDING_DATE"].astype(str)
+    try:
+        current_path = Path(__file__).resolve().parent / "model" / "data" / "Current_Data.csv"
+        ytd_recalc = recompute_ytd_share_from_current_data(current_path)
+        if not ytd_recalc.empty:
+            ytd_marketshare_data = ytd_marketshare_data.merge(
+                ytd_recalc,
+                on=["YEAR", "WEEK_ENDING_DATE", "LABEL_NAME"],
+                how="left",
+                suffixes=("", "_RECALC"),
+            )
+            ytd_marketshare_data["ALBUM_EQUIVALENT_SHARE"] = ytd_marketshare_data[
+                "ALBUM_EQUIVALENT_SHARE_RECALC"
+            ].where(
+                ytd_marketshare_data["ALBUM_EQUIVALENT_SHARE_RECALC"].notna(),
+                ytd_marketshare_data["ALBUM_EQUIVALENT_SHARE"],
+            )
+            ytd_marketshare_data = ytd_marketshare_data.drop(columns=["ALBUM_EQUIVALENT_SHARE_RECALC"])
+    except Exception:
+        # If Current_Data.csv is unavailable, keep Snowflake-provided YTD share.
+        pass
+
     # Update tables
+    logger.info("sqlite_handler: writing weekly/ytd/metrics rows into SQLite")
     cursor.executemany(load_sql(INSERT_WEEKLY_MARKETSHARE), weekly_marketshare_data[[
         'WEEK_ENDING_DATE', 'COUNTRY_CODE', 'RELEASE_AGE', 'LABEL_NAME',
         'STREAMING_TOTAL', 'ALBUM_EQUIVALENT', 'PRODUCT_SALES', 'SONG_SALE_EQUIVALENT',
@@ -156,6 +290,7 @@ def update_sqlite_main() -> None:
     # Commit and close connection
     sqlite_conn.commit()
     sqlite_conn.close()
+    logger.info("sqlite_handler: refresh complete")
 
 
 def drop_table(table_name: str) -> None:

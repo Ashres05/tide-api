@@ -1,4 +1,5 @@
 from __future__ import annotations
+from contextlib import asynccontextmanager
 import sys
 from pathlib import Path
 
@@ -25,8 +26,16 @@ except ModuleNotFoundError:
         require_api_key,
     )
 
-app = FastAPI(title="Tide Marketshare API", version="1.1.0")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Pull SQLite + model artifacts from S3 when configured (EC2 + parquetgarage)."""
+    from api.s3_pull import sync_artifacts_from_s3_if_configured
 
+    sync_artifacts_from_s3_if_configured()
+    yield
+
+
+app = FastAPI(title="Tide Marketshare API", version="1.1.0", lifespan=lifespan)
 # TODO: When a release is officially released but does not have a MRELG ID, give a warning to the user.
 
 # TODO (Phase 3): Move CSV/parquet/artifact storage to S3.
@@ -176,6 +185,18 @@ def refresh_model(_: None = Depends(require_api_key)) -> JobAcceptedResponse:
     """
     return _dispatch("refresh_model", model_handler.refresh_model)
 
+@app.post(
+    "/v1/data/reload_artifacts",
+    dependencies=[Depends(require_api_key)],
+)
+def reload_forecast_artifacts_from_disk() -> dict:
+    """
+    Drop in-memory ForecastEngine caches so the next request reloads parquets/pkls
+    from disk. Call after S3 sync or daily_release_sync (S3_DOWNLOAD=1) wrote new
+    files without restarting uvicorn. Does not pull from S3 or retrain.
+    """
+    model_handler.reload_artifacts()
+    return {"status": "ok", "detail": "forecast caches cleared; next API use loads from disk"}
 
 @app.post(
     "/v1/releases/backfill",
