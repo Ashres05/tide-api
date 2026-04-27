@@ -89,12 +89,47 @@ def sync_artifacts_from_s3_if_configured() -> None:
         "off",
     )
 
-    def download_key(key: str, dest: Path) -> None:
+    def download_key(key: str, dest: Path, expected_size: int | None = None) -> None:
         dest.parent.mkdir(parents=True, exist_ok=True)
+        if expected_size is not None and dest.is_file():
+            try:
+                if dest.stat().st_size == int(expected_size):
+                    logger.info(
+                        "S3 pull: skip unchanged object s3://%s/%s (size=%d)",
+                        bucket,
+                        key,
+                        int(expected_size),
+                    )
+                    return
+            except OSError:
+                pass
         tmp = dest.with_suffix(dest.suffix + ".partial")
         logger.info("S3 pull: s3://%s/%s -> %s", bucket, key, dest)
-        client.download_file(bucket, key, str(tmp))
-        tmp.replace(dest)
+        try:
+            client.download_file(bucket, key, str(tmp))
+            tmp.replace(dest)
+        except OSError as e:
+            # Common on EC2 when large parquet exists locally and we attempt
+            # atomic tmp-download first: requires ~2x file space briefly.
+            if getattr(e, "errno", None) == 28:
+                logger.warning(
+                    "S3 pull: no space left while temp-downloading %s; "
+                    "retrying with in-place overwrite.",
+                    key,
+                )
+                if tmp.exists():
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass
+                if dest.exists():
+                    try:
+                        dest.unlink()
+                    except OSError:
+                        pass
+                client.download_file(bucket, key, str(dest))
+            else:
+                raise
 
     def _head_exists(key: str) -> bool:
         try:
@@ -114,8 +149,8 @@ def sync_artifacts_from_s3_if_configured() -> None:
         )
         db_key = root_db_key
     try:
-        client.head_object(Bucket=bucket, Key=db_key)
-        download_key(db_key, root / "marketshare_data.db")
+        db_head = client.head_object(Bucket=bucket, Key=db_key)
+        download_key(db_key, root / "marketshare_data.db", expected_size=db_head.get("ContentLength"))
     except ClientError as e:
         logger.warning("S3 pull: database object missing or inaccessible: s3://%s/%s (%s)", bucket, db_key, e)
 
@@ -153,7 +188,7 @@ def sync_artifacts_from_s3_if_configured() -> None:
                     continue
                 rel = key[len(full_prefix) :].lstrip("/")
                 dest = (root / local_rel / rel) if rel else (root / local_rel / Path(key).name)
-                download_key(key, dest)
+                download_key(key, dest, expected_size=obj.get("Size"))
                 n += 1
         if n:
             logger.info("S3 pull: %d objects under s3://%s/%s", n, bucket, full_prefix)
