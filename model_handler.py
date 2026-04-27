@@ -1323,10 +1323,34 @@ def refresh_model() -> None:
 
 
 _PARQUET_DIR = Path(__file__).resolve().parent / "model" / "data"
-_REQUIRED_PARQUETS = (
-    _PARQUET_DIR / "streams_product_songs_ae_compressed.parquet",
-    _PARQUET_DIR / "worldwide_streams_compressed.parquet",
+# Some environments still carry the legacy worldwide parquet name
+# `streams_worldwide_compressed.parquet`. Treat either as satisfying the
+# requirement so refresh_weekly does not trigger an unnecessary full rebuild.
+_REQUIRED_PARQUET_ALTERNATIVES = (
+    (_PARQUET_DIR / "streams_product_songs_ae_compressed.parquet",),
+    (
+        _PARQUET_DIR / "worldwide_streams_compressed.parquet",
+        _PARQUET_DIR / "streams_worldwide_compressed.parquet",
+    ),
 )
+
+
+def _resolve_missing_required_parquets() -> list[str]:
+    missing: list[str] = []
+    for alternatives in _REQUIRED_PARQUET_ALTERNATIVES:
+        if not any(p.is_file() for p in alternatives):
+            missing.append(str(alternatives[0]))
+    return missing
+
+
+def _resolved_required_parquet_names() -> list[str]:
+    out: list[str] = []
+    for alternatives in _REQUIRED_PARQUET_ALTERNATIVES:
+        for p in alternatives:
+            if p.is_file():
+                out.append(p.name)
+                break
+    return out
 
 
 def refresh_weekly(force_refresh_parquets: bool = False) -> dict:
@@ -1374,9 +1398,9 @@ def refresh_weekly(force_refresh_parquets: bool = False) -> dict:
 
     set_step("refresh_parquets:start")
     t0 = _now()
-    missing = [p for p in _REQUIRED_PARQUETS if not p.is_file()]
+    missing = _resolve_missing_required_parquets()
     if not force_refresh_parquets and not missing:
-        existing = [p.name for p in _REQUIRED_PARQUETS]
+        existing = _resolved_required_parquet_names()
         logger.info(
             "refresh_weekly: skipping parquet refresh (found %s). "
             "Call refresh_weekly(force_refresh_parquets=True) or /refresh_model "
