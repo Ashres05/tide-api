@@ -545,9 +545,22 @@ def backfill_releases(
             except Exception as e:
                 errors.append({"mrelg_id": mrelg_id, "error": str(e)})
 
-    if inserted > 0 and run_sqlite_refresh:
+    # Always refresh per-release weekly metrics from Snowflake, even when 0
+    # new releases were inserted. The previous `inserted > 0` gate caused a
+    # silent staleness bug: when refresh_weekly's daily/weekly cadence found
+    # no new mrelg_ids, MARKETSHARE_RELEASE_METRICS / MARKETSHARE_WEEKLY /
+    # MARKETSHARE_YTD all stayed pinned at whatever date they were when
+    # someone last triggered an insert. The /v1/releases/{id}/weekly endpoint
+    # then returned multi-week-stale "AE YTD" sums (e.g. OCTANE showing 837K
+    # instead of 894K because the 2026-04-23 row was missing).
+    #
+    # update_sqlite_main is idempotent and incremental — its own internal
+    # max-date watermark keeps the Snowflake roundtrip narrow even when no
+    # new releases were inserted, so the cost of always running it is small
+    # (~30s typical) compared to the staleness it prevents.
+    if run_sqlite_refresh:
         logger.info(
-            "backfill_releases: running update_sqlite_main() for %d new release(s)",
+            "backfill_releases: running update_sqlite_main() (inserted=%d, refresh per-release metrics)",
             inserted,
         )
         try:
@@ -558,17 +571,17 @@ def backfill_releases(
                 {
                     "stage": "update_sqlite_main",
                     "error": str(e)
-                    + "\nWARNING: weekly metric data for new releases may be missing.",
+                    + "\nWARNING: weekly metric data may be stale.",
                 }
             )
-    elif inserted > 0:
+    else:
         logger.info(
-            "backfill_releases: skipping update_sqlite_main (run_sqlite_refresh=False); "
-            "metrics for %d new release(s) picked up on next sqlite_handler run",
-            inserted,
+            "backfill_releases: skipping update_sqlite_main (run_sqlite_refresh=False)"
         )
 
-    if inserted > 0:
+    # Push DB to S3 whenever we mutated SQLite (either by insert OR by
+    # update_sqlite_main refreshing the per-release metrics tables).
+    if inserted > 0 or run_sqlite_refresh:
         sync_db_to_s3()
 
     return {"inserted": inserted, "skipped": skipped, "errors": errors}
