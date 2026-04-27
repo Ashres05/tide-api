@@ -35,16 +35,13 @@ MODEL_PARQUET_METRICS_STREAMING_QUERY = "query_model_parquet_metrics_streaming.s
 # Phase 2 design notes
 # --------------------
 # The three CSV queries (Current_Data, alist_75k, bigreleaseflag_75k) now accept
-# a {MIN_WEEK_END_DATE} placeholder and emit only weeks >= that anchor (with a
-# -2 day upper guard so the in-progress week is never persisted). The Python
-# layer appends the result onto the existing CSV and de-dupes on a row-level
-# primary key so re-runs within the overlap window are idempotent.
+# a {MIN_WEEK_END_DATE} placeholder and emit only weeks >= that anchor (with an
+# upper guard so the in-progress week is never persisted). The Python layer
+# appends the result onto the existing CSV and de-dupes on a row-level primary
+# key so re-runs within the overlap window are idempotent.
 #
-# The anchor is the max WEEK_END_DATE already present in alist_75k.csv. Using
-# a single canonical anchor for all three keeps the three files in lockstep —
-# even if Current_Data happens to publish a week earlier than alist, we never
-# persist a Current_Data row that wouldn't also be covered by a future alist
-# refresh.
+# Each CSV now computes its own anchor from its own max week column. This avoids
+# a stale/corrupt alist_75k.csv pinning the other files to an old lower bound.
 #
 # Cold start (no alist_75k.csv yet): anchor defaults to '2018-01-01', which
 # reproduces the original behavior of the un-parameterized queries.
@@ -106,14 +103,31 @@ def _refresh_data_directory() -> None:
     queuing as the bottleneck.
     """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    min_week = _get_min_week_end_date()
-    logger.info("train_model.py: Refreshing CSV directory (min_week_end_date=%s)", min_week)
+    current_min_week = _get_min_week_end_date(
+        DATA_DIR / "Current_Data.csv",
+        week_col="WEEK_ENDING_DATE",
+    )
+    alist_min_week = _get_min_week_end_date(
+        DATA_DIR / "alist_75k.csv",
+        week_col="WEEK_END_DATE",
+    )
+    big_release_min_week = _get_min_week_end_date(
+        DATA_DIR / "bigreleaseflag_75k.csv",
+        week_col="WEEK_END_DATE",
+    )
+    logger.info(
+        "train_model.py: Refreshing CSV directory "
+        "(Current_Data min=%s, alist_75k min=%s, bigreleaseflag_75k min=%s)",
+        current_min_week,
+        alist_min_week,
+        big_release_min_week,
+    )
 
     with get_snowflake_connection() as sf:
-        for name, updater in (
-            ("Current_Data.csv", _update_current_data),
-            ("alist_75k.csv", _update_a_list_75k),
-            ("bigreleaseflag_75k.csv", _update_big_release_flag_75k),
+        for name, updater, min_week in (
+            ("Current_Data.csv", _update_current_data, current_min_week),
+            ("alist_75k.csv", _update_a_list_75k, alist_min_week),
+            ("bigreleaseflag_75k.csv", _update_big_release_flag_75k, big_release_min_week),
         ):
             _set_step(f"refresh_data:csv:{name}")
             _run_stage(name, lambda sf=sf, updater=updater: updater(sf, min_week))
@@ -126,29 +140,28 @@ def _run_stage(name: str, fn: Callable[[], int]) -> None:
     logger.info("train_model.py: %s +%d rows (%.1fs)", name, added, elapsed)
 
 
-def _get_min_week_end_date() -> str:
+def _get_min_week_end_date(path: Path, *, week_col: str) -> str:
     """
-    Canonical incremental anchor: the max WEEK_END_DATE currently in
-    alist_75k.csv. Defaults to '2018-01-01' so a cold run (no CSV yet)
+    Incremental anchor for a single CSV: max value currently in `week_col`.
+    Defaults to '2018-01-01' so a cold run (no CSV yet)
     reproduces the original full-history pull.
 
     A corrupt or schema-drifted CSV also falls back to cold start rather than
     raising — safer to over-pull once than to skip weeks silently.
     """
-    alist = DATA_DIR / "alist_75k.csv"
-    if not alist.exists():
-        logger.info("alist_75k.csv not found; cold start from %s", _COLD_START_MIN_WEEK)
+    if not path.exists():
+        logger.info("%s not found; cold start from %s", path.name, _COLD_START_MIN_WEEK)
         return _COLD_START_MIN_WEEK
     try:
-        df = pd.read_csv(alist, usecols=["WEEK_END_DATE"])
+        df = pd.read_csv(path, usecols=[week_col])
     except (ValueError, KeyError) as e:
-        logger.warning("alist_75k.csv missing WEEK_END_DATE column (%s); cold start", e)
+        logger.warning("%s missing %s column (%s); cold start", path.name, week_col, e)
         return _COLD_START_MIN_WEEK
     if df.empty:
         return _COLD_START_MIN_WEEK
-    max_wk = pd.to_datetime(df["WEEK_END_DATE"], errors="coerce").max()
+    max_wk = pd.to_datetime(df[week_col], errors="coerce").max()
     if pd.isna(max_wk):
-        logger.warning("alist_75k.csv WEEK_END_DATE column is all NaT; cold start")
+        logger.warning("%s %s column is all NaT; cold start", path.name, week_col)
         return _COLD_START_MIN_WEEK
     return max_wk.strftime("%Y-%m-%d")
 
