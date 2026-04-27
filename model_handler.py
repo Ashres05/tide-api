@@ -20,6 +20,7 @@ from sqlite_handler import (
     refresh_marketshare_search_summary,
 )
 from search_text import normalize_search_text
+import marketshare_from_csv
 from model.marketshare_75k_simulation import DISTRIBUTIONS, NUM_WEEKS
 from snowflake_conn import load_sql
 from model.forecast_engine_server import ForecastEngine
@@ -1121,81 +1122,42 @@ def get_known_component_vols(
 
 def get_marketshare_actuals() -> pd.DataFrame:
     """
-    Returns the year-to-date observed marketshare timeline from MARKETSHARE_YTD,
-    reshaped to match the unified_ytd schema. Rows tagged Data_Type='Actual'.
+    Year-to-date observed marketshare timeline derived directly from
+    Current_Data.csv (the same file the LGBM/Prophet trainer ingests). The
+    YEAR column in Current_Data is Luminate's authoritative chart-year, so
+    boundary weeks straddling Jan 1 are bucketed correctly without any
+    ``startsWith('YYYY')`` heuristics.
+
+    Returns rows tagged Data_Type='Actual' in the unified_ytd schema. Reads
+    are O(1) after the first hit (in-memory cache invalidated by
+    reload_artifacts() at the end of every refresh_weekly).
     """
-    query = load_sql(MARKETSHARE_ACTUALS_QUERY)
-    with sqlite3.connect(DATABASE_NAME) as conn:
-        df = pd.read_sql_query(query, conn)
-    if df.empty:
-        return pd.DataFrame(
-            columns=[
-                "Week Ending Date", "Owner", "Total_Market_AE_Volume",
-                "Active_Share", "Data_Type", "Unified_YTD_Share",
-                "YTD_Share_Upper", "YTD_Share_Lower",
-            ]
-        )
-    out = pd.DataFrame(
-        {
-            "Week Ending Date": df["WEEK_ENDING_DATE"].astype(str),
-            "Owner": df["LABEL_NAME"].astype(str),
-            "Total_Market_AE_Volume": pd.to_numeric(df["ALBUM_EQUIVALENT"], errors="coerce").fillna(0),
-            "Active_Share": pd.to_numeric(df["ALBUM_EQUIVALENT_SHARE"], errors="coerce").fillna(0),
-            "Data_Type": "Actual",
-            "Unified_YTD_Share": pd.to_numeric(df["ALBUM_EQUIVALENT_SHARE"], errors="coerce").fillna(0),
-        }
-    )
-    out["YTD_Share_Upper"] = out["Unified_YTD_Share"]
-    out["YTD_Share_Lower"] = out["Unified_YTD_Share"]
-    return out
+    return marketshare_from_csv.ytd_actuals_for_year()
 
 
-def _sqlite_weekly_marketshare_observed() -> pd.DataFrame:
+def _weekly_marketshare_observed() -> pd.DataFrame:
     """
-    Weekly label AE volume and share from SQLite (Snowflake refresh via sqlite_handler).
-    Shares are normalized to percent points to match run_archetype_scenario / df_full.
+    Per-week observed marketshare for the current Luminate chart-year, sourced
+    directly from Current_Data.csv. Used to overlay engine forecasts so the
+    "actual" portion of the YTD chart matches the same CSV the trainer ingests
+    (no SQLite-vs-CSV cadence drift). Shares are percent points.
     """
-    query = load_sql(MARKETSHARE_WEEKLY_ACTUALS_QUERY)
-    with sqlite3.connect(DATABASE_NAME) as conn:
-        raw = pd.read_sql_query(query, conn)
-    if raw.empty:
-        return pd.DataFrame(
-            columns=["Week Ending Date", "Owner", "Total_Market_AE_Volume", "Active_Share"]
-        )
-    wk = pd.to_datetime(raw["WEEK_ENDING_DATE"], errors="coerce")
-    owner = raw["LABEL_NAME"].astype(str)
-    vol = pd.to_numeric(raw["ALBUM_EQUIVALENT"], errors="coerce")
-    sh = pd.to_numeric(raw["ALBUM_EQUIVALENT_SHARE"], errors="coerce")
-    med = sh.dropna().median()
-    if pd.notna(med) and med <= 1.0:
-        sh = sh * 100.0
-    total = pd.Series(
-        pd.NA,
-        index=raw.index,
-        dtype="Float64",
-    )
-    ok = sh.abs() > 1e-9
-    total.loc[ok] = (vol.loc[ok] / (sh.loc[ok] / 100.0)).astype("Float64")
-    out = pd.DataFrame(
-        {
-            "Week Ending Date": wk,
-            "Owner": owner,
-            "Total_Market_AE_Volume": total,
-            "Active_Share": sh,
-        }
-    )
-    return out.dropna(subset=["Week Ending Date", "Owner"]).reset_index(drop=True)
+    return marketshare_from_csv.weekly_actuals_for_year()
 
 
-def _apply_sqlite_weekly_to_unified_ytd(unified_ytd: pd.DataFrame) -> pd.DataFrame:
+def _apply_weekly_actuals_to_unified_ytd(unified_ytd: pd.DataFrame) -> pd.DataFrame:
     """
-    Replace weekly Active_Share / Total_Market for weeks present in MARKETSHARE_WEEKLY
-    so /v1/marketshare/weekly matches live SQLite instead of stale actuals_2026.parquet.
+    Replace weekly Active_Share / Total_Market for weeks present in
+    Current_Data.csv so /v1/marketshare/weekly stitches actuals (past) +
+    engine forecast (future). The forecast doesn't "restart from week 1"
+    because the weeks before the first forecast week are explicit actuals
+    drawn from the same CSV the trainer used.
+
     Recomputes cumulative YTD columns the same way as run_archetype_scenario.
     """
     if unified_ytd.empty:
         return unified_ytd
-    obs = _sqlite_weekly_marketshare_observed()
+    obs = _weekly_marketshare_observed()
     if obs.empty:
         return unified_ytd
 
@@ -1263,7 +1225,7 @@ def get_marketshare_forecasts(week_ending_date: str | None = None) -> pd.DataFra
     unified_ytd = pd.DataFrame(forecasts["unified_ytd"])
     if unified_ytd.empty:
         return unified_ytd
-    unified_ytd = _apply_sqlite_weekly_to_unified_ytd(unified_ytd)
+    unified_ytd = _apply_weekly_actuals_to_unified_ytd(unified_ytd)
     if week_ending_date is None:
         return unified_ytd
     else:
@@ -1517,6 +1479,7 @@ def reload_artifacts() -> None:
     GLOBAL_FORECAST_ENGINE = None
     GLOBAL_WORLDWIDE_ARTIFACTS = None
     forecast_cache_clear()
+    marketshare_from_csv.clear_cache()
 
 
 def df_to_json(
