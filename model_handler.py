@@ -26,6 +26,7 @@ from snowflake_conn import get_snowflake_connection, Snowflake
 from train_model import refresh_data, update_parquet_metrics
 from sqlite_handler import update_sqlite_main
 from model.worldwide_streams_api import simulate_one_worldwide_streams
+from api.s3_pull import sync_artifacts_from_s3_if_configured, sync_artifacts_to_s3_if_configured
 
 # Set up logging.
 logger = logging.getLogger(__name__)
@@ -465,6 +466,9 @@ def backfill_releases(
     """
     import os as _os
 
+    # Keep SQLite aligned with canonical S3 snapshot before deriving scope.
+    sync_artifacts_from_s3_if_configured()
+
     existing_mrelg_ids = {
         (row["MRELG_ID"] or "").strip()
         for row in _get_all_release_rows()
@@ -551,6 +555,9 @@ def backfill_releases(
             "metrics for %d new release(s) picked up on next sqlite_handler run",
             inserted,
         )
+
+    if inserted > 0:
+        sync_artifacts_to_s3_if_configured()
 
     return {"inserted": inserted, "skipped": skipped, "errors": errors}
 
@@ -1290,6 +1297,9 @@ def train_model() -> None:
     is fully overwritten (delete + insert) because daily-stream snapshots
     are not additive across runs.
     """
+    # Pull latest canonical files from S3 first so incremental anchors are
+    # computed against shared state across EC2 restarts/process churn.
+    sync_artifacts_from_s3_if_configured()
     refresh_data()
     reload_artifacts()
     try:
@@ -1299,6 +1309,8 @@ def train_model() -> None:
             "train_model: search summary refresh failed; search results may be stale"
         )
     forecast_cache_clear()
+    # Persist refreshed CSV/artifacts/db for future incremental runs.
+    sync_artifacts_to_s3_if_configured()
 
 
 def refresh_model() -> None:

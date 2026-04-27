@@ -3,6 +3,7 @@ from search_text import normalize_search_text
 import sqlite3
 import pandas as pd
 import numpy as np
+import os
 from pathlib import Path
 import logging
 
@@ -69,6 +70,25 @@ def ensure_expected_releases_fw_columns(conn: sqlite3.Connection) -> None:
 
 def _chunked(values: list[str], size: int) -> list[list[str]]:
     return [values[i:i + size] for i in range(0, len(values), size)]
+
+
+def _min_week_anchor(cursor: sqlite3.Cursor, table: str, lookback_days: int, fallback: str = "2018-01-01") -> str:
+    """
+    Incremental lower-bound date for Snowflake pulls:
+    max existing WEEK_ENDING_DATE in SQLite minus lookback_days.
+    """
+    try:
+        cursor.execute(f"SELECT MAX(WEEK_ENDING_DATE) FROM {table}")
+        row = cursor.fetchone()
+        max_week = row[0] if row else None
+    except sqlite3.Error:
+        max_week = None
+    if not max_week:
+        return fallback
+    max_dt = pd.to_datetime(max_week, errors="coerce")
+    if pd.isna(max_dt):
+        return fallback
+    return (max_dt - pd.Timedelta(days=max(0, int(lookback_days)))).strftime("%Y-%m-%d")
 
 
 def ensure_marketshare_search_summary_columns(conn: sqlite3.Connection) -> None:
@@ -266,6 +286,29 @@ def update_sqlite_main() -> None:
     cursor.execute(load_sql(CREATE_YTD_MARKETSHARE_TABLE))
     cursor.execute(load_sql(CREATE_MARKETSHARE_RELEASE_METRICS_TABLE))
 
+    full_refresh = os.environ.get("TIDE_SQLITE_FULL_REFRESH", "").strip().lower() in (
+        "1", "true", "yes",
+    )
+    weekly_ytd_lookback_days = int(os.environ.get("TIDE_MARKETSHARE_LOOKBACK_DAYS", "120"))
+    release_metrics_lookback_days = int(os.environ.get("TIDE_RELEASE_METRICS_LOOKBACK_DAYS", "560"))
+
+    if full_refresh:
+        min_week_marketshare = "2018-01-01"
+        min_week_metrics = "2018-01-01"
+        logger.info("sqlite_handler: full Snowflake refresh enabled (TIDE_SQLITE_FULL_REFRESH=1)")
+    else:
+        min_week_marketshare = _min_week_anchor(
+            cursor, "MARKETSHARE_WEEKLY", weekly_ytd_lookback_days
+        )
+        min_week_metrics = _min_week_anchor(
+            cursor, "MARKETSHARE_RELEASE_METRICS", release_metrics_lookback_days
+        )
+        logger.info(
+            "sqlite_handler: incremental Snowflake pull (marketshare_min_week=%s, metrics_min_week=%s)",
+            min_week_marketshare,
+            min_week_metrics,
+        )
+
     cursor.execute(load_sql(EXPECTED_RELEASES_QUERY))
     expected_releases_columns = [d[0] for d in cursor.description]
     expected_releases_rows = cursor.fetchall()
@@ -286,8 +329,12 @@ def update_sqlite_main() -> None:
     # Get data from Snowflake
     logger.info("sqlite_handler: querying Snowflake weekly/ytd marketshare tables")
     with get_snowflake_connection() as sf:
-        weekly_marketshare_data = sf.query(load_sql(WEEKLY_MARKETSHARE_QUERY))
-        ytd_marketshare_data = sf.query(load_sql(YTD_MARKETSHARE_QUERY))
+        weekly_marketshare_data = sf.query(
+            load_sql(WEEKLY_MARKETSHARE_QUERY).replace("{MIN_WEEK_END_DATE}", min_week_marketshare)
+        )
+        ytd_marketshare_data = sf.query(
+            load_sql(YTD_MARKETSHARE_QUERY).replace("{MIN_WEEK_END_DATE}", min_week_marketshare)
+        )
         logger.info(
             "sqlite_handler: Snowflake rows weekly=%d ytd=%d",
             len(weekly_marketshare_data),
@@ -309,7 +356,7 @@ def update_sqlite_main() -> None:
                 release_ids_str = ','.join(_snowflake_string_literal(rid) for rid in batch)
                 metrics_sql = load_sql(MARKETSHARE_RELEASE_METRICS_QUERY).replace(
                     '{RELEASE_IDS}', release_ids_str
-                )
+                ).replace("{MIN_WEEK_END_DATE}", min_week_metrics)
                 logger.info(
                     "sqlite_handler: release metrics batch %d/%d (%d releases)",
                     idx,

@@ -96,7 +96,23 @@ def sync_artifacts_from_s3_if_configured() -> None:
         client.download_file(bucket, key, str(tmp))
         tmp.replace(dest)
 
+    def _head_exists(key: str) -> bool:
+        try:
+            client.head_object(Bucket=bucket, Key=key)
+            return True
+        except ClientError:
+            return False
+
     db_key = f"{pfx}marketshare_data.db".replace("//", "/")
+    root_db_key = "marketshare_data.db"
+    if not _head_exists(db_key) and pfx and _head_exists(root_db_key):
+        logger.warning(
+            "S3 pull: %s not found; falling back to bucket-root key %s. "
+            "Check TIDE_ARTIFACTS_S3_PREFIX/TIDE_ARTIFACTS_S3_URI alignment.",
+            db_key,
+            root_db_key,
+        )
+        db_key = root_db_key
     try:
         client.head_object(Bucket=bucket, Key=db_key)
         download_key(db_key, root / "marketshare_data.db")
@@ -105,6 +121,27 @@ def sync_artifacts_from_s3_if_configured() -> None:
 
     def sync_tree(s3_sub: str, local_rel: Path) -> int:
         full_prefix = f"{pfx}{s3_sub}".replace("//", "/")
+
+        def _count(prefix: str) -> int:
+            pages = client.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix, MaxKeys=1)
+            for page in pages:
+                return len(page.get("Contents", []) or [])
+            return 0
+
+        if _count(full_prefix) == 0 and pfx:
+            root_prefix = s3_sub.lstrip("/")
+            if _count(root_prefix) > 0:
+                logger.warning(
+                    "S3 pull: no objects under prefixed path s3://%s/%s; "
+                    "falling back to bucket-root path s3://%s/%s. "
+                    "Check TIDE_ARTIFACTS_S3_PREFIX/TIDE_ARTIFACTS_S3_URI alignment.",
+                    bucket,
+                    full_prefix,
+                    bucket,
+                    root_prefix,
+                )
+                full_prefix = root_prefix
+
         n = 0
         paginator = client.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=bucket, Prefix=full_prefix):
@@ -132,3 +169,58 @@ def sync_artifacts_from_s3_if_configured() -> None:
     sync_tree("model/archetypes_artifacts/", Path("model/archetypes_artifacts"))
 
     logger.info("S3 artifact pull finished (bucket=%s, prefix=%r).", bucket, pfx)
+
+
+def sync_artifacts_to_s3_if_configured() -> None:
+    """
+    Push local SQLite + model artifacts to S3 when configured.
+    Keeps S3 as the canonical cache so future refresh/backfill runs can pull
+    existing CSV/DB state and stay incremental.
+    """
+    uri = os.environ.get("TIDE_ARTIFACTS_S3_URI", "").strip()
+    bucket = os.environ.get("TIDE_ARTIFACTS_S3_BUCKET", "").strip()
+    prefix = os.environ.get("TIDE_ARTIFACTS_S3_PREFIX", "").strip()
+
+    if uri:
+        bucket, prefix = _parse_s3_uri(uri)
+    elif not bucket:
+        return
+
+    if os.environ.get("TIDE_ARTIFACTS_S3_PUSH", "1").strip().lower() in ("0", "false", "no", "off"):
+        logger.info("S3 artifact push disabled (TIDE_ARTIFACTS_S3_PUSH=0).")
+        return
+
+    try:
+        import boto3
+    except ImportError:
+        logger.error("boto3 is required for S3 artifact push. Install: pip install boto3")
+        return
+
+    pfx = _norm_s3_prefix(prefix)
+    root = _repo_root()
+    client = boto3.client("s3")
+
+    def upload_file(path: Path, key: str) -> None:
+        if not path.is_file():
+            return
+        logger.info("S3 push: %s -> s3://%s/%s", path, bucket, key)
+        client.upload_file(str(path), bucket, key)
+
+    def upload_tree(local_dir: Path, s3_sub: str) -> int:
+        if not local_dir.exists():
+            return 0
+        n = 0
+        full_prefix = f"{pfx}{s3_sub}".replace("//", "/")
+        for fp in local_dir.rglob("*"):
+            if not fp.is_file():
+                continue
+            rel = fp.relative_to(local_dir).as_posix()
+            key = f"{full_prefix}{rel}".replace("//", "/")
+            upload_file(fp, key)
+            n += 1
+        return n
+
+    upload_file(root / "marketshare_data.db", f"{pfx}marketshare_data.db".replace("//", "/"))
+    upload_tree(root / "model" / "data", "model/data/")
+    upload_tree(root / "model" / "artifacts_75k", "model/artifacts_75k/")
+    upload_tree(root / "model" / "archetypes_artifacts", "model/archetypes_artifacts/")

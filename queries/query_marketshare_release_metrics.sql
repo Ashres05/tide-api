@@ -43,6 +43,7 @@ FROM
 WHERE
     s.country_code = 'US'
     AND s.mrelg_id IN ({RELEASE_IDS})
+    AND da.week_end_date >= '{MIN_WEEK_END_DATE}'
     AND s.report_date >= m.first_sale_date
     AND da.week_end_date < DATEADD(DAY, -2, CURRENT_DATE())
 GROUP BY
