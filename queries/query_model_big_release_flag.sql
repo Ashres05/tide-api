@@ -1,7 +1,7 @@
 -- Phase 2: incremental refresh.
 -- {MIN_WEEK_END_DATE} is the max WEEK_END_DATE currently in alist_75k.csv,
--- injected from Python ('2018-01-01' on cold start). The -2 day guard excludes
--- the in-progress week so we never persist partial data.
+-- injected from Python ('2018-01-01' on cold start). Use an inclusive -1 day
+-- guard so the most recently completed week is included promptly.
 --
 -- NOTE: target_albums keeps the rolling 18-month qualifier (`first_sale_date >=
 -- -18mo`) unchanged — that's the "is this album less-than-18-months-old" test
@@ -49,7 +49,7 @@ debut_week_performance AS (
         -- prior CSV row; the Python layer's dedupe keeps them.
         AND s.report_date >= '{MIN_WEEK_END_DATE}'
         AND da.week_end_date >= '{MIN_WEEK_END_DATE}'
-        AND DATEADD(DAY, -2, CURRENT_DATE()) > da.week_end_date
+        AND da.week_end_date <= DATEADD(DAY, -1, CURRENT_DATE())
         AND a.first_sale_date BETWEEN DATEADD(DAY, -7, da.week_end_date) AND da.week_end_date
     GROUP BY
         da.week_end_date,

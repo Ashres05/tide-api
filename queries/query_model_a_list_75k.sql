@@ -1,8 +1,8 @@
 -- Phase 2: incremental refresh.
 -- {MIN_WEEK_END_DATE} is the max WEEK_END_DATE currently in alist_75k.csv, injected
 -- from Python. On a cold start the Python layer passes '2018-01-01' to reproduce
--- the original full-history behavior. The -2 day guard excludes the in-progress
--- week so partial data is never written to the CSV.
+-- the original full-history behavior. Use an inclusive -1 day guard so the
+-- latest completed week (e.g., Thu on Fri) is pulled immediately.
 --
 -- The a-list concept here is "any week in which an album moved >= 75k AE units".
 -- That is per-week data — adding MIN_WEEK_END_DATE to the lower bound does not
@@ -21,7 +21,7 @@ WITH major_releases AS (
         s.country_code = 'US'
         AND m.compilation_type = 'Non Compilation'
         AND s.report_date >= '{MIN_WEEK_END_DATE}'
-        AND DATEADD(DAY, -2, CURRENT_DATE()) > da.week_end_date
+        AND da.week_end_date <= DATEADD(DAY, -1, CURRENT_DATE())
         AND s.report_date >= m.first_sale_date
     GROUP BY
         da.week_end_date,
