@@ -1365,6 +1365,13 @@ def refresh_weekly(force_refresh_parquets: bool = False) -> dict:
 
     summary: Dict[str, Any] = {"stages": {}}
 
+    # Always try to hydrate local disk from S3 before deciding parquets are
+    # missing. This prevents unnecessary full rebuilds when EC2 local files
+    # were pruned but canonical artifacts exist in S3.
+    set_step("sync_from_s3:start")
+    sync_artifacts_from_s3_if_configured()
+    set_step("sync_from_s3:done")
+
     set_step("refresh_parquets:start")
     t0 = _now()
     missing = [p for p in _REQUIRED_PARQUETS if not p.is_file()]
