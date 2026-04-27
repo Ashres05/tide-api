@@ -314,6 +314,30 @@ def weekly_release(release_id: int, week_ending_date: str | None = None):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/v1/album_art/{mrelg_id}")
+def album_art(mrelg_id: str):
+    """
+    Stream the cover image for a given mrelg_id from s3://<bucket>/album_art/.
+    Returns the raw image bytes with a long Cache-Control so Cloudflare's edge
+    caches each cover for a day after the first hit. Falls back to 404 when
+    no cover has been uploaded for the mrelg_id — the frontend's <AlbumArt>
+    component swaps to its gradient placeholder on the load error.
+    """
+    import album_art as _album_art
+
+    result = _album_art.fetch_bytes(mrelg_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="album art not found")
+    body, content_type = result
+    return Response(
+        content=body,
+        media_type=content_type,
+        headers={
+            "Cache-Control": "public, max-age=86400, immutable",
+        },
+    )
+
+
 @app.get("/v1/marketshare/actuals")
 def actuals_marketshare():
     try:

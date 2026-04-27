@@ -21,6 +21,7 @@ from sqlite_handler import (
 )
 from search_text import normalize_search_text
 import marketshare_from_csv
+import album_art
 from model.marketshare_75k_simulation import DISTRIBUTIONS, NUM_WEEKS
 from snowflake_conn import load_sql
 from model.forecast_engine_server import ForecastEngine
@@ -1493,6 +1494,7 @@ def reload_artifacts() -> None:
     GLOBAL_WORLDWIDE_ARTIFACTS = None
     forecast_cache_clear()
     marketshare_from_csv.clear_cache()
+    album_art.clear_cache()
 
 
 def df_to_json(
