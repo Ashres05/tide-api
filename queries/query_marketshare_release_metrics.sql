@@ -45,6 +45,11 @@ WHERE
     AND s.mrelg_id IN ({RELEASE_IDS})
     AND da.week_end_date >= '{MIN_WEEK_END_DATE}'
     AND s.report_date >= m.first_sale_date
-    AND da.week_end_date < DATEADD(DAY, -2, CURRENT_DATE())
+    -- Intentionally no upper bound on week_end_date: include the partial
+    -- in-progress week so AE YTD totals match Atlantic's expected numbers
+    -- (Luminate Connect dashboards include the partial week too). The
+    -- previous `week_end_date < CURRENT_DATE - 2d` filter was lopping ~12K
+    -- AE off OCTANE-class releases mid-week, causing every per-release card
+    -- to display 1 week stale even after refresh.
 GROUP BY
     ALL;
