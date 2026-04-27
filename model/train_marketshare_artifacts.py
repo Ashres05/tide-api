@@ -882,10 +882,89 @@ def main() -> None:
     logger.info("Wrote artifacts to %s", art_dir)
 
 
-def train_artifacts_main() -> None:
+def _load_json_dict(path: Path) -> Dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        logger.warning("Could not load %s (%s); using empty dict", path, e)
+        return {}
+
+
+def _is_numberish(v: Any) -> bool:
+    try:
+        float(v)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _load_parquet_sidecars_from_artifacts_dir(
+    art_dir: Path,
+) -> tuple[Dict[str, Dict[int, float]], Dict[str, Dict[str, float]], Dict[str, float], Dict[int, float], Dict[str, Any]]:
     """
-    The main function from train_marketshare_artifacts.py without command line arguments to train marketshare artifacts.
-    Will create necessary parquets and JSON files for model artifacts.
+    Reload DNA / profile / W2 / cluster coefficients written on a prior full
+    train so a csv_only weekly run does not overwrite them with empty defaults.
+    """
+    artist_dna_raw = _load_json_dict(art_dir / "artist_dna_lookup.json")
+    artist_dna_lookup: Dict[str, Dict[int, float]] = {}
+    for artist, clusters in artist_dna_raw.items():
+        if not isinstance(clusters, dict):
+            continue
+        inner: Dict[int, float] = {}
+        for cid, val in clusters.items():
+            try:
+                inner[int(cid)] = float(val)
+            except (TypeError, ValueError):
+                continue
+        if inner:
+            artist_dna_lookup[str(artist)] = inner
+
+    artist_w2_raw = _load_json_dict(art_dir / "artist_w2_retention.json")
+    artist_w2_retention: Dict[str, Dict[str, float]] = {}
+    for k, v in artist_w2_raw.items():
+        if isinstance(v, dict):
+            artist_w2_retention[str(k)] = {str(sk): float(sv) for sk, sv in v.items() if _is_numberish(sv)}
+
+    profile_raw = _load_json_dict(art_dir / "artist_profile_dict.json")
+    artist_profile_dict: Dict[str, float] = {}
+    for k, v in profile_raw.items():
+        try:
+            artist_profile_dict[str(k)] = float(v)
+        except (TypeError, ValueError):
+            continue
+
+    coef_raw = _load_json_dict(art_dir / "cluster_product_coef.json")
+    cluster_product_coef: Dict[int, float] = {}
+    for k, v in coef_raw.items():
+        try:
+            cluster_product_coef[int(k)] = float(v)
+        except (TypeError, ValueError):
+            continue
+    cluster_product_meta = _load_json_dict(art_dir / "cluster_product_regression.json")
+
+    return (
+        artist_dna_lookup,
+        artist_w2_retention,
+        artist_profile_dict,
+        cluster_product_coef,
+        cluster_product_meta,
+    )
+
+
+def train_artifacts_main(*, csv_only: bool = False) -> None:
+    """
+    Train 75k marketshare artifacts (LGBM, Prophet, spike, df_full, etc.).
+
+    When ``csv_only=True`` (used by ``refresh_weekly``): skip reading the AE
+    parquet for KMeans/DNA/cluster regression and skip all archetype decay
+    retrains (AE panel + worldwide). Existing sidecar JSON under
+    ``artifacts_75k/`` is reloaded so weekly runs do not clobber parquet-derived
+    files. Full parquet + archetype pipeline: call with ``csv_only=False`` or
+    use ``/v1/data/refresh_model`` + a full ``refresh_data`` train.
     """
     # --- Hardcoded Configuration ---
     base_path = Path(__file__).resolve().parent
@@ -966,7 +1045,21 @@ def train_artifacts_main() -> None:
     artist_profile_dict: Dict[str, float] = {}
     cluster_product_coef: Dict[int, float] = {}
     cluster_product_meta: Dict[str, Any] = {}
-    if ae_parquet.exists():
+    if csv_only:
+        logger.info(
+            "train_artifacts_main: csv_only=True — skipping AE parquet KMeans/DNA "
+            "and archetype decay; reusing prior artifacts_75k sidecars when present"
+        )
+        (
+            artist_dna_lookup,
+            artist_w2_retention,
+            artist_profile_dict,
+            cluster_product_coef,
+            cluster_product_meta,
+        ) = _load_parquet_sidecars_from_artifacts_dir(art_dir)
+        if not cluster_product_coef:
+            cluster_product_coef = {c: float(GLOBAL_PRODUCT_COEF) for c in (0, 1, 2, 3)}
+    elif ae_parquet.exists():
         try:
             artist_dna_lookup, kmeans_model, project_to_cluster, mrelg_to_cluster = (
                 kmeans_and_dna_from_ae_parquet(ae_parquet)
@@ -1022,28 +1115,76 @@ def train_artifacts_main() -> None:
 
     logger.info("Wrote artifacts to %s", art_dir)
 
-    # Archetype decay: two disjoint data sources (do not conflate).
-    # (1) AE panel parquet — album-equivalent weekly metrics (streaming equivalents, product sales, song sales).
-    # (2) worldwide_streams parquet — raw weekly counts only (separate file, separate artifact dir).
-    ae_archetypes_parquet = data_dir / "streams_product_songs_ae_compressed.parquet"
-    if ae_archetypes_parquet.exists():
-        archetypes_base = base_path / "archetypes_artifacts"
-        for metric, subdir in [
-            ("streaming_equivalent", "streams"),
-            ("product_sales", "sales"),
-            ("song_sale_equivalent", "songs"),
-        ]:
-            out_dir = archetypes_base / subdir
+    # Archetype decay — memory-heavy; skipped on weekly csv_only runs.
+    if csv_only:
+        logger.info(
+            "train_artifacts_main: csv_only=True — skipping AE-panel and worldwide_streams "
+            "archetype decay (use /v1/data/refresh_model or train with csv_only=False to rebuild)"
+        )
+    else:
+        # Archetype decay: two disjoint data sources (do not conflate).
+        # (1) AE panel parquet — album-equivalent weekly metrics (streaming equivalents, product sales, song sales).
+        # (2) worldwide_streams parquet — raw weekly counts only (separate file, separate artifact dir).
+        ae_archetypes_parquet = data_dir / "streams_product_songs_ae_compressed.parquet"
+        if ae_archetypes_parquet.exists():
+            archetypes_base = base_path / "archetypes_artifacts"
+            for metric, subdir in [
+                ("streaming_equivalent", "streams"),
+                ("product_sales", "sales"),
+                ("song_sale_equivalent", "songs"),
+            ]:
+                out_dir = archetypes_base / subdir
+                logger.info(
+                    "Archetype decay (AE panel %s): metric=%s → %s",
+                    ae_archetypes_parquet.name,
+                    metric,
+                    out_dir,
+                )
+                archetype_args = argparse.Namespace(
+                    parquet_path=str(ae_archetypes_parquet),
+                    out_dir=str(out_dir),
+                    metric=metric,
+                    horizon_weeks=78,
+                    n_clusters=4,
+                    random_state=42,
+                    kmeans_batch_size=2048,
+                    max_tracks_for_features=None,
+                    sanity_artist=None,
+                    sanity_peak_volume=None,
+                    sanity_peak_week=None,
+                    sanity_genre=None,
+                )
+                train_archetype_model(archetype_args)
+            logger.info("Wrote archetype artifacts to %s", archetypes_base)
+        else:
+            logger.warning(
+                "Skipping AE-panel archetype decay — parquet not found: %s", ae_archetypes_parquet
+            )
+
+        # worldwide_streams weekly counts (not streaming_equivalent): its own parquet and archetypes_artifacts/worldwide_streams/.
+        # Default: model/data/worldwide_streams_compressed.parquet
+        # Override: TIDE_WORLDWIDE_STREAMS_PARQUET=/path/to/file.parquet
+        worldwide_env = os.environ.get("TIDE_WORLDWIDE_STREAMS_PARQUET", "").strip()
+        worldwide_parquet = (
+            Path(worldwide_env).expanduser().resolve()
+            if worldwide_env
+            else (data_dir / "worldwide_streams_compressed.parquet")
+        )
+        legacy_worldwide = data_dir / "streams_worldwide_compressed.parquet"
+        if not worldwide_parquet.is_file() and legacy_worldwide.is_file():
+            worldwide_parquet = legacy_worldwide
+        if worldwide_parquet.exists():
+            archetypes_base = base_path / "archetypes_artifacts"
+            out_dir = archetypes_base / "worldwide_streams"
             logger.info(
-                "Archetype decay (AE panel %s): metric=%s → %s",
-                ae_archetypes_parquet.name,
-                metric,
+                "Archetype decay (worldwide_streams %s): metric=worldwide_streams → %s",
+                worldwide_parquet.name,
                 out_dir,
             )
             archetype_args = argparse.Namespace(
-                parquet_path=str(ae_archetypes_parquet),
+                parquet_path=str(worldwide_parquet),
                 out_dir=str(out_dir),
-                metric=metric,
+                metric="worldwide_streams",
                 horizon_weeks=78,
                 n_clusters=4,
                 random_state=42,
@@ -1055,52 +1196,14 @@ def train_artifacts_main() -> None:
                 sanity_genre=None,
             )
             train_archetype_model(archetype_args)
-        logger.info("Wrote archetype artifacts to %s", archetypes_base)
-    else:
-        logger.warning(
-            "Skipping AE-panel archetype decay — parquet not found: %s", ae_archetypes_parquet
-        )
-
-    # worldwide_streams weekly counts (not streaming_equivalent): its own parquet and archetypes_artifacts/worldwide_streams/.
-    # Default: model/data/worldwide_streams_compressed.parquet
-    # Override: TIDE_WORLDWIDE_STREAMS_PARQUET=/path/to/file.parquet
-    worldwide_env = os.environ.get("TIDE_WORLDWIDE_STREAMS_PARQUET", "").strip()
-    worldwide_parquet = (
-        Path(worldwide_env).expanduser().resolve()
-        if worldwide_env
-        else (data_dir / "worldwide_streams_compressed.parquet")
-    )
-    if worldwide_parquet.exists():
-        archetypes_base = base_path / "archetypes_artifacts"
-        out_dir = archetypes_base / "worldwide_streams"
-        logger.info(
-            "Archetype decay (worldwide_streams %s): metric=worldwide_streams → %s",
-            worldwide_parquet.name,
-            out_dir,
-        )
-        archetype_args = argparse.Namespace(
-            parquet_path=str(worldwide_parquet),
-            out_dir=str(out_dir),
-            metric="worldwide_streams",
-            horizon_weeks=78,
-            n_clusters=4,
-            random_state=42,
-            kmeans_batch_size=2048,
-            max_tracks_for_features=None,
-            sanity_artist=None,
-            sanity_peak_volume=None,
-            sanity_peak_week=None,
-            sanity_genre=None,
-        )
-        train_archetype_model(archetype_args)
-        logger.info("Wrote worldwide_streams archetype artifacts to %s", out_dir)
-    else:
-        logger.info(
-            "Skipping worldwide_streams archetype training — parquet not found: %s "
-            "(not streaming_equivalent; place worldwide_streams_compressed.parquet under %s or set TIDE_WORLDWIDE_STREAMS_PARQUET)",
-            worldwide_parquet,
-            data_dir,
-        )
+            logger.info("Wrote worldwide_streams archetype artifacts to %s", out_dir)
+        else:
+            logger.info(
+                "Skipping worldwide_streams archetype training — parquet not found: %s "
+                "(not streaming_equivalent; place worldwide_streams_compressed.parquet under %s or set TIDE_WORLDWIDE_STREAMS_PARQUET)",
+                worldwide_parquet,
+                data_dir,
+            )
 
 
 if __name__ == "__main__":

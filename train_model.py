@@ -58,15 +58,20 @@ MODEL_PARQUET_METRICS_STREAMING_QUERY = "query_model_parquet_metrics_streaming.s
 _COLD_START_MIN_WEEK = "2018-01-01"
 
 
-def refresh_data() -> None:
+def refresh_data(*, csv_only: bool = False) -> None:
     """
-    Calls the main function from train_marketshare_artifacts.py to train the marketshare artifacts.
-    Will create necessary parquets and JSON files for model training.
+    Incrementally refresh the three weekly CSVs from Snowflake, then train artifacts.
+
+    ``csv_only=False`` (default): full train including AE parquet KMeans/DNA and
+    archetype decay (heavy; use from ``/v1/data/refresh_data`` or ad-hoc runs).
+
+    ``csv_only=True``: CSV pull + LGBM/Prophet/spike/df_full only; skips parquet
+    reads and archetype retrains. Used by ``refresh_weekly`` to avoid OOM.
     """
     _set_step("refresh_data:pull_csvs")
     _refresh_data_directory()
     _set_step("refresh_data:train_artifacts")
-    train_model()
+    train_model(csv_only=csv_only)
 
 
 def update_parquet_metrics(sf: Snowflake) -> None:

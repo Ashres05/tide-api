@@ -1369,9 +1369,10 @@ def refresh_weekly(force_refresh_parquets: bool = False) -> dict:
          multiple minutes each. The parquets change infrequently; force a
          refresh by passing force_refresh_parquets=True or by calling the
          dedicated /v1/data/refresh_model endpoint.
-      2. refresh_data — pulls the three CSVs (incremental since Phase 2) and
-         retrains LGBM / Prophet / Ridge and (if parquets exist) archetype
-         decay models.
+      2. refresh_data(csv_only=True) — pulls the three CSVs (incremental; append +
+         de-dupe on disk) and retrains LGBM / Prophet / spike / df_full from CSVs
+         only. Skips AE parquet KMeans/DNA and all archetype decay (heavy; run
+         /v1/data/refresh_data or /v1/data/refresh_model when parquets change).
       3. backfill_releases — inserts any new mrelg_ids into SQLite and
          refreshes per-release historical metrics used by /weekly forecasts.
 
@@ -1441,7 +1442,7 @@ def refresh_weekly(force_refresh_parquets: bool = False) -> dict:
     set_step("refresh_data:start")
     t0 = _now()
     try:
-        refresh_data()
+        refresh_data(csv_only=True)
         summary["stages"]["refresh_data"] = {"ok": True, "elapsed_sec": _elapsed(t0)}
     except Exception as e:
         logger.exception("refresh_weekly: refresh_data failed")
@@ -1470,6 +1471,8 @@ def refresh_weekly(force_refresh_parquets: bool = False) -> dict:
 
     set_step("reload_artifacts")
     reload_artifacts()
+    set_step("sync_to_s3")
+    sync_artifacts_to_s3_if_configured()
     set_step("done")
     return summary
 
