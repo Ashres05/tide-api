@@ -28,10 +28,10 @@ except ModuleNotFoundError:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """Pull SQLite + model artifacts from S3 when configured (EC2 + parquetgarage)."""
-    from api.s3_pull import sync_artifacts_from_s3_if_configured
+    """Pull only the artifacts needed for forecast serving (db + artifacts_75k + archetypes)."""
+    from api.s3_pull import sync_serving_inputs_from_s3
 
-    sync_artifacts_from_s3_if_configured()
+    sync_serving_inputs_from_s3()
     yield
 
 

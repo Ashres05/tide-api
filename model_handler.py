@@ -3,6 +3,7 @@ import contextlib
 import json
 import math
 import numbers
+import os
 import sqlite3
 import logging
 import time
@@ -26,7 +27,17 @@ from snowflake_conn import get_snowflake_connection, Snowflake
 from train_model import refresh_data, update_parquet_metrics
 from sqlite_handler import update_sqlite_main
 from model.worldwide_streams_api import simulate_one_worldwide_streams
-from api.s3_pull import sync_artifacts_from_s3_if_configured, sync_artifacts_to_s3_if_configured
+from api.s3_pull import (
+    sync_artifacts_from_s3_if_configured,
+    sync_artifacts_to_s3_if_configured,
+    sync_db_from_s3,
+    sync_db_to_s3,
+    sync_full_inputs_from_s3,
+    sync_full_outputs_to_s3,
+    sync_parquets_to_s3,
+    sync_weekly_inputs_from_s3,
+    sync_weekly_outputs_to_s3,
+)
 
 # Set up logging.
 logger = logging.getLogger(__name__)
@@ -466,8 +477,8 @@ def backfill_releases(
     """
     import os as _os
 
-    # Keep SQLite aligned with canonical S3 snapshot before deriving scope.
-    sync_artifacts_from_s3_if_configured()
+    # Backfill only mutates marketshare_data.db; pull only that scope from S3.
+    sync_db_from_s3()
 
     existing_mrelg_ids = {
         (row["MRELG_ID"] or "").strip()
@@ -557,7 +568,7 @@ def backfill_releases(
         )
 
     if inserted > 0:
-        sync_artifacts_to_s3_if_configured()
+        sync_db_to_s3()
 
     return {"inserted": inserted, "skipped": skipped, "errors": errors}
 
@@ -1297,9 +1308,9 @@ def train_model() -> None:
     is fully overwritten (delete + insert) because daily-stream snapshots
     are not additive across runs.
     """
-    # Pull latest canonical files from S3 first so incremental anchors are
-    # computed against shared state across EC2 restarts/process churn.
-    sync_artifacts_from_s3_if_configured()
+    # Full refresh trains every scope, so pull all canonical inputs from S3
+    # (csv + parquets + artifacts_75k + archetypes + db) before training.
+    sync_full_inputs_from_s3()
     refresh_data()
     reload_artifacts()
     try:
@@ -1309,17 +1320,19 @@ def train_model() -> None:
             "train_model: search summary refresh failed; search results may be stale"
         )
     forecast_cache_clear()
-    # Persist refreshed CSV/artifacts/db for future incremental runs.
-    sync_artifacts_to_s3_if_configured()
+    # Persist refreshed CSV + parquets + artifacts + db for future incremental runs.
+    sync_full_outputs_to_s3()
 
 
 def refresh_model() -> None:
     """
-    Refreshes the model.
+    Refreshes the model parquets from Snowflake and pushes them to S3.
     """
     with get_snowflake_connection() as sf:
         update_parquet_metrics(sf)
     reload_artifacts()
+    # Parquets are the only thing this path writes; push just that scope.
+    sync_parquets_to_s3()
 
 
 _PARQUET_DIR = Path(__file__).resolve().parent / "model" / "data"
@@ -1355,26 +1368,27 @@ def _resolved_required_parquet_names() -> list[str]:
 
 def refresh_weekly(force_refresh_parquets: bool = False) -> dict:
     """
-    Single weekly orchestration: (optionally) refresh parquets, refresh CSV
-    data and retrain, then backfill releases. This is what the weekly cron
-    should call — it replaces the prior pattern of invoking /refresh_model,
-    /refresh_data, and /releases/backfill separately (which made ordering
-    easy to get wrong).
+    Single weekly orchestration designed around the canonical S3 pattern:
+      - Pull only weekly inputs (db + csvs + artifacts_75k) to local disk.
+      - Train CSV-only (skips heavy parquet KMeans/archetype decay).
+      - Push weekly outputs (db + csvs + artifacts_75k) back to S3.
+
+    Heavy steps (parquet rebuild, full backfill) are intentionally separated
+    so the weekly path stays fast, low-memory, and reliable. Use the dedicated
+    endpoints when those need to run:
+      - /v1/data/refresh_model  — rebuild AE + worldwide parquets
+      - /v1/data/refresh_data   — full retrain (parquets + archetypes + csvs)
+      - /v1/releases/backfill   — full release backfill
 
     Stage order:
-      1. update_parquet_metrics — AE + worldwide_streams parquets feed the
-         archetype KMeans step that train_artifacts_main runs. SKIPPED when
-         both parquet files already exist on disk, because the two queries
-         that back this stage scan Luminate from 2018 to present and take
-         multiple minutes each. The parquets change infrequently; force a
-         refresh by passing force_refresh_parquets=True or by calling the
-         dedicated /v1/data/refresh_model endpoint.
-      2. refresh_data(csv_only=True) — pulls the three CSVs (incremental; append +
-         de-dupe on disk) and retrains LGBM / Prophet / spike / df_full from CSVs
-         only. Skips AE parquet KMeans/DNA and all archetype decay (heavy; run
-         /v1/data/refresh_data or /v1/data/refresh_model when parquets change).
-      3. backfill_releases — inserts any new mrelg_ids into SQLite and
-         refreshes per-release historical metrics used by /weekly forecasts.
+      1. (optional) refresh_parquets — only when force_refresh_parquets=True.
+         Pulls the parquets scope from S3 first so the rebuild starts from
+         the canonical state; pushes them back when done.
+      2. refresh_data(csv_only=True) — pulls 3 CSVs incrementally from
+         Snowflake and retrains LGBM / Prophet / spike / df_full from CSVs
+         only. Skips AE parquet KMeans/DNA and all archetype decay.
+      3. backfill_releases — inserts new mrelg_ids and refreshes per-release
+         historical metrics. Skipped when TIDE_WEEKLY_SKIP_BACKFILL=1.
 
     Returns a per-stage summary. Stage 1 failures are non-fatal (archetype
     training falls back to whatever parquets are already on disk); stages 2
@@ -1390,43 +1404,27 @@ def refresh_weekly(force_refresh_parquets: bool = False) -> dict:
 
     summary: Dict[str, Any] = {"stages": {}}
 
-    # Always try to hydrate local disk from S3 before deciding parquets are
-    # missing. This prevents unnecessary full rebuilds when EC2 local files
-    # were pruned but canonical artifacts exist in S3.
+    skip_backfill = os.environ.get("TIDE_WEEKLY_SKIP_BACKFILL", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+    # Pull only the weekly inputs (db + csvs + artifacts_75k). Skip the heavy
+    # parquets/archetypes scopes — those are not needed for CSV-only training.
     set_step("sync_from_s3:start")
-    sync_artifacts_from_s3_if_configured()
+    sync_weekly_inputs_from_s3()
     set_step("sync_from_s3:done")
 
-    set_step("refresh_parquets:start")
-    t0 = _now()
-    missing = _resolve_missing_required_parquets()
-    if not force_refresh_parquets and not missing:
-        existing = _resolved_required_parquet_names()
-        logger.info(
-            "refresh_weekly: skipping parquet refresh (found %s). "
-            "Call refresh_weekly(force_refresh_parquets=True) or /refresh_model "
-            "to rebuild.",
-            existing,
-        )
-        set_step("refresh_parquets:skipped")
-        summary["stages"]["refresh_parquets"] = {
-            "ok": True,
-            "skipped": True,
-            "reason": "parquets already exist on disk",
-            "paths": existing,
-            "elapsed_sec": _elapsed(t0),
-        }
-    else:
-        if force_refresh_parquets:
-            logger.info("refresh_weekly: force_refresh_parquets=True; rebuilding parquets")
-        else:
-            logger.info(
-                "refresh_weekly: parquet(s) missing, rebuilding: %s",
-                [str(p) for p in missing],
-            )
+    # Stage 1: parquet rebuild (opt-in only). Pull parquet scope first so the
+    # rebuild has the latest canonical state, then push the new ones back.
+    if force_refresh_parquets:
+        set_step("refresh_parquets:start")
+        t0 = _now()
+        logger.info("refresh_weekly: force_refresh_parquets=True; rebuilding parquets")
         try:
+            sync_artifacts_from_s3_if_configured(scopes={"parquets"})
             with get_snowflake_connection() as sf:
                 update_parquet_metrics(sf)
+            sync_parquets_to_s3()
             summary["stages"]["refresh_parquets"] = {
                 "ok": True, "skipped": False, "elapsed_sec": _elapsed(t0),
             }
@@ -1438,7 +1436,18 @@ def refresh_weekly(force_refresh_parquets: bool = False) -> dict:
                 "error": str(e),
                 "elapsed_sec": _elapsed(t0),
             }
+    else:
+        logger.info(
+            "refresh_weekly: skipping parquet refresh (CSV-only weekly path). "
+            "Call /refresh_model or pass force_refresh_parquets=True to rebuild."
+        )
+        summary["stages"]["refresh_parquets"] = {
+            "ok": True,
+            "skipped": True,
+            "reason": "weekly path is CSV-only by design",
+        }
 
+    # Stage 2: CSV-only training.
     set_step("refresh_data:start")
     t0 = _now()
     try:
@@ -1453,26 +1462,39 @@ def refresh_weekly(force_refresh_parquets: bool = False) -> dict:
         reload_artifacts()
         raise
 
-    set_step("backfill_releases:start")
-    t0 = _now()
-    try:
-        backfill_result = backfill_releases()
+    # Stage 3: backfill (skippable for fast weekly runs).
+    if skip_backfill:
+        logger.info(
+            "refresh_weekly: skipping backfill_releases (TIDE_WEEKLY_SKIP_BACKFILL=1). "
+            "Run POST /v1/releases/backfill separately when needed."
+        )
         summary["stages"]["backfill_releases"] = {
-            "ok": True, "elapsed_sec": _elapsed(t0), **backfill_result,
+            "ok": True,
+            "skipped": True,
+            "reason": "TIDE_WEEKLY_SKIP_BACKFILL=1",
         }
-    except Exception as e:
-        logger.exception("refresh_weekly: backfill_releases failed")
-        summary["stages"]["backfill_releases"] = {
-            "ok": False, "error": str(e), "elapsed_sec": _elapsed(t0),
-        }
-        set_step("reload_artifacts")
-        reload_artifacts()
-        raise
+    else:
+        set_step("backfill_releases:start")
+        t0 = _now()
+        try:
+            backfill_result = backfill_releases()
+            summary["stages"]["backfill_releases"] = {
+                "ok": True, "elapsed_sec": _elapsed(t0), **backfill_result,
+            }
+        except Exception as e:
+            logger.exception("refresh_weekly: backfill_releases failed")
+            summary["stages"]["backfill_releases"] = {
+                "ok": False, "error": str(e), "elapsed_sec": _elapsed(t0),
+            }
+            set_step("reload_artifacts")
+            reload_artifacts()
+            raise
 
     set_step("reload_artifacts")
     reload_artifacts()
+    # Push only what weekly mutates: db + csvs + artifacts_75k.
     set_step("sync_to_s3")
-    sync_artifacts_to_s3_if_configured()
+    sync_weekly_outputs_to_s3()
     set_step("done")
     return summary
 
