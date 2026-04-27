@@ -1,31 +1,39 @@
-WITH prelim_query AS (
+-- Single-pass weekly aggregation with an inline spike filter.
+--
+-- Replaces the previous CTE + self-join pattern. The original query
+-- materialized weekly totals into ``prelim_query`` and self-joined it on
+-- ``rn = rn + 1`` just to compare each week to the next, which forced
+-- Snowflake to scan/aggregate the same rows twice and silently dropped the
+-- final week (the last row had no week_after). LEAD() over the same window
+-- gets the next-week comparison in one pass and keeps the tail row.
+--
+-- Filter semantics are preserved: drop the very first observed week iff the
+-- following week's streams are >100x larger (treats the first week as a
+-- pre-release leak / metadata error and prefers the second week as the
+-- true cold-start anchor).
+SELECT
+    week_ending_date,
+    global_streams
+FROM (
     SELECT
         da.week_end_date AS week_ending_date,
-        SUM(s.quantity) AS global_streams,
-        ROW_NUMBER() OVER (
-            ORDER BY week_end_date
-        ) AS rn
+        SUM(s.quantity)  AS global_streams,
+        ROW_NUMBER() OVER (ORDER BY da.week_end_date) AS rn,
+        LEAD(SUM(s.quantity)) OVER (ORDER BY da.week_end_date) AS next_global_streams
     FROM luminate_prod.extract_s.vw_daily_fact_mrelg_summary_ds s
         JOIN luminate_prod.extract_s.vw_musical_release_group_ds m ON s.mrelg_id = m.mrelg_id
         JOIN luminate_prod.extract_s.vw_date_ds da ON da.datename = s.report_date
     WHERE
-        s.country_code = 'AA'
+        s.country_code      = 'AA'
         AND s.metric_category = 'Streams'
-        AND s.service_type = 'OnDemand'
-	AND da.week_end_date >= {RELEASE_DATE}
-        AND s.mrelg_id = {MRELG_ID}
+        AND s.service_type    = 'OnDemand'
+        AND da.week_end_date >= {RELEASE_DATE}
+        AND s.mrelg_id        = {MRELG_ID}
         AND da.week_end_date < DATEADD(DAY, -2, CURRENT_DATE())
-    GROUP BY
-        1
+    GROUP BY da.week_end_date
 )
-
-SELECT
-    weekly.week_ending_date,
-    weekly.global_streams
-FROM prelim_query weekly
-    JOIN prelim_query week_after ON week_after.rn = weekly.rn + 1
-WHERE
-    NOT (
-        weekly.rn = 1
-        AND COALESCE(week_after.global_streams / NULLIF(weekly.global_streams, 0), 0) > 100        -- streams week 2 are 100x greater
-    ) // coalesce to avoid division by 0 and endpoint error
+WHERE NOT (
+    rn = 1
+    AND COALESCE(next_global_streams / NULLIF(global_streams, 0), 0) > 100
+)
+ORDER BY week_ending_date

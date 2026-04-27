@@ -1,15 +1,24 @@
 from __future__ import annotations
+import contextlib
 import json
 import math
 import numbers
 import sqlite3
 import logging
+import time
 import pandas as pd
 
 from datetime import datetime, date
+from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Dict, List
-from sqlite_handler import DATABASE_NAME, ensure_expected_releases_fw_columns
+from typing import Any, Dict, Iterator, List, Optional, Tuple
+from sqlite_handler import (
+    DATABASE_NAME,
+    ensure_expected_releases_fw_columns,
+    ensure_marketshare_search_summary_columns,
+    refresh_marketshare_search_summary,
+)
+from search_text import normalize_search_text
 from model.marketshare_75k_simulation import DISTRIBUTIONS, NUM_WEEKS
 from snowflake_conn import load_sql
 from model.forecast_engine_server import ForecastEngine
@@ -94,6 +103,125 @@ _ALLOWED_SCENARIOS = frozenset[str]({"Bear", "Base", "Bull"})
 
 GLOBAL_FORECAST_ENGINE = None
 GLOBAL_WORLDWIDE_ARTIFACTS = None
+
+
+# ---------------------------------------------------------------------------
+# Performance instrumentation
+# ---------------------------------------------------------------------------
+# Lightweight timing helper. Logs INFO with a stable structured prefix so the
+# timings are easy to grep in api_refresh / FastAPI logs:
+#
+#     PERF endpoint=search_global_streaming phase=db_fetch ms=412.1 rows=403211
+#
+# Each top-level endpoint creates a span dict, then writes a final aggregated
+# line at the end summarising every phase + total wall time. Phase timers also
+# log per-phase so we still see partial progress on slow requests.
+
+_PERF_LOG_PREFIX = "PERF"
+
+
+def _now() -> float:
+    return time.perf_counter()
+
+
+def _ms(t0: float) -> float:
+    return round((time.perf_counter() - t0) * 1000.0, 1)
+
+
+@contextlib.contextmanager
+def _perf_phase(
+    span: Dict[str, Any], phase: str, *, endpoint: str, **extra: Any
+) -> Iterator[Dict[str, Any]]:
+    """
+    Time a single phase of an endpoint and append it to ``span``.
+
+    ``extra`` is mutable inside the with-block (the dict is yielded so callers
+    can record observed counts), and is logged once on exit alongside the
+    phase duration.
+    """
+    t0 = _now()
+    info: Dict[str, Any] = dict(extra)
+    try:
+        yield info
+    finally:
+        duration_ms = _ms(t0)
+        record = {"phase": phase, "ms": duration_ms, **info}
+        span.setdefault("phases", []).append(record)
+        kv = " ".join(f"{k}={v}" for k, v in record.items())
+        logger.info("%s endpoint=%s %s", _PERF_LOG_PREFIX, endpoint, kv)
+
+
+def _perf_summary(span: Dict[str, Any], *, endpoint: str, t_start: float, **extra: Any) -> None:
+    """Emit the final aggregated PERF log for an endpoint span."""
+    total_ms = _ms(t_start)
+    span["total_ms"] = total_ms
+    span.update(extra)
+    parts = [f"total_ms={total_ms}"]
+    for k, v in extra.items():
+        parts.append(f"{k}={v}")
+    logger.info(
+        "%s endpoint=%s phase=__summary__ %s",
+        _PERF_LOG_PREFIX,
+        endpoint,
+        " ".join(parts),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Forecast response cache
+# ---------------------------------------------------------------------------
+# Bounded TTL cache keyed by (mrelg_id, daily-data-cutoff). The Snowflake
+# query for global streaming filters by ``CURRENT_DATE() - 2 days`` so the
+# answer is stable for a given (mrelg_id, today) pair. We keep entries for
+# ``_FORECAST_CACHE_TTL_S`` and bound the cache size to ``_FORECAST_CACHE_MAX``
+# so unbounded growth doesn't pin memory in long-running API workers.
+_FORECAST_CACHE_TTL_S = 6 * 60 * 60  # 6 hours
+_FORECAST_CACHE_MAX = 256
+
+
+import threading as _threading  # noqa: E402  (kept local to forecast cache)
+
+_FORECAST_CACHE: Dict[Tuple[str, str], Tuple[float, pd.DataFrame]] = {}
+_FORECAST_CACHE_LOCK = _threading.Lock()
+
+
+def _forecast_cache_key(mrelg_id: str) -> Tuple[str, str]:
+    # Bind to the calendar date so refreshed Snowflake data is picked up the
+    # next day even if the worker has not been restarted; the TTL still
+    # guards against same-day invalidation if the daily snapshot changes.
+    return (mrelg_id, date.today().isoformat())
+
+
+def _forecast_cache_lookup(mrelg_id: str) -> Optional[pd.DataFrame]:
+    key = _forecast_cache_key(mrelg_id)
+    with _FORECAST_CACHE_LOCK:
+        entry = _FORECAST_CACHE.get(key)
+        if entry is None:
+            return None
+        ts, df = entry
+        if (time.time() - ts) > _FORECAST_CACHE_TTL_S:
+            _FORECAST_CACHE.pop(key, None)
+            return None
+    return df
+
+
+def _forecast_cache_store(mrelg_id: str, df: pd.DataFrame) -> None:
+    if df is None or df.empty:
+        return
+    key = _forecast_cache_key(mrelg_id)
+    with _FORECAST_CACHE_LOCK:
+        _FORECAST_CACHE[key] = (time.time(), df.copy())
+        # Cheap LRU-ish eviction: drop the oldest entries beyond the cap.
+        if len(_FORECAST_CACHE) > _FORECAST_CACHE_MAX:
+            evict = sorted(_FORECAST_CACHE.items(), key=lambda kv: kv[1][0])
+            for k, _ in evict[: len(_FORECAST_CACHE) - _FORECAST_CACHE_MAX]:
+                _FORECAST_CACHE.pop(k, None)
+
+
+def forecast_cache_clear() -> None:
+    """Drop all cached forecast responses (used after a data refresh)."""
+    with _FORECAST_CACHE_LOCK:
+        _FORECAST_CACHE.clear()
 
 
 def _cap_weekly_series(values: List[float] | None, max_weeks: int) -> List[float]:
@@ -552,6 +680,365 @@ def get_all_releases_series_json() -> str:
     return json.dumps(get_all_releases())
 
 
+# ---------------------------------------------------------------------------
+# Search: artist+title -> ranked MRELG candidates
+#
+# Powered by the local MARKETSHARE_SEARCH_SUMMARY table (rebuilt every
+# refresh_data call). Ranks rows with a weighted blend of fuzzy text match
+# and log-scaled daily streams so popular releases bubble up *without*
+# drowning out close text matches on smaller releases.
+# ---------------------------------------------------------------------------
+
+_SEARCH_TEXT_WEIGHT = 0.75
+_SEARCH_STREAM_WEIGHT = 0.25
+_SEARCH_DEFAULT_LIMIT = 20
+_SEARCH_TEXT_FLOOR = 0.30  # rows with text similarity below this are dropped
+
+# Two-stage retrieval tuning: SQL prefilter shrinks the candidate pool that
+# the Python fuzzy scorer iterates over. Tokens shorter than MIN_TOKEN_LEN
+# generate too many false positives in LIKE scans, so we drop them. The
+# candidate pool is capped by CANDIDATE_LIMIT (taking the most-streamed
+# matches first) so even worst-case queries stay below ~10k Python iterations.
+_SEARCH_MIN_TOKEN_LEN = 2
+_SEARCH_CANDIDATE_LIMIT = 8000
+_SEARCH_FALLBACK_TOPK = 2000  # used when no usable tokens exist (e.g. all 1-char)
+
+
+def _normalize_search_text(value: Any) -> str:
+    """Backwards-compatible alias for the shared normalizer."""
+    return normalize_search_text(value)
+
+
+def _text_similarity(a: str, b: str) -> float:
+    """
+    Hybrid text similarity in [0, 1]:
+    - SequenceMatcher.ratio for overall ordering / typo tolerance.
+    - Token overlap (Jaccard) so partial matches like "untitled unmastered"
+      vs "untitled unmastered." score high even when punctuation/order vary.
+    """
+    if not a or not b:
+        return 0.0
+    seq = SequenceMatcher(None, a, b).ratio()
+
+    a_tokens = set(a.split())
+    b_tokens = set(b.split())
+    if a_tokens and b_tokens:
+        jaccard = len(a_tokens & b_tokens) / len(a_tokens | b_tokens)
+    else:
+        jaccard = 0.0
+
+    return max(seq, jaccard)
+
+
+def _search_tokens(*texts: str) -> List[str]:
+    """Tokenize already-normalized search inputs and drop noise."""
+    tokens: List[str] = []
+    seen: set[str] = set()
+    for text in texts:
+        if not text:
+            continue
+        for tok in text.split():
+            if len(tok) < _SEARCH_MIN_TOKEN_LEN:
+                continue
+            if tok in seen:
+                continue
+            seen.add(tok)
+            tokens.append(tok)
+    return tokens
+
+
+def _fetch_search_candidates(
+    *,
+    artist_norm: str,
+    title_norm: str,
+    span: Dict[str, Any],
+) -> List[sqlite3.Row]:
+    """
+    Two-stage retrieval: SQL prefilter on indexed normalized text columns to
+    shrink the pool we feed to the Python fuzzy scorer. Falls back to the
+    most-streamed releases when the query has no usable tokens (e.g. all
+    1-char tokens) so we still return *something* and the result quality
+    matches the legacy behaviour for those edge cases.
+
+    Always selects ARTIST_SEARCH/TITLE_SEARCH so the caller can avoid
+    re-normalizing every row at request time. Older databases that predate
+    the columns are detected once and a graceful fallback path is used.
+    """
+    tokens = _search_tokens(artist_norm, title_norm)
+
+    fetch_sql = (
+        "SELECT MRELG_ID, TITLE, ARTIST, LABEL_NAME, RELEASE_DATE, GENRE, "
+        "DAILY_GLOBAL_STREAMS, ARTIST_SEARCH, TITLE_SEARCH "
+        "FROM MARKETSHARE_SEARCH_SUMMARY"
+    )
+
+    try:
+        with sqlite3.connect(DATABASE_NAME) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+
+            normalized_columns_present = _has_normalized_search_columns(cur)
+
+            if not normalized_columns_present:
+                # Legacy schema: fall back to the original full-table fetch so
+                # the function still works after a deploy that hasn't run the
+                # refresh job yet.
+                with _perf_phase(
+                    span,
+                    "db_fetch",
+                    endpoint="search_global_streaming",
+                    mode="full_scan_legacy",
+                ) as info:
+                    cur.execute(
+                        "SELECT MRELG_ID, TITLE, ARTIST, LABEL_NAME, RELEASE_DATE, "
+                        "GENRE, DAILY_GLOBAL_STREAMS FROM MARKETSHARE_SEARCH_SUMMARY"
+                    )
+                    rows = cur.fetchall()
+                    info["rows"] = len(rows)
+                return rows
+
+            if tokens:
+                like_clauses: List[str] = []
+                params: List[Any] = []
+                for tok in tokens:
+                    like_clauses.append("ARTIST_SEARCH LIKE ?")
+                    params.append(f"%{tok}%")
+                    like_clauses.append("TITLE_SEARCH LIKE ?")
+                    params.append(f"%{tok}%")
+
+                sql = (
+                    f"{fetch_sql} WHERE ({' OR '.join(like_clauses)}) "
+                    "ORDER BY DAILY_GLOBAL_STREAMS DESC LIMIT ?"
+                )
+                params.append(_SEARCH_CANDIDATE_LIMIT)
+                with _perf_phase(
+                    span,
+                    "db_fetch",
+                    endpoint="search_global_streaming",
+                    mode="prefilter",
+                ) as info:
+                    info["tokens"] = len(tokens)
+                    cur.execute(sql, params)
+                    rows = cur.fetchall()
+                    info["rows"] = len(rows)
+                return rows
+
+            # No usable tokens: return top-K by streams so we don't fall back
+            # to a full scan but the Python scorer still has *something* to
+            # rank. This matches what the user typically wants (popular
+            # releases) when the query is too short to filter on.
+            with _perf_phase(
+                span,
+                "db_fetch",
+                endpoint="search_global_streaming",
+                mode="topk_no_tokens",
+            ) as info:
+                cur.execute(
+                    f"{fetch_sql} ORDER BY DAILY_GLOBAL_STREAMS DESC LIMIT ?",
+                    (_SEARCH_FALLBACK_TOPK,),
+                )
+                rows = cur.fetchall()
+                info["rows"] = len(rows)
+            return rows
+    except sqlite3.Error as e:
+        raise sqlite3.Error(f"Error querying MARKETSHARE_SEARCH_SUMMARY: {e}") from e
+
+
+_HAS_NORMALIZED_SEARCH_COLUMNS: Optional[bool] = None
+
+
+def _has_normalized_search_columns(cur: sqlite3.Cursor) -> bool:
+    """
+    Cache whether the local SQLite schema has the persisted search columns
+    AND whether they have been populated. The column check runs once per
+    process; the value is only flipped to ``True`` after a refresh has
+    written non-NULL values, so the migration window between an online
+    schema-only ALTER and the next refresh still falls back to the legacy
+    full-scan path (rather than running a LIKE prefilter against all-NULL
+    columns and returning empty results).
+    """
+    global _HAS_NORMALIZED_SEARCH_COLUMNS
+    if _HAS_NORMALIZED_SEARCH_COLUMNS is True:
+        return True
+    cur.execute("PRAGMA table_info(MARKETSHARE_SEARCH_SUMMARY)")
+    cols = {row[1] for row in cur.fetchall()}
+    if "ARTIST_SEARCH" not in cols or "TITLE_SEARCH" not in cols:
+        _HAS_NORMALIZED_SEARCH_COLUMNS = False
+        return False
+    cur.execute(
+        "SELECT 1 FROM MARKETSHARE_SEARCH_SUMMARY "
+        "WHERE ARTIST_SEARCH IS NOT NULL OR TITLE_SEARCH IS NOT NULL LIMIT 1"
+    )
+    populated = cur.fetchone() is not None
+    if populated:
+        _HAS_NORMALIZED_SEARCH_COLUMNS = True
+    return populated
+
+
+def search_releases_by_artist_title(
+    artist: str,
+    title: str,
+    limit: int = _SEARCH_DEFAULT_LIMIT,
+) -> List[Dict[str, Any]]:
+    """
+    Search the MARKETSHARE_SEARCH_SUMMARY table for the best-matching
+    Luminate release groups given a free-text artist and album title.
+
+    Ranking: combined_score = TEXT_WEIGHT * text_score + STREAM_WEIGHT *
+    popularity_score, where text_score is a fuzzy match on artist+title
+    (50/50 average) and popularity_score is log1p(daily_global_streams)
+    normalized to [0, 1] across the candidate pool. The streaming weight is
+    intentionally bounded so popular releases bubble up only when text
+    relevance is comparable; smaller releases with stronger text matches
+    still surface near the top.
+
+    Returns up to `limit` results sorted by combined_score (desc), each with
+    metadata + component scores so the front end can debug / display reasons.
+    """
+    if not isinstance(artist, str):
+        artist = "" if artist is None else str(artist)
+    if not isinstance(title, str):
+        title = "" if title is None else str(title)
+    artist = artist.strip()
+    title = title.strip()
+    if not artist and not title:
+        raise ValueError("At least one of `artist` or `title` is required.")
+    if limit is None:
+        limit = _SEARCH_DEFAULT_LIMIT
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError) as e:
+        raise ValueError("limit must be a positive integer.") from e
+    if limit < 1:
+        raise ValueError("limit must be a positive integer.")
+    limit = min(limit, 100)
+
+    span: Dict[str, Any] = {}
+    t_start = _now()
+
+    artist_norm = _normalize_search_text(artist)
+    title_norm = _normalize_search_text(title)
+
+    rows = _fetch_search_candidates(
+        artist_norm=artist_norm,
+        title_norm=title_norm,
+        span=span,
+    )
+
+    if not rows:
+        logger.info("search: candidate set is empty; returning no matches")
+        _perf_summary(
+            span,
+            endpoint="search_global_streaming",
+            t_start=t_start,
+            results=0,
+            candidates=0,
+        )
+        return []
+
+    candidates: List[Dict[str, Any]] = []
+    with _perf_phase(span, "score", endpoint="search_global_streaming") as info:
+        info["pool"] = len(rows)
+        for row in rows:
+            # Refresh writes pre-normalized columns; legacy rows are normalized
+            # on the fly so a stale DB still works.
+            row_artist_norm = (
+                row["ARTIST_SEARCH"] if "ARTIST_SEARCH" in row.keys() and row["ARTIST_SEARCH"]
+                else _normalize_search_text(row["ARTIST"])
+            )
+            row_title_norm = (
+                row["TITLE_SEARCH"] if "TITLE_SEARCH" in row.keys() and row["TITLE_SEARCH"]
+                else _normalize_search_text(row["TITLE"])
+            )
+
+            if artist_norm and title_norm:
+                artist_score = _text_similarity(artist_norm, row_artist_norm)
+                title_score = _text_similarity(title_norm, row_title_norm)
+                text_score = 0.5 * artist_score + 0.5 * title_score
+            elif artist_norm:
+                artist_score = _text_similarity(artist_norm, row_artist_norm)
+                title_score = 0.0
+                text_score = artist_score
+            else:
+                artist_score = 0.0
+                title_score = _text_similarity(title_norm, row_title_norm)
+                text_score = title_score
+
+            if text_score < _SEARCH_TEXT_FLOOR:
+                continue
+
+            try:
+                daily_streams = float(row["DAILY_GLOBAL_STREAMS"] or 0)
+            except (TypeError, ValueError):
+                daily_streams = 0.0
+
+            candidates.append(
+                {
+                    "mrelg_id": row["MRELG_ID"],
+                    "title": row["TITLE"],
+                    "artist": row["ARTIST"],
+                    "label_name": row["LABEL_NAME"],
+                    "release_date": row["RELEASE_DATE"],
+                    "genre": row["GENRE"],
+                    "daily_global_streams": int(daily_streams),
+                    "artist_score": round(float(artist_score), 4),
+                    "title_score": round(float(title_score), 4),
+                    "text_score": round(float(text_score), 4),
+                    "_raw_streams": daily_streams,
+                }
+            )
+        info["matched"] = len(candidates)
+
+    if not candidates:
+        _perf_summary(
+            span,
+            endpoint="search_global_streaming",
+            t_start=t_start,
+            results=0,
+            candidates=len(rows),
+        )
+        return []
+
+    with _perf_phase(span, "rank", endpoint="search_global_streaming") as info:
+        max_log_streams = max(math.log1p(c["_raw_streams"]) for c in candidates)
+        if max_log_streams <= 0:
+            max_log_streams = 1.0  # avoid divide-by-zero when nothing has streams
+
+        for c in candidates:
+            stream_score = math.log1p(c["_raw_streams"]) / max_log_streams
+            c["stream_score"] = round(float(stream_score), 4)
+            c["combined_score"] = round(
+                float(_SEARCH_TEXT_WEIGHT * c["text_score"] + _SEARCH_STREAM_WEIGHT * stream_score),
+                4,
+            )
+            c.pop("_raw_streams", None)
+
+        candidates.sort(
+            key=lambda x: (x["combined_score"], x["text_score"], x["daily_global_streams"]),
+            reverse=True,
+        )
+        info["matched"] = len(candidates)
+
+    results = candidates[:limit]
+    _perf_summary(
+        span,
+        endpoint="search_global_streaming",
+        t_start=t_start,
+        results=len(results),
+        candidates=len(rows),
+    )
+    return results
+
+
+def search_releases_by_artist_title_json(
+    artist: str,
+    title: str,
+    limit: int = _SEARCH_DEFAULT_LIMIT,
+) -> str:
+    """JSON-serialized form of search_releases_by_artist_title for the API layer."""
+    return json.dumps(search_releases_by_artist_title(artist, title, limit=limit))
+
+
 def get_known_vols(
     release_id: int,
 ) -> List[float]:
@@ -797,9 +1284,21 @@ def get_release_forecasts(id: int, week_ending_date: str | None = None) -> pd.Da
 def train_model() -> None:
     """
     Trains the model.
+
+    Also rebuilds the MARKETSHARE_SEARCH_SUMMARY SQLite table so the search
+    endpoint always reflects the latest daily Snowflake snapshot. The table
+    is fully overwritten (delete + insert) because daily-stream snapshots
+    are not additive across runs.
     """
     refresh_data()
     reload_artifacts()
+    try:
+        refresh_marketshare_search_summary()
+    except Exception:
+        logger.exception(
+            "train_model: search summary refresh failed; search results may be stale"
+        )
+    forecast_cache_clear()
 
 
 def refresh_model() -> None:
@@ -932,14 +1431,8 @@ def refresh_weekly(force_refresh_parquets: bool = False) -> dict:
     return summary
 
 
-def _now() -> float:
-    import time as _t
-    return _t.perf_counter()
-
-
 def _elapsed(t0: float) -> float:
-    import time as _t
-    return round(_t.perf_counter() - t0, 2)
+    return round(time.perf_counter() - t0, 2)
 
 
 def reload_artifacts() -> None:
@@ -955,6 +1448,7 @@ def reload_artifacts() -> None:
     global GLOBAL_FORECAST_ENGINE, GLOBAL_WORLDWIDE_ARTIFACTS
     GLOBAL_FORECAST_ENGINE = None
     GLOBAL_WORLDWIDE_ARTIFACTS = None
+    forecast_cache_clear()
 
 
 def df_to_json(
@@ -1219,8 +1713,11 @@ def get_global_streaming_forecast(id: int) -> pd.DataFrame:
              data_type, pred_worldwide_streams, cumulative_worldwide_streams
 
     data_type is "Actual" for observed weeks and "Forecast" for model-predicted weeks.
+
+    Deprecated: prefer get_global_streaming_forecast_by_mrelg(mrelg_id), which
+    is what the new front end uses after the search endpoint resolves an MRELG.
+    Kept for backward compatibility while the UI is migrated.
     """
-    # Verify parameters.
     _verify_id(id)
     release = get_release(id)
     mrelg_id = (release.get("mrelg_id") or "").strip()
@@ -1231,64 +1728,249 @@ def get_global_streaming_forecast(id: int) -> pd.DataFrame:
         )
     release_date = _validate_date(release.get("date"))
 
-    # Get historical observed weeks from Snowflake.
+    fw_peak = float(release.get("fw_streams") or 0.0) or float(release.get("fw_vol") or 0.0)
+
+    df = _build_global_streaming_forecast(
+        mrelg_id=mrelg_id,
+        release_date=release_date,
+        artist=release.get("artist") or release.get("name") or "",
+        title=release.get("title") or release.get("name") or "",
+        genre=release.get("genre"),
+        fw_streams_peak=fw_peak,
+    )
+    df.insert(0, "release_id", id)
+    return df
+
+
+def get_global_streaming_forecast_by_mrelg(mrelg_id: str) -> pd.DataFrame:
+    """
+    Returns a DataFrame of worldwide streaming forecasts for a given MRELG ID,
+    independent of any local SQLite release record.
+
+    Metadata (artist, title, release_date, genre) is resolved from the local
+    MARKETSHARE_SEARCH_SUMMARY table when available and falls back to a direct
+    Snowflake lookup so previously unseen Luminate releases can still be
+    forecast on demand.
+
+    Output schema mirrors get_global_streaming_forecast (minus release_id):
+    mrelg_id, artist, title, week, data_type, week_ending_date,
+    pred_worldwide_streams, cumulative_worldwide_streams.
+    """
+    if not isinstance(mrelg_id, str) or not mrelg_id.strip():
+        raise ValueError("mrelg_id is required.")
+    mrelg_id = mrelg_id.strip()
+
+    span: Dict[str, Any] = {}
+    t_start = _now()
+
+    cached = _forecast_cache_lookup(mrelg_id)
+    if cached is not None:
+        _perf_summary(
+            span,
+            endpoint="global_streaming_by_mrelg",
+            t_start=t_start,
+            mrelg_id=mrelg_id,
+            cache="hit",
+            rows=len(cached),
+        )
+        return cached.copy()
+
+    with _perf_phase(span, "metadata_lookup_local", endpoint="global_streaming_by_mrelg") as info:
+        local_meta = _resolve_mrelg_metadata_local(mrelg_id)
+        info["hit"] = bool(local_meta)
+
+    # Single Snowflake session per request: re-used for the (rare) metadata
+    # fallback AND the always-required global streams pull. This eliminates
+    # the previous double-connect on the metadata-miss path and removes one
+    # auth roundtrip on the hot path even when metadata is in SQLite.
+    with get_snowflake_connection() as sf:
+        if local_meta is not None:
+            metadata = local_meta
+        else:
+            with _perf_phase(
+                span, "metadata_lookup_snowflake", endpoint="global_streaming_by_mrelg"
+            ):
+                metadata = _resolve_mrelg_metadata_snowflake(mrelg_id, sf)
+
+        release_date = _validate_date(metadata.get("release_date"))
+        df = _build_global_streaming_forecast(
+            mrelg_id=mrelg_id,
+            release_date=release_date,
+            artist=metadata.get("artist") or "",
+            title=metadata.get("title") or "",
+            genre=metadata.get("genre"),
+            fw_streams_peak=0.0,
+            span=span,
+            sf=sf,
+        )
+
+    _forecast_cache_store(mrelg_id, df)
+
+    _perf_summary(
+        span,
+        endpoint="global_streaming_by_mrelg",
+        t_start=t_start,
+        mrelg_id=mrelg_id,
+        cache="miss",
+        rows=len(df),
+    )
+    return df
+
+
+def _resolve_mrelg_metadata(mrelg_id: str) -> Dict[str, Any]:
+    """
+    Look up MRELG metadata. Prefer the local MARKETSHARE_SEARCH_SUMMARY table
+    (populated daily) for speed, and fall back to a direct Snowflake query if
+    the row is not present locally.
+
+    Kept for backward compatibility with any caller that does not have its
+    own Snowflake session; new code paths should call
+    ``_resolve_mrelg_metadata_local`` first and pass an existing Snowflake
+    connection into ``_resolve_mrelg_metadata_snowflake`` to avoid opening a
+    second connection.
+    """
+    local = _resolve_mrelg_metadata_local(mrelg_id)
+    if local is not None:
+        return local
     with get_snowflake_connection() as _sf:
-        hist_df = _get_known_vols_global_streaming(mrelg_id, release_date, _sf)
+        return _resolve_mrelg_metadata_snowflake(mrelg_id, _sf)
+
+
+def _resolve_mrelg_metadata_local(mrelg_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Try to resolve metadata from the daily SQLite snapshot. Returns ``None``
+    when the row is not present so the caller can decide whether to fall
+    back to Snowflake (and reuse an existing session if it has one).
+    """
+    try:
+        with sqlite3.connect(DATABASE_NAME) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT MRELG_ID, TITLE, ARTIST, LABEL_NAME, RELEASE_DATE, GENRE "
+                "FROM MARKETSHARE_SEARCH_SUMMARY WHERE MRELG_ID = ? LIMIT 1",
+                (mrelg_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            return {
+                "mrelg_id": row["MRELG_ID"],
+                "title": row["TITLE"],
+                "artist": row["ARTIST"],
+                "label_name": row["LABEL_NAME"],
+                "release_date": row["RELEASE_DATE"],
+                "genre": row["GENRE"],
+            }
+    except sqlite3.Error as e:
+        logger.warning("mrelg metadata: SQLite lookup failed (%s); will fall back to Snowflake", e)
+        return None
+
+
+def _resolve_mrelg_metadata_snowflake(mrelg_id: str, sf: Snowflake) -> Dict[str, Any]:
+    """Resolve metadata from Snowflake using an already-open session."""
+    df = _verify_mrelg_id(mrelg_id, sf).rename(columns=str.upper)
+    row = df.iloc[0]
+    return {
+        "mrelg_id": str(row.get("MRELG_ID") or mrelg_id),
+        "title": (row.get("TITLE") or ""),
+        "artist": (row.get("DISPLAY_ARTIST") or row.get("ARTIST") or ""),
+        "label_name": None,
+        "release_date": str(row.get("RELEASE_DATE") or "").split(" ")[0],
+        "genre": row.get("GENRE"),
+    }
+
+
+def _build_global_streaming_forecast(
+    mrelg_id: str,
+    release_date: str,
+    artist: str,
+    title: str,
+    genre: Any,
+    fw_streams_peak: float,
+    span: Optional[Dict[str, Any]] = None,
+    sf: Optional[Snowflake] = None,
+) -> pd.DataFrame:
+    """
+    Shared backbone for both the legacy release_id-driven and the new MRELG-driven
+    global streaming forecast endpoints. Pulls observed weekly streams from
+    Snowflake, runs the worldwide-streams archetype simulation, and returns
+    the actual-plus-forecast frame.
+
+    ``sf`` lets callers pass an already-open Snowflake session so we don't pay
+    the connect/auth cost more than once per request. ``span`` enables phase-
+    level timing logs without polluting the production code path with
+    bookkeeping when omitted (single-shot scripts).
+    """
+    @contextlib.contextmanager
+    def _phase(name: str, **extra: Any):
+        if span is not None:
+            with _perf_phase(span, name, endpoint="global_streaming_by_mrelg", **extra) as info:
+                yield info
+        else:
+            yield {}
+
+    @contextlib.contextmanager
+    def _sf_session():
+        if sf is not None:
+            yield sf
+        else:
+            with get_snowflake_connection() as _sf:
+                yield _sf
+
+    with _phase("snowflake_streams_query") as info:
+        with _sf_session() as session:
+            hist_df = _get_known_vols_global_streaming(mrelg_id, release_date, session)
+        info["rows"] = len(hist_df)
+
     if hist_df.empty:
         raise ValueError(f"No historical observed weeks found for mrelg_id: {mrelg_id}")
 
     artifacts = get_worldwide_artifacts()
     horizon_weeks = int(artifacts.horizon_weeks)
 
-    # Extract ordered weekly raw stream counts; empty list = cold-start mode.
     known: List[float] = []
-    if not hist_df.empty:
-        stream_col = next(
-            (c for c in hist_df.columns if "stream" in c.lower()),
-            hist_df.columns[-1],
+    stream_col = next(
+        (c for c in hist_df.columns if "stream" in c.lower()),
+        hist_df.columns[-1],
+    )
+    series = pd.to_numeric(hist_df[stream_col], errors="coerce").fillna(0.0)
+    known = series.tolist()
+    if len(known) > horizon_weeks:
+        logger.info(
+            "global_streaming: truncating observed weeks for mrelg_id=%s from %d to %d",
+            mrelg_id,
+            len(known),
+            horizon_weeks,
         )
-        series = pd.to_numeric(hist_df[stream_col], errors="coerce").fillna(0.0)
-        known = series.tolist()
-        if len(known) > horizon_weeks:
-            logger.info(
-                "global_streaming: truncating observed weeks for release_id=%s mrelg_id=%s from %d to %d",
-                id,
-                mrelg_id,
-                len(known),
-                horizon_weeks,
-            )
-            # fit_backfill_forecast requires len(actuals) <= end_week <= horizon.
-            # Keep the earliest weeks (week 1..horizon) for a valid backfill fit.
-            known = known[:horizon_weeks]
-            hist_df = hist_df.iloc[:horizon_weeks].copy()
+        # fit_backfill_forecast requires len(actuals) <= end_week <= horizon.
+        # Keep the earliest weeks (week 1..horizon) for a valid backfill fit.
+        known = known[:horizon_weeks]
+        hist_df = hist_df.iloc[:horizon_weeks].copy()
 
-    # Cold-start peak: prefer fw_streams, fall back to fw_vol.
-    fw_peak = float(release.get("fw_streams") or 0.0) or float(release.get("fw_vol") or 0.0)
-    if not any(x > 0 for x in known) and fw_peak <= 0:
+    if not any(x > 0 for x in known) and fw_streams_peak <= 0:
         raise ValueError(
-            f"Release {id} ({mrelg_id}) has no observed worldwide stream history "
-            "and no fw_streams / fw_vol peak set. "
-            "Provide at least one observed week or set fw_streams > 0."
+            f"mrelg_id {mrelg_id} has no observed worldwide stream history and no "
+            "first-week peak available; cannot produce a forecast."
         )
 
     release_dict: Dict[str, Any] = {
-        "artist": release.get("artist") or release.get("name") or "",
-        "name": release.get("name") or "",
-        "genre": release.get("genre"),
-        "date": release.get("date"),
+        "artist": artist or "",
+        "name": title or "",
+        "genre": genre,
+        "date": release_date,
         "known_worldwide_streams": known,
-        "fw_worldwide_streams": fw_peak,
+        "fw_worldwide_streams": float(fw_streams_peak or 0.0),
     }
 
-    result = simulate_one_worldwide_streams(release_dict, artifacts, end_week=horizon_weeks)
+    with _phase("simulation") as info:
+        result = simulate_one_worldwide_streams(release_dict, artifacts, end_week=horizon_weeks)
+        info["weeks"] = horizon_weeks
+        info["known"] = len(known)
 
     n_known = len(known)
     df = pd.DataFrame(result["weekly"])  # week, pred_worldwide_streams, cumulative_worldwide_streams
 
-    # --- week_ending_date -------------------------------------------------------
-    # Observed weeks: use real dates from hist_df (already ordered by week_end_date).
-    # Forecast weeks: extrapolate 7 days per week past the last known date.
-    # Cold-start (no hist_df): derive entirely from release date.
     if not hist_df.empty:
         date_col = next(c for c in hist_df.columns if "date" in c.lower())
         hist_dates = pd.to_datetime(hist_df[date_col]).reset_index(drop=True)
@@ -1300,22 +1982,17 @@ def get_global_streaming_forecast(id: int) -> pd.DataFrame:
                 return hist_dates.iloc[idx].strftime("%Y-%m-%d")
             return (last_known_date + pd.Timedelta(weeks=(week - n_known))).strftime("%Y-%m-%d")
     else:
-        release_date = pd.to_datetime(release.get("date"))
+        rel_dt = pd.to_datetime(release_date)
 
         def _week_to_date(week: int) -> str:  # type: ignore[misc]
-            return (release_date + pd.Timedelta(weeks=week)).strftime("%Y-%m-%d")
+            return (rel_dt + pd.Timedelta(weeks=week)).strftime("%Y-%m-%d")
 
     df["week_ending_date"] = df["week"].apply(_week_to_date)
-
-    # --- data_type --------------------------------------------------------------
     df["data_type"] = df["week"].apply(lambda w: "Actual" if w <= n_known else "Forecast")
 
-    # --- final column order -----------------------------------------------------
-    df.insert(0, "release_id", id)
-    df.insert(1, "mrelg_id", mrelg_id)
-    df.insert(2, "artist", release.get("artist") or "")
-    df.insert(3, "title", release.get("title") or release.get("name") or "")
-    # Place week_ending_date and data_type immediately after week
+    df.insert(0, "mrelg_id", mrelg_id)
+    df.insert(1, "artist", artist or "")
+    df.insert(2, "title", title or "")
     week_pos = df.columns.get_loc("week")
     for col in ("data_type", "week_ending_date"):
         df.insert(week_pos + 1, col, df.pop(col))

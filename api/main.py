@@ -336,8 +336,67 @@ def weekly_marketshare(week_ending_date: str | None = None):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/v1/releases/{release_id}/global_streaming")
+@app.get("/v1/revenue/search_global_streaming")
+def search_global_streaming(
+    artist: str = "",
+    title: str = "",
+    limit: int = 20,
+):
+    """
+    Search the local MARKETSHARE_SEARCH_SUMMARY table for the best-matching
+    Luminate releases given a free-text artist and album title. Returns a
+    ranked list of candidates (each carrying its `mrelg_id`) so the front
+    end can call /v1/releases/global_streaming_by_mrelg/{mrelg_id} without
+    ever exposing the MRELG lookup to the user.
+
+    Ranking: weighted blend of fuzzy text match and log-scaled daily streams
+    (text-dominant by default) so popular releases bubble up but never drown
+    out close text matches on smaller releases.
+
+    Note: this static route is intentionally registered before the
+    /v1/releases/{release_id} parameterized routes so FastAPI matches it as
+    a literal path instead of trying to coerce 'search_global_streaming'
+    into an int release_id.
+    """
+    try:
+        payload = model_handler.search_releases_by_artist_title_json(
+            artist=artist, title=title, limit=limit
+        )
+        return Response(content=payload, media_type="application/json")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v1/revenue/global_streaming_by_mrelg/{mrelg_id}")
+def global_streaming_by_mrelg(mrelg_id: str):
+    """
+    Returns observed + forecasted global weekly streams for a Luminate MRELG
+    release group. Metadata (artist/title/release_date/genre) is resolved
+    from the local MARKETSHARE_SEARCH_SUMMARY table when present and falls
+    back to a direct Snowflake lookup. Pair with
+    GET /v1/releases/search_global_streaming so the front end never has to
+    resolve MRELG IDs by hand.
+    """
+    try:
+        payload = model_handler.df_to_json(
+            model_handler.get_global_streaming_forecast_by_mrelg(mrelg_id)
+        )
+        return Response(content=payload, media_type="application/json")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v1/releases/{release_id}/global_streaming", deprecated=True)
 def global_streaming_release(release_id: int):
+    """
+    Deprecated: use GET /v1/releases/global_streaming_by_mrelg/{mrelg_id}
+    instead. Kept temporarily so existing callers that still pass a local
+    SQLite release_id continue to work during front-end migration.
+    """
     try:
         payload = model_handler.df_to_json(
             model_handler.get_global_streaming_forecast(release_id)

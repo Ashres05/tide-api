@@ -5,9 +5,43 @@ from dotenv import load_dotenv
 from pathlib import Path
 from cryptography.hazmat.primitives import serialization
 import textwrap
+import threading
 
 SECRETS_DIR_NAME = 'secrets'
 SNOWFLAKE_SECRETS_FILE = 'amg_research.env'
+
+# Parsing the Snowflake PEM into DER and re-loading it through cryptography
+# costs ~30–80ms per call. Forecast endpoints open a fresh session per
+# request, so we cache the derived bytes keyed on the raw PEM string. A new
+# secrets file (env reload) produces a new cache key automatically; the cache
+# never grows beyond a handful of entries.
+_PRIVATE_KEY_DER_CACHE: dict[str, bytes] = {}
+_PRIVATE_KEY_DER_LOCK = threading.Lock()
+
+
+def _private_key_der_for(private_key_str: str) -> bytes:
+    """Return the cached DER-encoded private key for a Snowflake PEM string."""
+    with _PRIVATE_KEY_DER_LOCK:
+        cached = _PRIVATE_KEY_DER_CACHE.get(private_key_str)
+        if cached is not None:
+            return cached
+
+    header = "-----BEGIN PRIVATE KEY-----"
+    footer = "-----END PRIVATE KEY-----"
+    key_body = private_key_str.replace(header, "").replace(footer, "").strip()
+    key_body_wrapped = "\n".join(textwrap.wrap(key_body, 64))
+    private_key_pem = f"{header}\n{key_body_wrapped}\n{footer}".encode()
+
+    private_key = serialization.load_pem_private_key(private_key_pem, password=None)
+    private_key_der = private_key.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
+    with _PRIVATE_KEY_DER_LOCK:
+        _PRIVATE_KEY_DER_CACHE[private_key_str] = private_key_der
+    return private_key_der
 
 class Snowflake:
     """
@@ -78,25 +112,7 @@ def get_snowflake_connection():
     if not private_key_str:
         raise ValueError("SNOWFLAKE_PRIVATE_KEY is missing or incorrect.")
 
-    # Extract the header and footer
-    header = "-----BEGIN PRIVATE KEY-----"
-    footer = "-----END PRIVATE KEY-----"
-    key_body = private_key_str.replace(header, "").replace(footer, "").strip()
-
-    # Insert line breaks every 64 characters
-    key_body_wrapped = "\n".join(textwrap.wrap(key_body, 64))
-    private_key_pem = f"{header}\n{key_body_wrapped}\n{footer}".encode()
-
-    private_key = serialization.load_pem_private_key(
-        private_key_pem,
-        password=None
-    )
-
-    private_key_der = private_key.private_bytes(
-        encoding=serialization.Encoding.DER,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption()
-    )
+    private_key_der = _private_key_der_for(private_key_str)
 
     creds = {
         "user": os.environ.get("SNOWFLAKE_USER"),

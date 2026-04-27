@@ -1,4 +1,5 @@
 from snowflake_conn import get_snowflake_connection, load_sql
+from search_text import normalize_search_text
 import sqlite3
 import pandas as pd
 import numpy as np
@@ -12,6 +13,29 @@ DATABASE_NAME = str(Path(__file__).resolve().parent / 'marketshare_data.db')
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
+
+# Create table queries
+CREATE_EXPECTED_RELEASES_TABLE = 'create_expected_releases_table.sql'
+CREATE_MARKETSHARE_RELEASE_METRICS_TABLE = 'create_marketshare_release_metrics.sql'
+CREATE_WEEKLY_MARKETSHARE_TABLE = 'create_weekly_marketshare_table.sql'
+CREATE_YTD_MARKETSHARE_TABLE = 'create_ytd_marketshare_table.sql'
+CREATE_MARKETSHARE_SEARCH_SUMMARY_TABLE = 'create_marketshare_search_summary_table.sql'
+
+# Select queries
+WEEKLY_MARKETSHARE_QUERY = 'query_weekly_marketshare_query.sql'
+YTD_MARKETSHARE_QUERY = 'query_ytd_marketshare_query.sql'
+MARKETSHARE_RELEASE_METRICS_QUERY = 'query_marketshare_release_metrics.sql'
+EXPECTED_RELEASES_QUERY = 'release_get_all.sql'
+MARKETSHARE_SEARCH_SUMMARY_QUERY = 'query_marketshare_search_summary.sql'
+
+# Insert queries
+INSERT_WEEKLY_MARKETSHARE = 'insert_weekly_marketshare.sql'
+INSERT_YTD_MARKETSHARE = 'insert_ytd_marketshare.sql'
+INSERT_MARKETSHARE_RELEASE_METRICS = 'insert_marketshare_release_metrics.sql'
+INSERT_MARKETSHARE_SEARCH_SUMMARY = 'insert_marketshare_search_summary.sql'
+
+# Delete queries
+DELETE_MARKETSHARE_SEARCH_SUMMARY = 'delete_marketshare_search_summary.sql'
 
 def ensure_expected_releases_fw_columns(conn: sqlite3.Connection) -> None:
     """
@@ -43,26 +67,127 @@ def ensure_expected_releases_fw_columns(conn: sqlite3.Connection) -> None:
                 raise
 
 
-# Create table queries
-CREATE_EXPECTED_RELEASES_TABLE = 'create_expected_releases_table.sql'
-CREATE_MARKETSHARE_RELEASE_METRICS_TABLE = 'create_marketshare_release_metrics.sql'
-CREATE_WEEKLY_MARKETSHARE_TABLE = 'create_weekly_marketshare_table.sql'
-CREATE_YTD_MARKETSHARE_TABLE = 'create_ytd_marketshare_table.sql'
-
-# Select queries
-WEEKLY_MARKETSHARE_QUERY = 'query_weekly_marketshare_query.sql'
-YTD_MARKETSHARE_QUERY = 'query_ytd_marketshare_query.sql'
-MARKETSHARE_RELEASE_METRICS_QUERY = 'query_marketshare_release_metrics.sql'
-EXPECTED_RELEASES_QUERY = 'release_get_all.sql'
-
-# Insert queries
-INSERT_WEEKLY_MARKETSHARE = 'insert_weekly_marketshare.sql'
-INSERT_YTD_MARKETSHARE = 'insert_ytd_marketshare.sql'
-INSERT_MARKETSHARE_RELEASE_METRICS = 'insert_marketshare_release_metrics.sql'
-
-
 def _chunked(values: list[str], size: int) -> list[list[str]]:
     return [values[i:i + size] for i in range(0, len(values), size)]
+
+
+def ensure_marketshare_search_summary_columns(conn: sqlite3.Connection) -> None:
+    """
+    Online migration for the search-summary table. Adds the persisted
+    normalized columns (and supporting indexes) to databases that pre-date
+    the search-latency optimization so production rollouts don't require a
+    full rebuild before the new prefilter path can run.
+
+    Safe to call on every connection; ALTER/CREATE statements are idempotent.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name='MARKETSHARE_SEARCH_SUMMARY'"
+    )
+    if cur.fetchone() is None:
+        return
+
+    cur.execute("PRAGMA table_info(MARKETSHARE_SEARCH_SUMMARY)")
+    existing = {row[1] for row in cur.fetchall()}
+    for col in ("ARTIST_SEARCH", "TITLE_SEARCH"):
+        if col in existing:
+            continue
+        try:
+            cur.execute(
+                f"ALTER TABLE MARKETSHARE_SEARCH_SUMMARY ADD COLUMN {col} TEXT"
+            )
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                raise
+
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS IDX_MARKETSHARE_SEARCH_SUMMARY_STREAMS "
+        "ON MARKETSHARE_SEARCH_SUMMARY (DAILY_GLOBAL_STREAMS DESC)"
+    )
+
+
+def refresh_marketshare_search_summary() -> int:
+    """
+    Rebuild the MARKETSHARE_SEARCH_SUMMARY table from Snowflake.
+
+    The Snowflake source query (query_marketshare_search_summary.sql) returns
+    one row per MRELG release with a single most-recent daily global stream
+    snapshot. Because that snapshot is daily, the local SQLite copy is fully
+    replaced on every refresh: stale rows are deleted before the freshly
+    queried rows are written.
+
+    Returns the number of rows written into SQLite.
+    """
+    logger.info("sqlite_handler: refreshing MARKETSHARE_SEARCH_SUMMARY (db=%s)", DATABASE_NAME)
+
+    with get_snowflake_connection() as sf:
+        df = sf.query(load_sql(MARKETSHARE_SEARCH_SUMMARY_QUERY))
+
+    df = df.rename(columns=str.upper) if not df.empty else df
+    logger.info("sqlite_handler: Snowflake search summary rows=%d", len(df))
+
+    # Map Snowflake-result column names → SQLite table column names. Insert
+    # ordering must mirror queries/insert_marketshare_search_summary.sql.
+    column_map = {
+        'MRELG_ID': 'MRELG_ID',
+        'TITLE': 'TITLE',
+        'ARTIST': 'ARTIST',
+        'LABEL': 'LABEL_NAME',
+        'RELEASE_DATE': 'RELEASE_DATE',
+        'GENRE': 'GENRE',
+        'DAILY_STREAMS': 'DAILY_GLOBAL_STREAMS',
+    }
+    target_cols = [
+        'MRELG_ID', 'TITLE', 'ARTIST', 'LABEL_NAME', 'RELEASE_DATE', 'GENRE',
+        'DAILY_GLOBAL_STREAMS', 'ARTIST_SEARCH', 'TITLE_SEARCH',
+    ]
+
+    if not df.empty:
+        for src in column_map:
+            if src not in df.columns:
+                df[src] = None
+        df = df.rename(columns=column_map)
+
+        if "RELEASE_DATE" in df.columns:
+            df["RELEASE_DATE"] = df["RELEASE_DATE"].astype(str)
+
+        if "DAILY_GLOBAL_STREAMS" in df.columns:
+            streams = pd.to_numeric(df["DAILY_GLOBAL_STREAMS"], errors="coerce")
+            streams = streams.replace([float("inf"), float("-inf")], pd.NA).fillna(0)
+            df["DAILY_GLOBAL_STREAMS"] = streams.astype("int64")
+
+        for col in ("MRELG_ID", "TITLE", "ARTIST", "LABEL_NAME", "GENRE"):
+            if col in df.columns:
+                df[col] = df[col].astype(object).where(df[col].notna(), None)
+
+        df = df.loc[df["MRELG_ID"].astype(str).str.strip() != ""].copy()
+
+        # Pre-compute normalized search columns once at refresh time. Doing
+        # this here (instead of per-request) is what lets the search endpoint
+        # skip ~400k unicode normalizations on the hot path.
+        df["ARTIST_SEARCH"] = df["ARTIST"].map(normalize_search_text)
+        df["TITLE_SEARCH"] = df["TITLE"].map(normalize_search_text)
+
+    rows = (
+        list(df[target_cols].itertuples(index=False, name=None))
+        if not df.empty
+        else []
+    )
+
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(load_sql(CREATE_MARKETSHARE_SEARCH_SUMMARY_TABLE))
+        # Tables created by older deploys won't have the persisted normalized
+        # columns; bring them up to schema before the bulk insert.
+        ensure_marketshare_search_summary_columns(conn)
+        cursor.execute(load_sql(DELETE_MARKETSHARE_SEARCH_SUMMARY))
+        if rows:
+            cursor.executemany(load_sql(INSERT_MARKETSHARE_SEARCH_SUMMARY), rows)
+        conn.commit()
+
+    logger.info("sqlite_handler: MARKETSHARE_SEARCH_SUMMARY rebuilt (rows=%d)", len(rows))
+    return len(rows)
 
 
 def recompute_ytd_share_from_current_data(data_path: Path) -> pd.DataFrame:
@@ -290,6 +415,15 @@ def update_sqlite_main() -> None:
     # Commit and close connection
     sqlite_conn.commit()
     sqlite_conn.close()
+
+    # Rebuild the search-summary table from Snowflake. Daily-stream snapshot
+    # data is fully replaced rather than merged so search results never carry
+    # stale popularity numbers between refreshes.
+    try:
+        refresh_marketshare_search_summary()
+    except Exception as e:
+        logger.exception("sqlite_handler: search summary refresh failed: %s", e)
+
     logger.info("sqlite_handler: refresh complete")
 
 
