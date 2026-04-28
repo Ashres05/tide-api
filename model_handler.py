@@ -256,6 +256,12 @@ def _sanitize_release_for_simulation(release_map: dict) -> dict:
     for key in ("known_vols", "known_streams", "known_sales", "known_songs"):
         if key in release_map and release_map[key]:
             release_map[key] = _cap_weekly_series(release_map[key], NUM_WEEKS)
+    # Keep known_week_dates aligned with known_vols after the cap so the
+    # frontend can still identify the in-progress week by date.
+    dates = release_map.get("known_week_dates")
+    if isinstance(dates, list) and dates:
+        if len(dates) > NUM_WEEKS:
+            release_map["known_week_dates"] = dates[:NUM_WEEKS]
     return release_map
 
 
@@ -1078,6 +1084,18 @@ def get_known_vols(
     """
     Pull known weekly actuals (ALBUM_EQUIVALENT) for a release from SQLite, ordered by week end.
     """
+    _, vols = get_known_vols_with_dates(release_id)
+    return vols
+
+
+def get_known_vols_with_dates(
+    release_id: int,
+) -> tuple[List[str], List[float]]:
+    """
+    Same as get_known_vols, but also returns the parallel WEEK_ENDING_DATE list
+    so callers can identify in-progress (partial) weeks. Both lists are aligned
+    by index and sorted ascending by week end.
+    """
     _verify_id(release_id)
 
     # TODO: Replace with query_known_vols_sqlite.sql, not a priority.
@@ -1091,10 +1109,13 @@ def get_known_vols(
     with sqlite3.connect(DATABASE_NAME) as conn:
         df = pd.read_sql_query(sql, conn, params=(int(release_id),))
     if df.empty:
-        return []
+        return [], []
     vals = pd.to_numeric(df["ALBUM_EQUIVALENT"], errors="coerce")
-    vals = vals.replace([float("inf"), float("-inf")], pd.NA).dropna()
-    return [float(x) for x in vals.to_list()]
+    vals = vals.replace([float("inf"), float("-inf")], pd.NA)
+    df = df.assign(_v=vals).dropna(subset=["_v"])
+    dates = [str(x) for x in df["WEEK_ENDING_DATE"].to_list()]
+    vols = [float(x) for x in df["_v"].to_list()]
+    return dates, vols
 
 
 def get_known_component_vols(
@@ -1546,12 +1567,13 @@ def _sqlite_row_to_release_map(row: sqlite3.Row) -> dict:
     rid = row["RELEASE_ID"] if "RELEASE_ID" in row.keys() else None
 
     known_vols: List[float] = []
+    known_week_dates: List[str] = []
     component_vols: Dict[str, List[float]] = {"streams": [], "sales": [], "songs": []}
     if mrelg_id and rid is not None:
         try:
-            known_vols = get_known_vols(int(rid))
+            known_week_dates, known_vols = get_known_vols_with_dates(int(rid))
         except Exception:
-            known_vols = []
+            known_week_dates, known_vols = [], []
         try:
             component_vols = get_known_component_vols(int(rid))
         except Exception:
@@ -1598,6 +1620,7 @@ def _sqlite_row_to_release_map(row: sqlite3.Row) -> dict:
         "fw_sales": _sql_float("FW_SALES"),
         "scenario": row["SCENARIO"],
         "known_vols": known_vols,
+        "known_week_dates": known_week_dates,
         "fy_vol": float(row["FY_VOL"] or 0),
         "avg_historical_w1_product_ratio": float(row["AVG_HISTORICAL_W1_PRODUCT_RATIO"] or 0),
         "product_ratio_coefficient": float(row["PRODUCT_RATIO_COEFFICIENT"] or 0),
