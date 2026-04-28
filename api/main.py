@@ -414,6 +414,30 @@ def global_streaming_by_mrelg(mrelg_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/v1/revenue/daily_streams_by_mrelg/{mrelg_id}")
+def daily_streams_by_mrelg(mrelg_id: str):
+    """
+    Live Revenue board only — daily worldwide on-demand streams since release
+    for the given Luminate MRELG release group. Reads from the cached SQLite
+    table MARKETSHARE_DAILY_GLOBAL_STREAMS; lazily refreshes from Snowflake on
+    the first call (or when the cache is older than DAILY_STREAMS_STALE_DAYS).
+
+    The response is sorted ascending by report_date and intentionally excludes
+    the most recent calendar day (Snowflake-side filter — Luminate data lags
+    by ~1 day before settling). This endpoint is not joined into the
+    forecast pipeline; it is a read-only surface for the Live Revenue board.
+    """
+    try:
+        payload = model_handler.df_to_json(
+            model_handler.get_daily_global_streams_by_mrelg(mrelg_id)
+        )
+        return Response(content=payload, media_type="application/json")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/v1/releases/{release_id}/global_streaming", deprecated=True)
 def global_streaming_release(release_id: int):
     """

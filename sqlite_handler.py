@@ -21,6 +21,7 @@ CREATE_MARKETSHARE_RELEASE_METRICS_TABLE = 'create_marketshare_release_metrics.s
 CREATE_WEEKLY_MARKETSHARE_TABLE = 'create_weekly_marketshare_table.sql'
 CREATE_YTD_MARKETSHARE_TABLE = 'create_ytd_marketshare_table.sql'
 CREATE_MARKETSHARE_SEARCH_SUMMARY_TABLE = 'create_marketshare_search_summary_table.sql'
+CREATE_DAILY_GLOBAL_STREAMS_TABLE = 'create_daily_global_streams_table.sql'
 
 # Select queries
 WEEKLY_MARKETSHARE_QUERY = 'query_weekly_marketshare_query.sql'
@@ -28,12 +29,15 @@ YTD_MARKETSHARE_QUERY = 'query_ytd_marketshare_query.sql'
 MARKETSHARE_RELEASE_METRICS_QUERY = 'query_marketshare_release_metrics.sql'
 EXPECTED_RELEASES_QUERY = 'release_get_all.sql'
 MARKETSHARE_SEARCH_SUMMARY_QUERY = 'query_marketshare_search_summary.sql'
+DAILY_GLOBAL_STREAMING_SF_QUERY = 'query_daily_global_streaming.sql'
+DAILY_GLOBAL_STREAMS_SQLITE_QUERY = 'query_daily_global_streams_sqlite.sql'
 
 # Insert queries
 INSERT_WEEKLY_MARKETSHARE = 'insert_weekly_marketshare.sql'
 INSERT_YTD_MARKETSHARE = 'insert_ytd_marketshare.sql'
 INSERT_MARKETSHARE_RELEASE_METRICS = 'insert_marketshare_release_metrics.sql'
 INSERT_MARKETSHARE_SEARCH_SUMMARY = 'insert_marketshare_search_summary.sql'
+INSERT_DAILY_GLOBAL_STREAMS = 'insert_daily_global_streams.sql'
 
 # Delete queries
 DELETE_MARKETSHARE_SEARCH_SUMMARY = 'delete_marketshare_search_summary.sql'
@@ -70,6 +74,11 @@ def ensure_expected_releases_fw_columns(conn: sqlite3.Connection) -> None:
 
 def _chunked(values: list[str], size: int) -> list[list[str]]:
     return [values[i:i + size] for i in range(0, len(values), size)]
+
+
+def _snowflake_str(value: str) -> str:
+    """Module-level Snowflake string-literal escaper."""
+    return "'" + str(value).replace("'", "''") + "'"
 
 
 def _min_week_anchor(cursor: sqlite3.Cursor, table: str, lookback_days: int, fallback: str = "2018-01-01") -> str:
@@ -472,6 +481,148 @@ def update_sqlite_main() -> None:
         logger.exception("sqlite_handler: search summary refresh failed: %s", e)
 
     logger.info("sqlite_handler: refresh complete")
+
+
+# ---------------------------------------------------------------------------
+# Daily worldwide streams (Live Revenue board only)
+#
+# Cached per-MRELG on demand from Snowflake. Intentionally NOT wired into
+# update_sqlite_main so the weekly refresh cron path stays free of an extra
+# per-release Snowflake roundtrip, and so a regression here cannot impact
+# MARKETSHARE_RELEASE_METRICS / the simulator. Read endpoint refreshes lazily
+# when the cached series is empty or older than DAILY_STREAMS_STALE_DAYS.
+# ---------------------------------------------------------------------------
+
+DAILY_STREAMS_STALE_DAYS = 2
+
+
+def _ensure_daily_global_streams_table(cursor: sqlite3.Cursor) -> None:
+    cursor.execute(load_sql(CREATE_DAILY_GLOBAL_STREAMS_TABLE))
+
+
+def _max_daily_streams_report_date(cursor: sqlite3.Cursor, mrelg_id: str) -> str | None:
+    cursor.execute(
+        "SELECT MAX(REPORT_DATE) FROM MARKETSHARE_DAILY_GLOBAL_STREAMS WHERE MRELG_ID = ?",
+        (mrelg_id,),
+    )
+    row = cursor.fetchone()
+    return (row[0] if row else None) or None
+
+
+def _daily_streams_is_fresh(cursor: sqlite3.Cursor, mrelg_id: str) -> bool:
+    """
+    True iff cache has rows AND the latest report_date is within
+    DAILY_STREAMS_STALE_DAYS of today. Snowflake itself excludes the most
+    recent day (DATEADD(DAY, -1, CURRENT_DATE())) so we expect max_report_date
+    to be roughly today-2.
+    """
+    max_report = _max_daily_streams_report_date(cursor, mrelg_id)
+    if not max_report:
+        return False
+    max_dt = pd.to_datetime(max_report, errors="coerce")
+    if pd.isna(max_dt):
+        return False
+    today = pd.Timestamp.utcnow().normalize().tz_localize(None)
+    return (today - max_dt).days <= DAILY_STREAMS_STALE_DAYS
+
+
+def refresh_daily_global_streams_for_mrelg(
+    mrelg_id: str,
+    release_date: str,
+    sf_conn=None,
+) -> int:
+    """
+    Pull daily worldwide stream counts for a single MRELG release group from
+    Snowflake (since release_date) and upsert into MARKETSHARE_DAILY_GLOBAL_STREAMS.
+    Returns the number of rows written. Reuses an existing Snowflake connection
+    when one is provided so callers can batch refreshes without re-auth churn.
+    """
+    if not mrelg_id:
+        return 0
+    sql = (
+        load_sql(DAILY_GLOBAL_STREAMING_SF_QUERY)
+        .replace("{RELEASE_DATE}", _snowflake_str(release_date))
+        .replace("{MRELG_ID}", _snowflake_str(mrelg_id))
+    )
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def _maybe_conn():
+        if sf_conn is not None:
+            yield sf_conn
+        else:
+            with get_snowflake_connection() as fresh:
+                yield fresh
+
+    with _maybe_conn() as sf:
+        df = sf.query(sql)
+
+    if df is None or df.empty:
+        return 0
+    df = df.rename(columns=str.upper)
+    if "REPORT_DATE" not in df.columns or "GLOBAL_STREAMS" not in df.columns:
+        logger.warning(
+            "refresh_daily_global_streams_for_mrelg: unexpected columns %s for mrelg=%s",
+            list(df.columns),
+            mrelg_id,
+        )
+        return 0
+    df["REPORT_DATE"] = df["REPORT_DATE"].astype(str)
+    df["GLOBAL_STREAMS"] = pd.to_numeric(df["GLOBAL_STREAMS"], errors="coerce")
+    df = df.dropna(subset=["GLOBAL_STREAMS"])
+
+    rows = [(mrelg_id, str(d), float(v)) for d, v in zip(df["REPORT_DATE"], df["GLOBAL_STREAMS"])]
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        cur = conn.cursor()
+        _ensure_daily_global_streams_table(cur)
+        cur.executemany(load_sql(INSERT_DAILY_GLOBAL_STREAMS), rows)
+        conn.commit()
+    logger.info(
+        "refresh_daily_global_streams_for_mrelg: wrote %d rows for mrelg=%s (since %s)",
+        len(rows),
+        mrelg_id,
+        release_date,
+    )
+    return len(rows)
+
+
+def get_daily_global_streams_for_mrelg(
+    mrelg_id: str,
+    release_date: str | None = None,
+    refresh_if_stale: bool = True,
+) -> pd.DataFrame:
+    """
+    Read cached daily worldwide streams for a MRELG. When the cache is empty
+    or older than DAILY_STREAMS_STALE_DAYS, refresh from Snowflake first
+    (requires release_date so the Snowflake query can bound itself). Pass
+    refresh_if_stale=False to always serve cached rows even if stale.
+    """
+    if not mrelg_id:
+        return pd.DataFrame(columns=["REPORT_DATE", "GLOBAL_STREAMS"])
+
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        cur = conn.cursor()
+        _ensure_daily_global_streams_table(cur)
+        fresh = _daily_streams_is_fresh(cur, mrelg_id)
+
+    if refresh_if_stale and not fresh and release_date:
+        try:
+            refresh_daily_global_streams_for_mrelg(mrelg_id, release_date)
+        except Exception as e:
+            logger.exception(
+                "get_daily_global_streams_for_mrelg: refresh failed for mrelg=%s: %s",
+                mrelg_id,
+                e,
+            )
+
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        df = pd.read_sql_query(
+            load_sql(DAILY_GLOBAL_STREAMS_SQLITE_QUERY),
+            conn,
+            params=(mrelg_id,),
+        )
+    return df
 
 
 def drop_table(table_name: str) -> None:

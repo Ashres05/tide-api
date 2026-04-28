@@ -1886,6 +1886,53 @@ def get_global_streaming_forecast_by_mrelg(mrelg_id: str) -> pd.DataFrame:
     return df
 
 
+def get_daily_global_streams_by_mrelg(mrelg_id: str) -> pd.DataFrame:
+    """
+    Live Revenue board — daily worldwide streams since release for a single
+    MRELG release group. Reads from the cached SQLite table
+    MARKETSHARE_DAILY_GLOBAL_STREAMS; lazily refreshes from Snowflake when
+    the cache is empty or older than DAILY_STREAMS_STALE_DAYS.
+
+    Returns columns: report_date (str YYYY-MM-DD), global_streams (float).
+
+    Intentionally isolated from the model: no callers in the simulator,
+    forecast engine, or training pipeline depend on this — a regression
+    here only affects the Live Revenue surface.
+    """
+    from sqlite_handler import get_daily_global_streams_for_mrelg
+
+    if not isinstance(mrelg_id, str) or not mrelg_id.strip():
+        raise ValueError("mrelg_id is required.")
+    mrelg_id = mrelg_id.strip()
+
+    # Need release_date to bound the Snowflake query when the cache is cold.
+    # Try local metadata first; fall back to Snowflake only if no cached row.
+    meta = _resolve_mrelg_metadata_local(mrelg_id)
+    release_date: Optional[str] = None
+    if meta:
+        rd = meta.get("release_date")
+        release_date = str(rd).split(" ")[0] if rd else None
+    if not release_date:
+        try:
+            with get_snowflake_connection() as sf:
+                snowflake_meta = _resolve_mrelg_metadata_snowflake(mrelg_id, sf)
+                release_date = (snowflake_meta.get("release_date") or "").split(" ")[0] or None
+        except Exception as e:
+            logger.warning(
+                "get_daily_global_streams_by_mrelg: metadata lookup failed for %s: %s",
+                mrelg_id,
+                e,
+            )
+
+    df = get_daily_global_streams_for_mrelg(mrelg_id, release_date=release_date)
+    df = df.rename(columns=str.lower) if df is not None else pd.DataFrame()
+    if df.empty:
+        return pd.DataFrame(columns=["report_date", "global_streams"])
+    df["report_date"] = df["report_date"].astype(str)
+    df["global_streams"] = pd.to_numeric(df["global_streams"], errors="coerce").fillna(0.0)
+    return df[["report_date", "global_streams"]]
+
+
 def _resolve_mrelg_metadata(mrelg_id: str) -> Dict[str, Any]:
     """
     Look up MRELG metadata. Prefer the local MARKETSHARE_SEARCH_SUMMARY table
