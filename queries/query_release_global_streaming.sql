@@ -27,8 +27,14 @@ FROM (
         s.country_code      = 'AA'
         AND s.metric_category = 'Streams'
         AND s.service_type    = 'OnDemand'
-        AND da.week_end_date >= {RELEASE_DATE}
         AND s.mrelg_id        = {MRELG_ID}
+        
+        -- Keeps the release date floor so we don't pull data from before the release existed
+        AND da.week_end_date >= {RELEASE_DATE}
+        
+        -- NEW: Apply the YTD + 12-week buffer to drop heavy catalog history
+        AND da.week_end_date >= DATEADD(WEEK, -12, DATE_TRUNC('YEAR', CURRENT_DATE()))
+        
         AND da.week_end_date < DATEADD(DAY, -2, CURRENT_DATE())
     GROUP BY da.week_end_date
 )

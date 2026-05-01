@@ -414,6 +414,27 @@ def global_streaming_by_mrelg(mrelg_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/v1/forecast/search/{mrelg_id}")
+def search_catalog_eoy_forecast(mrelg_id: str, target_year: int = 2026):
+    """
+    Autoregressive catalog-decay forecast of weekly **worldwide streams** through
+    the end of ``target_year`` (columns match ``catalog_streams_pruned_80k.parquet``).
+
+    Returns JSON array of row objects: actual weeks in ``target_year`` from Snowflake
+    history, then forecast weeks from the first week after the last observed point
+    through ``{target_year}-12-31``.
+    """
+    try:
+        df = model_handler.get_eoy_search_forecast(mrelg_id, target_year)
+        payload = model_handler.df_to_json(df)
+        return Response(content=payload, media_type="application/json")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/v1/revenue/daily_streams_by_mrelg/{mrelg_id}")
 def daily_streams_by_mrelg(mrelg_id: str):
     """

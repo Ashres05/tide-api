@@ -1,15 +1,18 @@
 from __future__ import annotations
 import contextlib
+import io
 import json
 import math
+import pickle
 import numbers
 import os
 import sqlite3
 import logging
 import time
 import pandas as pd
+import joblib
 
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -23,6 +26,7 @@ from search_text import normalize_search_text
 import marketshare_from_csv
 import album_art
 from model.marketshare_75k_simulation import DISTRIBUTIONS, NUM_WEEKS
+from model.train_catalog_decay import _build_feature_frame, extract_main_genre
 from snowflake_conn import load_sql
 from model.forecast_engine_server import ForecastEngine
 from snowflake_conn import get_snowflake_connection, Snowflake
@@ -117,6 +121,348 @@ _ALLOWED_SCENARIOS = frozenset[str]({"Bear", "Base", "Bull"})
 
 GLOBAL_FORECAST_ENGINE = None
 GLOBAL_WORLDWIDE_ARTIFACTS = None
+GLOBAL_1M_FORECASTER = None
+
+# Default: catalog decay forecaster artifact in S3 (override with TIDE_CATALOG_DECAY_MODEL_S3_URI).
+_CATALOG_DECAY_MODEL_S3_URI_DEFAULT = (
+    "s3://parquetgarage/model/catalog_decay_artifacts_80k/catalog_decay_model.pkl"
+)
+
+
+def _catalog_eoy_ar_trailing_weeks_excluded() -> int:
+    """
+    Optional unconditional strip: drop this many trailing Snowflake weeks from the
+    AR lag seed regardless of volume. Default ``0`` so we rely on
+    ``_catalog_eoy_partial_last_week_ratio``; set ``TIDE_CATALOG_EOY_AR_EXCLUDE_TRAILING_WEEKS=1``
+    to always omit the latest week (legacy behavior).
+    """
+    try:
+        n = int(os.environ.get("TIDE_CATALOG_EOY_AR_EXCLUDE_TRAILING_WEEKS", "0").strip())
+    except ValueError:
+        n = 0
+    return max(0, n)
+
+
+def _catalog_eoy_partial_last_week_ratio() -> float:
+    """
+    If the last weekly global-stream total is below this fraction of the prior
+    week, treat the last row as a partial / unsettled chart week and omit it
+    from the AR ``rolling`` seed (Actual row is still returned).
+
+    Default ``0.75``. Set ``TIDE_CATALOG_EOY_PARTIAL_LAST_WEEK_RATIO=0`` to disable.
+    Large real WoW drops can also trip this — tune (e.g. ``0.65``) if needed.
+    """
+    try:
+        r = float(os.environ.get("TIDE_CATALOG_EOY_PARTIAL_LAST_WEEK_RATIO", "0.75").strip())
+    except ValueError:
+        r = 0.75
+    if r <= 0:
+        return 0.0
+    return float(min(r, 0.9999))
+
+
+def _catalog_eoy_ar_seed_trailing_trim(series: List[float]) -> int:
+    """Weeks to drop from the end of ``series`` when building the AR lag seed only."""
+    if len(series) < 2:
+        return 0
+    exclude = _catalog_eoy_ar_trailing_weeks_excluded()
+    trim = max(0, min(exclude, len(series) - 1))
+    ratio = _catalog_eoy_partial_last_week_ratio()
+    if ratio > 0:
+        prev_wk = float(series[-2])
+        last_wk = float(series[-1])
+        if prev_wk > 0 and last_wk < ratio * prev_wk:
+            trim = max(trim, 1)
+    return min(trim, len(series) - 1)
+
+
+def _parse_s3_uri_to_bucket_key(uri: str) -> tuple[str, str]:
+    u = uri.strip()
+    low = u.lower()
+    if not low.startswith("s3://"):
+        raise ValueError(f"Expected s3:// URI, got {uri!r}")
+    rest = u[5:]
+    parts = rest.split("/", 1)
+    bucket = parts[0].strip()
+    if not bucket:
+        raise ValueError(f"Invalid S3 URI (empty bucket): {uri!r}")
+    key = parts[1].lstrip("/") if len(parts) > 1 else ""
+    if not key:
+        raise ValueError(f"Invalid S3 URI (empty key): {uri!r}")
+    return bucket, key
+
+
+def get_1m_forecaster():
+    """
+    Instantiate the catalog-decay (1M-scale) search forecaster once and return it.
+
+    Loads ``catalog_decay_model.pkl`` from S3 (IAM role or env credentials).
+    Override location with ``TIDE_CATALOG_DECAY_MODEL_S3_URI``.
+    """
+    global GLOBAL_1M_FORECASTER
+    if GLOBAL_1M_FORECASTER is None:
+        uri = os.environ.get(
+            "TIDE_CATALOG_DECAY_MODEL_S3_URI", _CATALOG_DECAY_MODEL_S3_URI_DEFAULT
+        ).strip()
+        bucket, key = _parse_s3_uri_to_bucket_key(uri)
+        logger.info("Loading catalog decay forecaster from s3://%s/%s", bucket, key)
+        try:
+            import boto3
+        except ImportError as e:
+            raise RuntimeError(
+                "boto3 is required to load the catalog decay model from S3"
+            ) from e
+        client = boto3.client("s3")
+        try:
+            resp = client.get_object(Bucket=bucket, Key=key)
+            raw = resp["Body"].read()
+        except Exception as e:
+            raise FileNotFoundError(
+                f"Catalog decay model not found or unreadable at s3://{bucket}/{key}: {e}"
+            ) from e
+        buf = io.BytesIO(raw)
+        try:
+            buf.seek(0)
+            GLOBAL_1M_FORECASTER = pickle.load(buf)
+        except Exception:
+            buf.seek(0)
+            GLOBAL_1M_FORECASTER = joblib.load(buf)
+        logger.info("Catalog decay forecaster loaded into memory.")
+    return GLOBAL_1M_FORECASTER
+
+
+# Column order matches ``catalog_streams_pruned_80k.parquet`` / train_catalog_decay.REQUIRED_COLUMNS + DISPLAY_ARTIST.
+_CATALOG_STREAMS_PARQUET_OUTPUT_COLS: Tuple[str, ...] = (
+    "MRELG_ID",
+    "TITLE",
+    "GENRES",
+    "RELEASE_DATE",
+    "FIRST_SALE_DATE",
+    "WEEK_END_DATE",
+    "WEEKS_SINCE_RELEASE",
+    "WORLDWIDE_STREAMS",
+    "LAG1W_STREAMS",
+    "LAG4W_AVG_STREAMS",
+    "LAG12W_AVG_STREAMS",
+    "DISPLAY_ARTIST",
+    # Not in training parquet; added for API consumers (matches global_streaming data_type).
+    "DATA_TYPE",
+)
+
+
+def _unpack_catalog_decay_bundle(raw: Any) -> Dict[str, Any]:
+    if not isinstance(raw, dict) or "model" not in raw or "feature_columns" not in raw:
+        raise TypeError(
+            "catalog_decay artifact must be a dict with 'model' and 'feature_columns' "
+            "(as produced by model.train_catalog_decay.write_artifacts)."
+        )
+    return raw
+
+
+def _metadata_genre_to_parquet_genres(genre: Any) -> str:
+    """Shape SQLite/Snowflake genre into GENRES JSON like catalog_streams parquet."""
+    if genre is None or (isinstance(genre, float) and pd.isna(genre)):
+        return json.dumps([{"CLIENT_DOMAIN": "Luminate", "MAIN_GENRE": "Unknown"}])
+    s = str(genre).strip()
+    if s.startswith("["):
+        return s
+    return json.dumps([{"CLIENT_DOMAIN": "Luminate", "MAIN_GENRE": s or "Unknown"}])
+
+
+def _mean_tail(seq: List[float], n: int) -> float:
+    if not seq:
+        return 0.0
+    tail = seq[-n:] if len(seq) >= n else seq
+    return float(sum(tail) / len(tail))
+
+
+def _predict_catalog_decay_step(
+    *,
+    model: Any,
+    feature_columns: List[str],
+    top_genres: List[str],
+    top_artists: List[str],
+    artist_history_default_log_median: float,
+    mrelg_id: str,
+    title: str,
+    display_artist: str,
+    genres_json: str,
+    release_dt: pd.Timestamp,
+    first_sale_dt: pd.Timestamp,
+    week_end: pd.Timestamp,
+    weeks_since_release: float,
+    lag1w: float,
+    lag4w: float,
+    lag12w: float,
+) -> float:
+    chunk = pd.DataFrame(
+        [
+            {
+                "MRELG_ID": mrelg_id,
+                "TITLE": title,
+                "DISPLAY_ARTIST": display_artist,
+                "GENRES": genres_json,
+                "RELEASE_DATE": release_dt,
+                "FIRST_SALE_DATE": first_sale_dt,
+                "WEEK_END_DATE": week_end,
+                "WEEKS_SINCE_RELEASE": float(weeks_since_release),
+            }
+        ]
+    )
+    chunk["PARSED_MAIN_GENRE"] = chunk["GENRES"].map(extract_main_genre)
+    base = _build_feature_frame(
+        chunk,
+        top_genres=top_genres,
+        top_artists=top_artists,
+        artist_history_log_median=None,
+        artist_history_default_log_median=float(artist_history_default_log_median),
+    )
+    base["Lag1W_Streams"] = [float(lag1w)]
+    base["Lag4W_Avg_Streams"] = [float(lag4w)]
+    base["Lag12W_Avg_Streams"] = [float(lag12w)]
+    x = base.reindex(columns=list(feature_columns)).fillna(0.0)
+    pred = float(model.predict(x)[0])
+    return max(0.0, pred)
+
+
+def get_eoy_search_forecast(mrelg_id: str, target_year: int = 2026) -> pd.DataFrame:
+    """
+    Given an MRELG from search, load weekly worldwide streams history from Snowflake,
+    then autoregress with the catalog-decay LightGBM bundle to ``target_year``-12-31.
+
+    Output columns match ``catalog_streams_pruned_80k.parquet`` (see
+    ``_CATALOG_STREAMS_PARQUET_OUTPUT_COLS``). ``WORLDWIDE_STREAMS`` holds observed
+    values for past weeks in the year and model predictions for future weeks.
+    Lag columns are the trailing 1 / 4 / 12-week stream moments used for that row
+    (prior week only for actuals; updated each AR step for forecasts).
+
+    Forecast AR ``rolling`` omits trailing week(s) when either
+    ``TIDE_CATALOG_EOY_AR_EXCLUDE_TRAILING_WEEKS`` forces it or the last week is
+    much lower than the prior (partial week — see
+    ``TIDE_CATALOG_EOY_PARTIAL_LAST_WEEK_RATIO``). Omitted rows still appear as
+    Actuals when they fall in ``target_year``.
+    """
+    if not str(mrelg_id or "").strip():
+        raise ValueError("mrelg_id is required.")
+    mrelg_id = str(mrelg_id).strip()
+
+    bundle = _unpack_catalog_decay_bundle(get_1m_forecaster())
+    model = bundle["model"]
+    feature_columns: List[str] = list(bundle["feature_columns"])
+    top_genres: List[str] = list(bundle["top_genres"])
+    top_artists: List[str] = list(bundle["top_artists"])
+    artist_hist_default = float(bundle.get("artist_history_default_log_median", 0.0))
+
+    with get_snowflake_connection() as sf:
+        meta = _resolve_mrelg_metadata_local(mrelg_id)
+        if meta is None:
+            meta = _resolve_mrelg_metadata_snowflake(mrelg_id, sf)
+        release_date = _validate_date(meta.get("release_date"))
+        artist = (meta.get("artist") or "").strip()
+        title = (meta.get("title") or "").strip()
+        genres_json = _metadata_genre_to_parquet_genres(meta.get("genre"))
+        hist_df = _get_known_vols_global_streaming(mrelg_id, release_date, sf)
+
+    if hist_df.empty:
+        raise ValueError(f"No historical streaming weeks for mrelg_id: {mrelg_id}")
+
+    stream_col = next(
+        (c for c in hist_df.columns if "stream" in c.lower()),
+        hist_df.columns[-1],
+    )
+    date_col = next(c for c in hist_df.columns if "date" in c.lower())
+    hist_df = hist_df.sort_values(date_col).reset_index(drop=True)
+    series = pd.to_numeric(hist_df[stream_col], errors="coerce").fillna(0.0).astype(float).tolist()
+    if not any(v > 0 for v in series):
+        raise ValueError(f"No positive stream history for mrelg_id: {mrelg_id}")
+
+    week_ends = pd.to_datetime(hist_df[date_col]).dt.normalize()
+    release_dt = pd.to_datetime(release_date).normalize()
+    first_sale_dt = release_dt
+
+    rows_out: List[Dict[str, Any]] = []
+
+    # Actuals: weeks in ``target_year`` only (parquet-aligned rows).
+    for i, we in enumerate(week_ends):
+        if int(we.year) != int(target_year):
+            continue
+        prefix = series[:i]
+        lag1w = float(prefix[-1]) if prefix else 0.0
+        lag4w = _mean_tail(prefix, 4)
+        lag12w = _mean_tail(prefix, 12)
+        wsr = max(0.0, (we - release_dt).days / 7.0)
+        rows_out.append(
+            {
+                "MRELG_ID": mrelg_id,
+                "TITLE": title,
+                "GENRES": genres_json,
+                "RELEASE_DATE": release_dt.strftime("%Y-%m-%d"),
+                "FIRST_SALE_DATE": first_sale_dt.strftime("%Y-%m-%d"),
+                "WEEK_END_DATE": we.strftime("%Y-%m-%d"),
+                "WEEKS_SINCE_RELEASE": float(wsr),
+                "WORLDWIDE_STREAMS": float(series[i]),
+                "LAG1W_STREAMS": lag1w,
+                "LAG4W_AVG_STREAMS": lag4w,
+                "LAG12W_AVG_STREAMS": lag12w,
+                "DISPLAY_ARTIST": artist,
+                "DATA_TYPE": "Actual",
+            }
+        )
+
+    # Forecast: weekly steps from first week after last known through end of target year.
+    last_known_date = week_ends.iloc[-1]
+    eoy = pd.Timestamp(year=int(target_year), month=12, day=31)
+    trim_tail = _catalog_eoy_ar_seed_trailing_trim(series)
+    ar_seed = series[: len(series) - trim_tail] if trim_tail else list(series)
+    rolling = list(ar_seed)
+    current = last_known_date + pd.Timedelta(days=7)
+    while current <= eoy:
+        lag1w = float(rolling[-1]) if rolling else 0.0
+        lag4w = _mean_tail(rolling, 4)
+        lag12w = _mean_tail(rolling, 12)
+        wsr = max(0.0, (current.normalize() - release_dt).days / 7.0)
+        pred = _predict_catalog_decay_step(
+            model=model,
+            feature_columns=feature_columns,
+            top_genres=top_genres,
+            top_artists=top_artists,
+            artist_history_default_log_median=artist_hist_default,
+            mrelg_id=mrelg_id,
+            title=title,
+            display_artist=artist,
+            genres_json=genres_json,
+            release_dt=release_dt,
+            first_sale_dt=first_sale_dt,
+            week_end=current.normalize(),
+            weeks_since_release=wsr,
+            lag1w=lag1w,
+            lag4w=lag4w,
+            lag12w=lag12w,
+        )
+        rows_out.append(
+            {
+                "MRELG_ID": mrelg_id,
+                "TITLE": title,
+                "GENRES": genres_json,
+                "RELEASE_DATE": release_dt.strftime("%Y-%m-%d"),
+                "FIRST_SALE_DATE": first_sale_dt.strftime("%Y-%m-%d"),
+                "WEEK_END_DATE": current.strftime("%Y-%m-%d"),
+                "WEEKS_SINCE_RELEASE": float(wsr),
+                "WORLDWIDE_STREAMS": float(pred),
+                "LAG1W_STREAMS": lag1w,
+                "LAG4W_AVG_STREAMS": lag4w,
+                "LAG12W_AVG_STREAMS": lag12w,
+                "DISPLAY_ARTIST": artist,
+                "DATA_TYPE": "Forecast",
+            }
+        )
+        rolling.append(pred)
+        current = current + pd.Timedelta(days=7)
+
+    out = pd.DataFrame(rows_out)
+    if out.empty:
+        return out
+    return out.reindex(columns=list(_CATALOG_STREAMS_PARQUET_OUTPUT_COLS))
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +593,43 @@ def _cap_weekly_series(values: List[float] | None, max_weeks: int) -> List[float
     return [float(x) for x in values[:max_weeks]]
 
 
+_PARTIAL_WEEK_LAG_DAYS = 3
+
+
+def _strip_partial_known_week(release_map: dict, lag_days: int = _PARTIAL_WEEK_LAG_DAYS) -> dict:
+    """
+    For simulation inputs only, treat the trailing in-progress known week as
+    partial and let the model forecast that slot.
+
+    This prevents a mid-week dip where WEEK_ENDING_DATE has only a few days of
+    observed volume and would otherwise override the model at the boundary.
+    """
+    known_vols = release_map.get("known_vols")
+    known_dates = release_map.get("known_week_dates")
+    if not isinstance(known_vols, list) or not known_vols:
+        return release_map
+    if not isinstance(known_dates, list) or len(known_dates) != len(known_vols):
+        return release_map
+
+    try:
+        last_date = datetime.strptime(str(known_dates[-1]), "%Y-%m-%d").date()
+    except Exception:
+        return release_map
+
+    cutoff = datetime.utcnow().date() - timedelta(days=lag_days)
+    if last_date < cutoff:
+        return release_map
+
+    # Drop the trailing partial point from all aligned known series.
+    release_map["known_vols"] = known_vols[:-1]
+    release_map["known_week_dates"] = known_dates[:-1]
+    for key in ("known_streams", "known_sales", "known_songs"):
+        vals = release_map.get(key)
+        if isinstance(vals, list) and len(vals) >= len(known_vols):
+            release_map[key] = vals[:-1]
+    return release_map
+
+
 def _sanitize_release_for_simulation(release_map: dict) -> dict:
     """
     Normalize per-release inputs before ``ForecastEngine.simulate``:
@@ -262,7 +645,7 @@ def _sanitize_release_for_simulation(release_map: dict) -> dict:
     if isinstance(dates, list) and dates:
         if len(dates) > NUM_WEEKS:
             release_map["known_week_dates"] = dates[:NUM_WEEKS]
-    return release_map
+    return _strip_partial_known_week(release_map)
 
 
 def _sanitize_forecast_engine_artifacts(engine: ForecastEngine) -> None:

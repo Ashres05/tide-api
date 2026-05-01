@@ -8,8 +8,14 @@ WHERE
     s.country_code = 'AA'
     AND s.metric_category = 'Streams'
     AND s.service_type = 'OnDemand'
-    AND da.datename >= {RELEASE_DATE} 
     AND s.mrelg_id = {MRELG_ID}
+    
+    -- Floor 1: Prevent pulling zeroes before the album actually dropped
+    AND da.datename >= {RELEASE_DATE} 
+    
+    -- Floor 2 (NEW): Drop ancient catalog history, keep only YTD + 12 weeks
+    AND da.datename >= DATEADD(WEEK, -12, DATE_TRUNC('YEAR', CURRENT_DATE()))
+    
     AND da.datename < DATEADD(DAY, -1, CURRENT_DATE())
 GROUP BY 
     da.datename
