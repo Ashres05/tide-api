@@ -438,6 +438,24 @@ def daily_streams_by_mrelg(mrelg_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/v1/revenue/catalog_revenue_2025/{mrelg_id}")
+def catalog_revenue_2025(mrelg_id: str):
+    """
+    Live Revenue board — 2025 catalog revenue for a single Luminate MRELG
+    release group. Reads from the local MARKETSHARE_REVENUE_2025 table,
+    which is loaded one-shot from
+    s3://parquetgarage/model/data/2025_revenue_catalog.csv. Returns
+    {"catalog_revenue_2025": float | null}; null when the MRELG isn't in
+    the file. Not joined into the forecast pipeline.
+    """
+    try:
+        return model_handler.get_catalog_revenue_2025_by_mrelg(mrelg_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/v1/releases/{release_id}/global_streaming", deprecated=True)
 def global_streaming_release(release_id: int):
     """

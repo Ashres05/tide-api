@@ -1933,6 +1933,22 @@ def get_daily_global_streams_by_mrelg(mrelg_id: str) -> pd.DataFrame:
     return df[["report_date", "global_streams"]]
 
 
+def get_catalog_revenue_2025_by_mrelg(mrelg_id: str) -> Dict[str, Any]:
+    """
+    Live Revenue board — 2025 catalog revenue for a single MRELG release
+    group, sourced from the local MARKETSHARE_REVENUE_2025 table (loaded
+    one-shot from s3://parquetgarage/model/data/2025_revenue_catalog.csv).
+    Returns {"catalog_revenue_2025": float | None}; null when the MRELG
+    isn't in the file (frontend treats null as "not in file").
+    """
+    from sqlite_handler import get_catalog_revenue_2025_for_mrelg
+
+    if not isinstance(mrelg_id, str) or not mrelg_id.strip():
+        raise ValueError("mrelg_id is required.")
+    value = get_catalog_revenue_2025_for_mrelg(mrelg_id.strip())
+    return {"catalog_revenue_2025": value}
+
+
 def _resolve_mrelg_metadata(mrelg_id: str) -> Dict[str, Any]:
     """
     Look up MRELG metadata. Prefer the local MARKETSHARE_SEARCH_SUMMARY table

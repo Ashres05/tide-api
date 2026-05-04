@@ -22,6 +22,7 @@ CREATE_WEEKLY_MARKETSHARE_TABLE = 'create_weekly_marketshare_table.sql'
 CREATE_YTD_MARKETSHARE_TABLE = 'create_ytd_marketshare_table.sql'
 CREATE_MARKETSHARE_SEARCH_SUMMARY_TABLE = 'create_marketshare_search_summary_table.sql'
 CREATE_DAILY_GLOBAL_STREAMS_TABLE = 'create_daily_global_streams_table.sql'
+CREATE_MARKETSHARE_REVENUE_2025_TABLE = 'create_marketshare_revenue_2025_table.sql'
 
 # Select queries
 WEEKLY_MARKETSHARE_QUERY = 'query_weekly_marketshare_query.sql'
@@ -31,6 +32,7 @@ EXPECTED_RELEASES_QUERY = 'release_get_all.sql'
 MARKETSHARE_SEARCH_SUMMARY_QUERY = 'query_marketshare_search_summary.sql'
 DAILY_GLOBAL_STREAMING_SF_QUERY = 'query_daily_global_streaming.sql'
 DAILY_GLOBAL_STREAMS_SQLITE_QUERY = 'query_daily_global_streams_sqlite.sql'
+MARKETSHARE_REVENUE_2025_BY_MRELG_QUERY = 'query_marketshare_revenue_2025_by_mrelg.sql'
 
 # Insert queries
 INSERT_WEEKLY_MARKETSHARE = 'insert_weekly_marketshare.sql'
@@ -38,9 +40,11 @@ INSERT_YTD_MARKETSHARE = 'insert_ytd_marketshare.sql'
 INSERT_MARKETSHARE_RELEASE_METRICS = 'insert_marketshare_release_metrics.sql'
 INSERT_MARKETSHARE_SEARCH_SUMMARY = 'insert_marketshare_search_summary.sql'
 INSERT_DAILY_GLOBAL_STREAMS = 'insert_daily_global_streams.sql'
+INSERT_MARKETSHARE_REVENUE_2025 = 'insert_marketshare_revenue_2025.sql'
 
 # Delete queries
 DELETE_MARKETSHARE_SEARCH_SUMMARY = 'delete_marketshare_search_summary.sql'
+DELETE_MARKETSHARE_REVENUE_2025 = 'delete_marketshare_revenue_2025.sql'
 
 def ensure_expected_releases_fw_columns(conn: sqlite3.Connection) -> None:
     """
@@ -623,6 +627,123 @@ def get_daily_global_streams_for_mrelg(
             params=(mrelg_id,),
         )
     return df
+
+
+# ---------------------------------------------------------------------------
+# 2025 catalog revenue (Live Revenue board only)
+#
+# One-shot load from s3://parquetgarage/model/data/2025_revenue_catalog.csv
+# into MARKETSHARE_REVENUE_2025. The CSV is the source of truth (~5M rows of
+# Luminate catalog revenue), so the table is fully replaced on refresh.
+# Intentionally NOT wired into update_sqlite_main — the weekly Snowflake cron
+# does not need to re-pull a static S3 file.
+# ---------------------------------------------------------------------------
+
+REVENUE_2025_S3_KEY = "model/data/2025_revenue_catalog.csv"
+
+
+def _open_revenue_2025_csv_from_s3():
+    """
+    Stream the 2025 revenue CSV from S3. Resolves bucket via the same env
+    as api/s3_pull.py (TIDE_ARTIFACTS_S3_URI / TIDE_ARTIFACTS_S3_BUCKET /
+    TIDE_S3_DEFAULT_BUCKET). Returns a file-like body suitable for
+    pandas.read_csv. Caller is responsible for closing.
+    """
+    import boto3
+
+    uri = os.environ.get("TIDE_ARTIFACTS_S3_URI", "").strip()
+    bucket = os.environ.get("TIDE_ARTIFACTS_S3_BUCKET", "").strip()
+    if uri:
+        if not uri.lower().startswith("s3://"):
+            raise ValueError(f"TIDE_ARTIFACTS_S3_URI must start with s3://, got {uri!r}")
+        rest = uri[5:].split("/", 1)
+        bucket = rest[0].strip()
+    if not bucket:
+        bucket = os.environ.get("TIDE_S3_DEFAULT_BUCKET", "parquetgarage").strip()
+    if not bucket:
+        raise RuntimeError(
+            "No S3 bucket configured for revenue 2025 load (set TIDE_ARTIFACTS_S3_URI or TIDE_S3_DEFAULT_BUCKET)."
+        )
+    logger.info("revenue_2025: streaming s3://%s/%s", bucket, REVENUE_2025_S3_KEY)
+    obj = boto3.client("s3").get_object(Bucket=bucket, Key=REVENUE_2025_S3_KEY)
+    return obj["Body"]
+
+
+def refresh_marketshare_revenue_2025() -> int:
+    """
+    Rebuild MARKETSHARE_REVENUE_2025 from the S3 CSV. Bulk-inserts in
+    chunks so we never hold the full ~350MB frame in memory. The CSV is
+    the source of truth; the table is fully cleared first.
+
+    Returns the number of rows written.
+    """
+    logger.info("sqlite_handler: refreshing MARKETSHARE_REVENUE_2025 (db=%s)", DATABASE_NAME)
+
+    body = _open_revenue_2025_csv_from_s3()
+
+    # Stream-parse the CSV: only the two columns we need. usecols by name
+    # tolerates the BOM-prefixed first header ('﻿MRELG_ID') because
+    # pandas strips it during header parsing.
+    chunk_iter = pd.read_csv(
+        body,
+        usecols=["MRELG_ID", "2025_revenue"],
+        dtype={"MRELG_ID": "string", "2025_revenue": "float64"},
+        chunksize=200_000,
+        encoding="utf-8",
+    )
+
+    total_rows = 0
+    insert_sql = load_sql(INSERT_MARKETSHARE_REVENUE_2025)
+
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(load_sql(CREATE_MARKETSHARE_REVENUE_2025_TABLE))
+        cursor.execute(load_sql(DELETE_MARKETSHARE_REVENUE_2025))
+        for chunk in chunk_iter:
+            chunk = chunk.dropna(subset=["MRELG_ID"])
+            chunk["MRELG_ID"] = chunk["MRELG_ID"].astype(str).str.strip()
+            chunk = chunk.loc[chunk["MRELG_ID"] != ""]
+            chunk["2025_revenue"] = pd.to_numeric(chunk["2025_revenue"], errors="coerce")
+            chunk = chunk.replace([float("inf"), float("-inf")], pd.NA)
+            rows = [
+                (mid, None if pd.isna(rev) else float(rev))
+                for mid, rev in zip(chunk["MRELG_ID"], chunk["2025_revenue"])
+            ]
+            if rows:
+                cursor.executemany(insert_sql, rows)
+                total_rows += len(rows)
+                logger.info("revenue_2025: wrote chunk (%d rows, total=%d)", len(rows), total_rows)
+        conn.commit()
+
+    logger.info("sqlite_handler: MARKETSHARE_REVENUE_2025 rebuilt (rows=%d)", total_rows)
+    return total_rows
+
+
+def get_catalog_revenue_2025_for_mrelg(mrelg_id: str) -> float | None:
+    """
+    Single-row lookup for the Live Revenue board. Returns None when the
+    MRELG isn't present in the CSV (frontend treats null as "not in file").
+    """
+    if not isinstance(mrelg_id, str) or not mrelg_id.strip():
+        return None
+    mrelg_id = mrelg_id.strip()
+    try:
+        with sqlite3.connect(DATABASE_NAME) as conn:
+            cur = conn.cursor()
+            cur.execute(load_sql(MARKETSHARE_REVENUE_2025_BY_MRELG_QUERY), (mrelg_id,))
+            row = cur.fetchone()
+    except sqlite3.OperationalError as e:
+        # Table missing on a fresh db — treat as "no data" rather than 500.
+        if "no such table" in str(e).lower():
+            logger.warning("get_catalog_revenue_2025_for_mrelg: table missing; returning None")
+            return None
+        raise
+    if row is None or row[0] is None:
+        return None
+    try:
+        return float(row[0])
+    except (TypeError, ValueError):
+        return None
 
 
 def drop_table(table_name: str) -> None:
