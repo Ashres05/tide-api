@@ -1,8 +1,13 @@
 """
 Album-art lookup against `s3://<bucket>/album_art/`.
 
-Files are uploaded once per release with the convention
-``album_art/mrelg_<mrelg_id_lowercase>_<spotify_id>.jpg``. This module
+Files are uploaded once per release with either convention:
+
+* ``album_art/mrelg_<mrelg_id_lowercase>_<spotify_id>.jpg`` (canonical)
+* ``album_art/<MRELG_ID>.jpg`` — flat name from ``spotify_album_art_sync.py``
+  when ``--manual '…|…|mrelg_id'`` is used (same id the API receives).
+
+This module
 indexes the prefix at startup (or first request) into an mrelg_id → S3-key
 dict, then serves the image bytes through the API. Sits behind Cloudflare
 Tunnel + Access — the upstream URL the frontend hits is

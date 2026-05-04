@@ -190,7 +190,7 @@ def refresh_marketshare_search_summary() -> int:
             streams = streams.replace([float("inf"), float("-inf")], pd.NA).fillna(0)
             df["DAILY_GLOBAL_STREAMS"] = streams.astype("int64")
 
-        for col in ("MRELG_ID", "TITLE", "ARTIST", "LABEL_NAME", "GENRE"):
+        for col in ("MRELG_ID", "TITLE", "ARTIST", "PARENT_NAME", "LABEL_NAME", "GENRE"):
             if col in df.columns:
                 df[col] = df[col].astype(object).where(df[col].notna(), None)
 
