@@ -23,6 +23,7 @@ mrelg_summary AS (
         s.mrelg_id,
         s.title,
         s.display_artist AS artist,
+        l.level_1_distributor AS parent,
         l.level_2_distributor AS label,
         COALESCE(s.first_sale_date, s.release_date) AS release_date,
         GET(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import logging
 import pickle
@@ -41,6 +42,9 @@ class CatalogDecayArtifacts:
     as_of_date: pd.Timestamp
     catalog_min_weeks: int
     artist_history_default_log_median: float
+    # ``log1p``: model was fit on ``np.log1p(WORLDWIDE_STREAMS)``; serve with ``expm1``.
+    # ``none``: legacy level target (L1 on raw weekly streams).
+    target_transform: str = "none"
 
 
 def _repo_root() -> Path:
@@ -75,6 +79,7 @@ def load_catalog_streams(
     *,
     low_memory: bool = False,
     min_weeks_since_release: int | None = None,
+    memory_efficient_load: bool = False,
 ) -> pd.DataFrame:
     required_with_artist = REQUIRED_COLUMNS + ["DISPLAY_ARTIST"]
     # Prefer scan-time predicate/column pushdown to avoid loading full parquet.
@@ -95,7 +100,14 @@ def load_catalog_streams(
             filt = filt & (ds.field("WEEKS_SINCE_RELEASE") >= int(min_weeks_since_release))
 
         table = dataset.to_table(columns=columns, filter=filt)
-        df = table.to_pandas(types_mapper=None)
+        # self_destruct frees Arrow buffers while building the pandas frame (lower peak RAM).
+        if memory_efficient_load:
+            try:
+                df = table.to_pandas(types_mapper=None, self_destruct=True)
+            except TypeError:
+                df = table.to_pandas(types_mapper=None)
+        else:
+            df = table.to_pandas(types_mapper=None)
     except Exception:
         # Fallback when pyarrow dataset scan is unavailable.
         columns = REQUIRED_COLUMNS + ["DISPLAY_ARTIST", "ARTIST"]
@@ -239,8 +251,8 @@ def _weighted_sample_train_df(train_df: pd.DataFrame, max_train_rows: int) -> pd
     if max_train_rows <= 0 or len(train_df) <= max_train_rows:
         return train_df
     streams = pd.to_numeric(train_df["WORLDWIDE_STREAMS"], errors="coerce").fillna(0.0).astype(float)
-    # Weight by sqrt(streams) so large projects are represented but not dominant.
-    w = np.sqrt(np.maximum(streams.to_numpy(), 0.0))
+    # Flatter high-tier weighting so 80k-200k tracks are not drowned by mega-hits.
+    w = np.log1p(np.maximum(streams.to_numpy(), 0.0))
     finite = np.isfinite(w)
     w = np.where(finite, w, 0.0)
     positive_mask = w > 0
@@ -302,6 +314,13 @@ def _build_feature_frame(
     *,
     top_genres: list[str],
     top_artists: list[str],
+    lag1_streams: pd.Series | np.ndarray | None = None,
+    lag4_avg_streams: pd.Series | np.ndarray | None = None,
+    lag12_avg_streams: pd.Series | np.ndarray | None = None,
+    short_momentum: pd.Series | np.ndarray | None = None,
+    long_momentum: pd.Series | np.ndarray | None = None,
+    anomaly_flag: pd.Series | np.ndarray | None = None,
+    weeks_since_peak: pd.Series | np.ndarray | None = None,
     artist_history_log_median: dict[str, float] | None = None,
     artist_history_default_log_median: float = 0.0,
 ) -> pd.DataFrame:
@@ -348,7 +367,72 @@ def _build_feature_frame(
         cols["artist_hist_log_median"] = float(artist_history_default_log_median)
     cols["artist_hist_x_age"] = cols["artist_hist_log_median"] * cols["age_weeks"]
 
+    # Keep absolute lag features in the model even with multiplier target.
+    cols["Lag1W_Streams"] = (
+        pd.to_numeric(lag1_streams, errors="coerce") if lag1_streams is not None else np.nan
+    )
+    cols["Lag4W_Avg_Streams"] = (
+        pd.to_numeric(lag4_avg_streams, errors="coerce") if lag4_avg_streams is not None else np.nan
+    )
+    cols["Lag12W_Avg_Streams"] = (
+        pd.to_numeric(lag12_avg_streams, errors="coerce")
+        if lag12_avg_streams is not None
+        else np.nan
+    )
+    cols["Short_Momentum"] = (
+        pd.to_numeric(short_momentum, errors="coerce") if short_momentum is not None else np.nan
+    )
+    cols["Long_Momentum"] = (
+        pd.to_numeric(long_momentum, errors="coerce") if long_momentum is not None else np.nan
+    )
+    cols["Anomaly_Flag"] = (
+        pd.to_numeric(anomaly_flag, errors="coerce").fillna(0.0).astype(float)
+        if anomaly_flag is not None
+        else 0.0
+    )
+    cols["Weeks_Since_Peak"] = (
+        pd.to_numeric(weeks_since_peak, errors="coerce")
+        if weeks_since_peak is not None
+        else np.nan
+    )
+
     return pd.DataFrame(cols, index=df.index).copy()
+
+
+def _safe_ratio(numer: pd.Series, denom: pd.Series, *, fallback: float = 1.0) -> pd.Series:
+    n = pd.to_numeric(numer, errors="coerce").astype(float)
+    d = pd.to_numeric(denom, errors="coerce").astype(float)
+    out = pd.Series(float(fallback), index=n.index, dtype="float64")
+    mask = np.isfinite(n.to_numpy()) & np.isfinite(d.to_numpy()) & (d.to_numpy() > 0.0)
+    if mask.any():
+        out.loc[mask] = n.loc[mask] / d.loc[mask]
+    return out
+
+
+def _compute_weeks_since_peak_by_track(df: pd.DataFrame, anomaly_col: str) -> pd.Series:
+    """
+    Stateful per-track counter:
+    - 0 when anomaly flag is 1
+    - otherwise increments weekly from prior value
+    """
+    if df.empty:
+        return pd.Series(dtype="float64")
+    work = df[["MRELG_ID", "WEEK_END_DATE", anomaly_col]].copy()
+    work["MRELG_ID"] = work["MRELG_ID"].astype(str)
+    work["WEEK_END_DATE"] = pd.to_datetime(work["WEEK_END_DATE"], errors="coerce")
+    work = work.sort_values(["MRELG_ID", "WEEK_END_DATE"]).copy()
+    out = pd.Series(index=work.index, dtype="float64")
+    for _, idx in work.groupby("MRELG_ID", sort=False).groups.items():
+        prev = 0
+        for i in idx:
+            flag = int(work.at[i, anomaly_col])
+            if flag == 1:
+                cur = 0
+            else:
+                cur = prev + 1
+            out.at[i] = float(cur)
+            prev = cur
+    return out.reindex(df.index).astype(float)
 
 
 def prepare_df_model(
@@ -363,21 +447,45 @@ def prepare_df_model(
     Build training frame. Lag features are now pre-calculated in the parquet.
     """
     d = df.copy()
+    lag1 = pd.to_numeric(d["LAG1W_STREAMS"], errors="coerce").astype(float)
+    lag4 = pd.to_numeric(d["LAG4W_AVG_STREAMS"], errors="coerce").astype(float)
+    lag12 = pd.to_numeric(d["LAG12W_AVG_STREAMS"], errors="coerce").astype(float)
+    y_level = pd.to_numeric(d["WORLDWIDE_STREAMS"], errors="coerce").astype(float)
+
+    short_momentum = _safe_ratio(lag1, lag4, fallback=1.0)
+    long_momentum = _safe_ratio(lag1, lag12, fallback=1.0)
+    anomaly_flag = ((short_momentum > 1.5) & (long_momentum > 2.0)).astype(int)
+    weeks_since_peak = _compute_weeks_since_peak_by_track(
+        pd.DataFrame(
+            {
+                "MRELG_ID": d["MRELG_ID"].astype(str),
+                "WEEK_END_DATE": pd.to_datetime(d["WEEK_END_DATE"], errors="coerce"),
+                "anomaly_flag": anomaly_flag,
+            }
+        ),
+        "anomaly_flag",
+    )
+    target_multiplier = _safe_ratio(y_level, lag1, fallback=1.0).clip(lower=0.0, upper=5.0)
 
     base = _build_feature_frame(
         d,
         top_genres=top_genres,
         top_artists=top_artists,
+        lag1_streams=lag1,
+        lag4_avg_streams=lag4,
+        lag12_avg_streams=lag12,
+        short_momentum=short_momentum,
+        long_momentum=long_momentum,
+        anomaly_flag=anomaly_flag,
+        weeks_since_peak=weeks_since_peak,
         artist_history_log_median=artist_history_log_median,
         artist_history_default_log_median=artist_history_default_log_median,
     )
 
     extras = pd.DataFrame(
         {
-            "Lag1W_Streams": pd.to_numeric(d["LAG1W_STREAMS"], errors="coerce"),
-            "Lag4W_Avg_Streams": pd.to_numeric(d["LAG4W_AVG_STREAMS"], errors="coerce"),
-            "Lag12W_Avg_Streams": pd.to_numeric(d["LAG12W_AVG_STREAMS"], errors="coerce"),
             "target_worldwide_streams": pd.to_numeric(d["WORLDWIDE_STREAMS"], errors="coerce"),
+            "target_multiplier": target_multiplier,
             "MRELG_ID": d["MRELG_ID"].astype(str).values,
             "WEEK_END_DATE": pd.to_datetime(d["WEEK_END_DATE"]).values,
             "WEEKS_SINCE_RELEASE": pd.to_numeric(d["WEEKS_SINCE_RELEASE"], errors="coerce").values,
@@ -392,11 +500,13 @@ def prepare_df_model(
 def fit_catalog_decay_model(
     df: pd.DataFrame,
     *,
-    catalog_min_weeks: int = 78,
+    catalog_min_weeks: int = 52,
     top_genres_n: int = 12,
     top_artists_n: int = 1200,
     ridge_alpha: float = 2.0,
     max_train_rows: int = 0,
+    target_transform: str = "none",
+    memory_efficient_fit: bool = False,
 ) -> CatalogDecayArtifacts:
     train_df = df[df["WEEKS_SINCE_RELEASE"] >= float(catalog_min_weeks)].copy()
     if train_df.empty:
@@ -422,7 +532,16 @@ def fit_catalog_decay_model(
         artist_history_default_log_median=artist_hist_default,
     )
     df_model = df_model.dropna(
-        subset=["Lag1W_Streams", "Lag4W_Avg_Streams", "Lag12W_Avg_Streams", "target_worldwide_streams"]
+        subset=[
+            "Lag1W_Streams",
+            "Lag4W_Avg_Streams",
+            "Lag12W_Avg_Streams",
+            "Short_Momentum",
+            "Long_Momentum",
+            "Anomaly_Flag",
+            "Weeks_Since_Peak",
+            "target_multiplier",
+        ]
     ).copy()
     if df_model.empty:
         raise ValueError("No rows left after lag feature construction.")
@@ -430,12 +549,37 @@ def fit_catalog_decay_model(
     feature_cols = [
         c for c in df_model.columns
         if c
-        not in ("target_worldwide_streams", "MRELG_ID", "WEEK_END_DATE", "WEEKS_SINCE_RELEASE")
+        not in (
+            "target_worldwide_streams",
+            "target_multiplier",
+            "MRELG_ID",
+            "WEEK_END_DATE",
+            "WEEKS_SINCE_RELEASE",
+        )
     ]
+    as_of = pd.to_datetime(df_model["WEEK_END_DATE"].max())
     x = df_model[feature_cols]
-    y = df_model["target_worldwide_streams"].astype(float)
+    y = df_model["target_multiplier"].astype(float).clip(lower=0.0, upper=5.0).to_numpy(dtype=float)
+    tt = "none"
+    if str(target_transform or "none").strip().lower() != "none":
+        logger.warning(
+            "catalog_decay: ignoring target_transform=%r; retained multiplier target uses 'none'",
+            target_transform,
+        )
+    logger.info("catalog_decay: fitting LightGBM on retained multiplier target")
 
-    model = LGBMRegressor(
+    if memory_efficient_fit:
+        x = x.astype(np.float32, copy=False)
+        y = np.asarray(y, dtype=np.float32)
+        del df_model
+        del train_df
+        gc.collect()
+        logger.info(
+            "catalog_decay: memory_efficient_fit — float32 X/y, dropped wide frame, "
+            "LightGBM max_bin=127 force_col_wise n_jobs=1 (slower, lower peak RAM)"
+        )
+
+    lgbm_kw: dict[str, Any] = dict(
         objective="regression_l1",
         n_estimators=500,
         learning_rate=0.05,
@@ -446,9 +590,18 @@ def fit_catalog_decay_model(
         random_state=42,
         n_jobs=-1,
     )
+    if memory_efficient_fit:
+        lgbm_kw.update(
+            max_bin=127,
+            force_col_wise=True,
+            n_jobs=1,
+        )
+
+    model = LGBMRegressor(**lgbm_kw)
     model.fit(x, y)
 
-    as_of = pd.to_datetime(df["WEEK_END_DATE"].max())
+    del x, y
+    gc.collect()
     return CatalogDecayArtifacts(
         model=model,
         feature_columns=list(feature_cols),
@@ -457,6 +610,7 @@ def fit_catalog_decay_model(
         as_of_date=as_of,
         catalog_min_weeks=catalog_min_weeks,
         artist_history_default_log_median=artist_hist_default,
+        target_transform=tt,
     )
 
 
@@ -535,6 +689,18 @@ def forecast_catalog_projects(
     for mid, chunk in hist.groupby("MRELG_ID", sort=False):
         vals = pd.to_numeric(chunk["WORLDWIDE_STREAMS"], errors="coerce").dropna().astype(float).tolist()
         history_by_mrelg[str(mid)] = vals
+    weeks_since_peak_state: dict[str, int] = {}
+    for mid, series in history_by_mrelg.items():
+        w = 0
+        for i in range(len(series)):
+            lag1 = float(series[i - 1]) if i >= 1 else float(series[i])
+            lag4 = float(np.mean(series[max(0, i - 4):i])) if i >= 1 else lag1
+            lag12 = float(np.mean(series[max(0, i - 12):i])) if i >= 1 else lag1
+            short = lag1 / lag4 if np.isfinite(lag4) and lag4 > 0 else 1.0
+            long = lag1 / lag12 if np.isfinite(lag12) and lag12 > 0 else 1.0
+            anomaly = 1 if (short > 1.5 and long > 2.0) else 0
+            w = 0 if anomaly == 1 else (w + 1)
+        weeks_since_peak_state[mid] = int(w)
 
     # --- NEW VECTORIZED INFERENCE LOOP ---
     
@@ -553,34 +719,56 @@ def forecast_catalog_projects(
         
         # Vectorized lag calculation: lookup latest history for all tracks at once
         lag1_list, lag4_list, lag12_list = [], [], []
+        short_momentum_list, long_momentum_list, anomaly_flag_list, weeks_since_peak_list = [], [], [], []
         for mid in chunk["MRELG_ID"]:
             series = history_by_mrelg.get(str(mid), [])
-            lag1_list.append(series[-1] if len(series) >= 1 else np.nan)
-            lag4_list.append(np.mean(series[-4:]) if len(series) >= 1 else np.nan)
-            lag12_list.append(np.mean(series[-12:]) if len(series) >= 1 else np.nan)
+            lag1 = float(series[-1]) if len(series) >= 1 else np.nan
+            lag4 = float(np.mean(series[-4:])) if len(series) >= 1 else np.nan
+            lag12 = float(np.mean(series[-12:])) if len(series) >= 1 else np.nan
+            short = (lag1 / lag4) if np.isfinite(lag4) and lag4 > 0 and np.isfinite(lag1) else 1.0
+            long = (lag1 / lag12) if np.isfinite(lag12) and lag12 > 0 and np.isfinite(lag1) else 1.0
+            anomaly = 1 if (short > 1.5 and long > 2.0) else 0
+            current_wsp = int(weeks_since_peak_state.get(str(mid), 0))
+            next_wsp = 0 if anomaly == 1 else current_wsp + 1
+            lag1_list.append(lag1)
+            lag4_list.append(lag4)
+            lag12_list.append(lag12)
+            short_momentum_list.append(short)
+            long_momentum_list.append(long)
+            anomaly_flag_list.append(anomaly)
+            weeks_since_peak_list.append(float(next_wsp))
+            weeks_since_peak_state[str(mid)] = next_wsp
             
         # 3. Build the feature matrix for ALL tracks in this week at once
         base = _build_feature_frame(
-            chunk, 
+            chunk,
             top_genres=artifacts.top_genres,
             top_artists=artifacts.top_artists,
+            lag1_streams=lag1_list,
+            lag4_avg_streams=lag4_list,
+            lag12_avg_streams=lag12_list,
+            short_momentum=short_momentum_list,
+            long_momentum=long_momentum_list,
+            anomaly_flag=anomaly_flag_list,
+            weeks_since_peak=weeks_since_peak_list,
             artist_history_log_median=artist_hist_map,
             artist_history_default_log_median=artist_hist_default,
         )
-        base["Lag1W_Streams"] = lag1_list
-        base["Lag4W_Avg_Streams"] = lag4_list
-        base["Lag12W_Avg_Streams"] = lag12_list
         
         x = base.reindex(columns=artifacts.feature_columns).fillna(0.0)
         
-        # 4. Predict ALL tracks for this week in a single fast call
-        preds = np.maximum(0.0, artifacts.model.predict(x))
+        # 4. Predict retained multipliers, then convert to absolute streams.
+        predicted_multiplier = np.asarray(artifacts.model.predict(x), dtype=float)
+        predicted_multiplier = np.clip(predicted_multiplier, 0.0, 5.0)
+        lag1_arr = np.nan_to_num(np.asarray(lag1_list, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+        preds = np.maximum(0.0, predicted_multiplier * lag1_arr)
         
         # 5. Append predictions back to history so next week's lags are correct
         for i, mid in enumerate(chunk["MRELG_ID"]):
             history_by_mrelg[str(mid)].append(preds[i])
             
         # Collect results
+        chunk["predicted_multiplier"] = predicted_multiplier
         chunk["predicted_worldwide_streams"] = preds
         chunk["as_of_date"] = artifacts.as_of_date
         rows_out.append(chunk)
@@ -607,6 +795,7 @@ def write_artifacts(
         "as_of_date": str(artifacts.as_of_date.date()),
         "catalog_min_weeks": artifacts.catalog_min_weeks,
         "artist_history_default_log_median": artifacts.artist_history_default_log_median,
+        "target_transform": getattr(artifacts, "target_transform", "none") or "none",
     }
     joblib.dump(model_bundle, out_dir / "catalog_decay_model.joblib")
     with open(out_dir / "catalog_decay_model.pkl", "wb") as f:
@@ -631,6 +820,7 @@ def write_artifacts(
         "top_genres": artifacts.top_genres,
         "top_artists": artifacts.top_artists,
         "forecast_rows": int(len(forecast_df)),
+        "target_transform": getattr(artifacts, "target_transform", "none") or "none",
     }
     with open(out_dir / "catalog_decay_metadata.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
@@ -641,18 +831,21 @@ def train_and_forecast_catalog_decay(
     input_parquet: Path,
     output_dir: Path,
     forecast_end_date: pd.Timestamp | None = None,
-    catalog_min_weeks: int = 78,
+    catalog_min_weeks: int = 52,
     top_genres_n: int = 12,
     top_artists_n: int = 60,
     ridge_alpha: float = 2.0,
     min_history_rows: int = 8,
     max_train_rows: int = 0,
     low_memory: bool = False,
+    target_transform: str = "none",
+    memory_efficient_fit: bool = False,
 ) -> pd.DataFrame:
     df = load_catalog_streams(
         input_parquet,
         low_memory=low_memory,
         min_weeks_since_release=max(0, int(catalog_min_weeks) - 2),
+        memory_efficient_load=memory_efficient_fit,
     )
     if forecast_end_date is None:
         as_of = pd.to_datetime(df["WEEK_END_DATE"].max())
@@ -664,6 +857,8 @@ def train_and_forecast_catalog_decay(
         top_artists_n=top_artists_n,
         ridge_alpha=ridge_alpha,
         max_train_rows=max_train_rows,
+        target_transform=target_transform,
+        memory_efficient_fit=memory_efficient_fit,
     )
     forecast_df = forecast_catalog_projects(
         df,
@@ -703,7 +898,12 @@ def main() -> None:
         default=_repo_root() / "model" / "catalog_decay_artifacts",
     )
     parser.add_argument("--forecast-end-date", type=str, default=None)
-    parser.add_argument("--catalog-min-weeks", type=int, default=78)
+    parser.add_argument(
+        "--catalog-min-weeks",
+        type=int,
+        default=52,
+        help="Train only on rows with WEEKS_SINCE_RELEASE >= this (catalog tail).",
+    )
     parser.add_argument("--top-genres-n", type=int, default=12)
     parser.add_argument("--top-artists-n", type=int, default=1200)
     parser.add_argument(
@@ -724,6 +924,21 @@ def main() -> None:
         action="store_true",
         help="Downcast dtypes and categories to reduce memory footprint.",
     )
+    parser.add_argument(
+        "--memory-efficient-fit",
+        action="store_true",
+        help=(
+            "Lower peak RAM at the cost of speed: Arrow self_destruct on parquet→pandas, "
+            "float32 X/y before LightGBM, drop wide frames early, max_bin=127, "
+            "force_col_wise=True, n_jobs=1."
+        ),
+    )
+    parser.add_argument(
+        "--target-transform",
+        choices=("none",),
+        default="none",
+        help="Retained multiplier target uses only 'none'.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -741,6 +956,8 @@ def main() -> None:
         min_history_rows=args.min_history_rows,
         max_train_rows=args.max_train_rows,
         low_memory=args.low_memory,
+        target_transform=args.target_transform,
+        memory_efficient_fit=args.memory_efficient_fit,
     )
 
 

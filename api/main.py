@@ -393,6 +393,18 @@ def search_global_streaming(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/v1/revenue/catalog_revenue_2025/{mrelg_id}")
+def catalog_revenue_2025_by_mrelg(mrelg_id: str):
+    """
+    2025 catalog revenue for a single MRELG from the S3 CSV
+    (``TIDE_CATALOG_REVENUE_2025_CSV_S3_URI``). ``catalog_revenue_2025`` is
+    null when the id is missing from the file or the file cannot be read.
+    """
+    v = model_handler.catalog_revenue_2025_for_mrelg(mrelg_id)
+    return {"mrelg_id": (mrelg_id or "").strip(), "catalog_revenue_2025": v}
+
+
+
 @app.get("/v1/revenue/global_streaming_by_mrelg/{mrelg_id}")
 def global_streaming_by_mrelg(mrelg_id: str):
     """

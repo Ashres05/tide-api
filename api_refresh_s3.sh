@@ -27,7 +27,7 @@ d=json.load(sys.stdin); s=d.get("steps") or []
 print(d.get("status",""), s[-1] if s else "")')"
   [[ "$STEP" != "$LAST_STEP" && -n "$STEP" ]] && { log "step: $STEP"; LAST_STEP="$STEP"; }
   case "$STATUS" in
-    completed) log "DONE in $(( $(date +%s) - START ))s"; exit 0 ;;
+    succeeded|completed) log "DONE in $(( $(date +%s) - START ))s"; exit 0 ;;
     failed) log "FAILED: $JOB_JSON"; exit 3 ;;
     running|pending|queued) sleep "$POLL_SEC" ;;
     *) log "unknown status=$STATUS"; sleep "$POLL_SEC" ;;

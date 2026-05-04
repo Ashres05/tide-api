@@ -38,6 +38,10 @@ PREFIX = "album_art/"
 _FILENAME_RE = re.compile(
     r"^album_art/mrelg_(?P<mrelg>mrelg[0-9a-f]+)_[A-Za-z0-9]+\.[A-Za-z]+$"
 )
+# sync script: album_art/MRELG3FB0….jpg (no Spotify id segment)
+_PLAIN_MRELG_FILE_RE = re.compile(
+    r"^album_art/(?P<mrelg>mrelg[0-9a-f]+)\.[A-Za-z]+$", re.IGNORECASE
+)
 
 _lock = threading.Lock()
 _cache: dict[str, str] | None = None  # mrelg_id_lower → full s3 key
@@ -68,17 +72,21 @@ def _build_index() -> dict[str, str]:
         return {}
 
     client = boto3.client("s3")
-    out: dict[str, str] = {}
+    canonical: dict[str, str] = {}
+    plain: dict[str, str] = {}
     paginator = client.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=bucket, Prefix=PREFIX):
         for obj in page.get("Contents") or []:
             key = obj["Key"]
             m = _FILENAME_RE.match(key)
-            if not m:
-                # Skip outliers (e.g. slug-based legacy uploads). They tend
-                # to duplicate a same-album entry that DOES match the convention.
+            if m:
+                canonical[m.group("mrelg").lower()] = key
                 continue
-            out[m.group("mrelg")] = key
+            m2 = _PLAIN_MRELG_FILE_RE.match(key)
+            if m2:
+                plain[m2.group("mrelg").lower()] = key
+    # Canonical keys win when both exist for the same mrelg.
+    out = {**plain, **canonical}
     logger.info("album_art: indexed %d covers from s3://%s/%s", len(out), bucket, PREFIX)
     return out
 

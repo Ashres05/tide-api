@@ -19,14 +19,17 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 from sqlite_handler import (
     DATABASE_NAME,
     ensure_expected_releases_fw_columns,
-    ensure_marketshare_search_summary_columns,
     refresh_marketshare_search_summary,
 )
 from search_text import normalize_search_text
 import marketshare_from_csv
 import album_art
 from model.marketshare_75k_simulation import DISTRIBUTIONS, NUM_WEEKS
-from model.train_catalog_decay import _build_feature_frame, extract_main_genre
+from model.train_catalog_decay import (
+    _build_feature_frame,
+    _normalize_artist_value,
+    extract_main_genre,
+)
 from snowflake_conn import load_sql
 from model.forecast_engine_server import ForecastEngine
 from snowflake_conn import get_snowflake_connection, Snowflake
@@ -125,8 +128,9 @@ GLOBAL_1M_FORECASTER = None
 
 # Default: catalog decay forecaster artifact in S3 (override with TIDE_CATALOG_DECAY_MODEL_S3_URI).
 _CATALOG_DECAY_MODEL_S3_URI_DEFAULT = (
-    "s3://parquetgarage/model/catalog_decay_artifacts_80k/catalog_decay_model.pkl"
+    "s3://parquetgarage/model/catalog_decay_artifacts_slow/catalog_decay_model.pkl"
 )
+# used to be _80k
 
 
 def _catalog_eoy_ar_trailing_weeks_excluded() -> int:
@@ -147,7 +151,10 @@ def _catalog_eoy_partial_last_week_ratio() -> float:
     """
     If the last weekly global-stream total is below this fraction of the prior
     week, treat the last row as a partial / unsettled chart week and omit it
-    from the AR ``rolling`` seed (Actual row is still returned).
+    from the AR ``rolling`` seed. By default the same trailing week(s) are also
+    omitted from ``Actual`` rows in ``get_eoy_search_forecast`` so the last
+    printed actual matches the lag anchor for the first forecast (see
+    ``TIDE_CATALOG_EOY_INCLUDE_TRAILING_PARTIAL_ACTUALS``).
 
     Default ``0.75``. Set ``TIDE_CATALOG_EOY_PARTIAL_LAST_WEEK_RATIO=0`` to disable.
     Large real WoW drops can also trip this — tune (e.g. ``0.65``) if needed.
@@ -176,6 +183,16 @@ def _catalog_eoy_ar_seed_trailing_trim(series: List[float]) -> int:
     return min(trim, len(series) - 1)
 
 
+def _catalog_eoy_include_trailing_partial_actuals() -> bool:
+    """
+    If true, emit Snowflake trailing week(s) as ``Actual`` even when they are
+    excluded from the AR seed (legacy chart: can show a low partial week next to
+    a forecast anchored on full-week lags).
+    """
+    v = os.environ.get("TIDE_CATALOG_EOY_INCLUDE_TRAILING_PARTIAL_ACTUALS", "0").strip().lower()
+    return v in ("1", "true", "yes")
+
+
 def _parse_s3_uri_to_bucket_key(uri: str) -> tuple[str, str]:
     u = uri.strip()
     low = u.lower()
@@ -190,6 +207,161 @@ def _parse_s3_uri_to_bucket_key(uri: str) -> tuple[str, str]:
     if not key:
         raise ValueError(f"Invalid S3 URI (empty key): {uri!r}")
     return bucket, key
+
+
+# Optional 2025 catalog revenue by MRELG (CSV in S3). Loaded once per process.
+_CATALOG_REVENUE_2025_BY_MRELG: Optional[Dict[str, float]] = None
+_CATALOG_REVENUE_2025_LOAD_FAILED: bool = False
+
+
+def _catalog_revenue_2025_csv_s3_uri() -> str:
+    return os.environ.get(
+        "TIDE_CATALOG_REVENUE_2025_CSV_S3_URI",
+        "s3://parquetgarage/model/data/2025_revenue_catalog.csv",
+    ).strip()
+
+
+def _norm_csv_header(name: Any) -> str:
+    return str(name).strip().upper().replace(" ", "_")
+
+
+def _normalize_mrelg_id_key(raw: Any) -> str:
+    """
+    Canonical MRELG id string for CSV/API joins.
+
+    Pandas often reads numeric MRELG_ID cells as floats (``12345.0``), which
+    would not match SQLite/API string ``"12345"``. Strip Excel quirks and
+    normalize integers to a stable decimal string.
+    """
+    if raw is None:
+        return ""
+    if isinstance(raw, float) and pd.isna(raw):
+        return ""
+    if isinstance(raw, bool):
+        return ""
+    if isinstance(raw, numbers.Integral):
+        return str(int(raw))
+    if isinstance(raw, numbers.Real):
+        rf = float(raw)
+        if not math.isfinite(rf):
+            return ""
+        if rf == int(rf):
+            return str(int(rf))
+        s = str(rf).strip()
+    else:
+        s = str(raw).strip()
+    if not s or s.lower() == "nan":
+        return ""
+    # Excel-style ="id" or 'id'
+    if s.startswith("="):
+        s = s[1:].strip().strip('"').strip("'")
+    try:
+        f = float(s)
+        if math.isfinite(f) and f == int(f):
+            return str(int(f))
+    except ValueError:
+        pass
+    return s
+
+
+def get_catalog_revenue_2025_by_mrelg() -> Dict[str, float]:
+    """
+    Lazy-load a map of MRELG_ID -> 2025 revenue from the configured S3 CSV.
+    Returns an empty dict if the file is missing or unreadable.
+    """
+    global _CATALOG_REVENUE_2025_BY_MRELG, _CATALOG_REVENUE_2025_LOAD_FAILED
+    if _CATALOG_REVENUE_2025_LOAD_FAILED:
+        return {}
+    if _CATALOG_REVENUE_2025_BY_MRELG is not None:
+        return _CATALOG_REVENUE_2025_BY_MRELG
+
+    uri = _catalog_revenue_2025_csv_s3_uri()
+    if not uri or not uri.lower().startswith("s3://"):
+        logger.info("catalog_revenue_2025: no s3:// URI configured; skipping")
+        _CATALOG_REVENUE_2025_BY_MRELG = {}
+        return {}
+
+    try:
+        import boto3
+
+        bucket, key = _parse_s3_uri_to_bucket_key(uri)
+        raw = boto3.client("s3").get_object(Bucket=bucket, Key=key)["Body"].read()
+        df = pd.read_csv(io.BytesIO(raw), encoding="utf-8-sig")
+    except Exception as e:
+        logger.warning("catalog_revenue_2025: could not load %s: %s", uri, e)
+        _CATALOG_REVENUE_2025_LOAD_FAILED = True
+        _CATALOG_REVENUE_2025_BY_MRELG = {}
+        return {}
+
+    if df.empty:
+        _CATALOG_REVENUE_2025_BY_MRELG = {}
+        return {}
+
+    col_lookup = {_norm_csv_header(c): c for c in df.columns}
+    # Prefer exact ``MRELG_ID`` (case/spacing-insensitive) to match Luminate / SQLite.
+    mrelg_col = col_lookup.get("MRELG_ID")
+    if not mrelg_col:
+        mrelg_candidates = ("MRELG", "MRELGID", "MRELGIDS", "RELEASE_GROUP_ID")
+        mrelg_col = next((col_lookup[c] for c in mrelg_candidates if c in col_lookup), None)
+    rev_candidates = (
+        "REVENUE_2025",
+        "CATALOG_REVENUE_2025",
+        "TOTAL_REVENUE_2025",
+        "Y2025_REVENUE",
+        "REVENUE",
+        "TOTAL_REVENUE",
+    )
+    rev_col = next((col_lookup[c] for c in rev_candidates if c in col_lookup), None)
+    if not mrelg_col or not rev_col:
+        logger.warning(
+            "catalog_revenue_2025: CSV missing expected columns (mrelg=%s revenue=%s) headers=%s",
+            mrelg_col,
+            rev_col,
+            list(df.columns),
+        )
+        _CATALOG_REVENUE_2025_BY_MRELG = {}
+        return {}
+
+    out: Dict[str, float] = {}
+    for _, row in df.iterrows():
+        raw_id = row[mrelg_col] if mrelg_col in row.index else None
+        mid = _normalize_mrelg_id_key(raw_id)
+        if not mid:
+            continue
+        try:
+            val = float(row[rev_col])
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(val):
+            continue
+        out[mid] = val
+
+    sample_keys = list(out.keys())[:3]
+    logger.info(
+        "catalog_revenue_2025: %d rows, MRELG column=%r revenue column=%r sample_mrelg_keys=%s uri=%s",
+        len(out),
+        mrelg_col,
+        rev_col,
+        sample_keys,
+        uri,
+    )
+    _CATALOG_REVENUE_2025_BY_MRELG = out
+    return out
+
+
+def catalog_revenue_2025_for_mrelg(mrelg_id: Optional[str]) -> Optional[float]:
+    """Return 2025 catalog revenue for ``mrelg_id``, or ``None`` if unknown."""
+    key = _normalize_mrelg_id_key(mrelg_id)
+    if not key:
+        return None
+    m = get_catalog_revenue_2025_by_mrelg()
+    if not m:
+        return None
+    v = m.get(key)
+    if v is None and key.isdigit():
+        # Rare: map built with int str but API sent zero-padded or spaced
+        v = m.get(str(int(key)))
+    return float(v) if v is not None and math.isfinite(float(v)) else None
 
 
 def get_1m_forecaster():
@@ -276,12 +448,59 @@ def _mean_tail(seq: List[float], n: int) -> float:
     return float(sum(tail) / len(tail))
 
 
+def _catalog_decay_level_from_raw_pred(raw: float, target_transform: str) -> float:
+    """Invert training target transform (see ``train_catalog_decay.fit_catalog_decay_model``)."""
+    tt = (target_transform or "none").strip().lower()
+    if tt != "log1p":
+        return max(0.0, float(raw))
+    r = float(raw)
+    if not math.isfinite(r):
+        return 0.0
+    r = max(-50.0, min(50.0, r))
+    return max(0.0, math.expm1(r))
+
+
+def _catalog_eoy_use_release_artist_hist() -> bool:
+    v = os.environ.get("TIDE_CATALOG_EOY_USE_RELEASE_ARTIST_HIST", "1").strip().lower()
+    return v not in ("0", "false", "no")
+
+
+def _artist_history_log_map_for_inference(
+    display_artist: str,
+    weekly_streams: List[float],
+    *,
+    default_log_median: float,
+) -> Optional[Dict[str, float]]:
+    """
+    Approximate training's per-artist ``artist_history_log_median`` with the log1p
+    median of **this release's** observed weekly stream levels (same artist key
+    normalization as ``train_catalog_decay``). Reduces train/serve skew vs always
+    using the bundle's global default for every row.
+    """
+    if not _catalog_eoy_use_release_artist_hist():
+        return None
+    key = _normalize_artist_value(display_artist)
+    vals: List[float] = []
+    for x in weekly_streams:
+        try:
+            xf = float(x)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(xf) and xf > 0:
+            vals.append(xf)
+    if not vals:
+        return {key: float(default_log_median)}
+    med = float(pd.Series(vals).median())
+    return {key: float(math.log1p(med))}
+
+
 def _predict_catalog_decay_step(
     *,
     model: Any,
     feature_columns: List[str],
     top_genres: List[str],
     top_artists: List[str],
+    artist_history_log_median: Optional[Dict[str, float]],
     artist_history_default_log_median: float,
     mrelg_id: str,
     title: str,
@@ -294,6 +513,7 @@ def _predict_catalog_decay_step(
     lag1w: float,
     lag4w: float,
     lag12w: float,
+    target_transform: str = "none",
 ) -> float:
     chunk = pd.DataFrame(
         [
@@ -314,15 +534,15 @@ def _predict_catalog_decay_step(
         chunk,
         top_genres=top_genres,
         top_artists=top_artists,
-        artist_history_log_median=None,
+        artist_history_log_median=artist_history_log_median,
         artist_history_default_log_median=float(artist_history_default_log_median),
     )
     base["Lag1W_Streams"] = [float(lag1w)]
     base["Lag4W_Avg_Streams"] = [float(lag4w)]
     base["Lag12W_Avg_Streams"] = [float(lag12w)]
     x = base.reindex(columns=list(feature_columns)).fillna(0.0)
-    pred = float(model.predict(x)[0])
-    return max(0.0, pred)
+    raw = float(model.predict(x)[0])
+    return _catalog_decay_level_from_raw_pred(raw, target_transform)
 
 
 def get_eoy_search_forecast(mrelg_id: str, target_year: int = 2026) -> pd.DataFrame:
@@ -339,8 +559,15 @@ def get_eoy_search_forecast(mrelg_id: str, target_year: int = 2026) -> pd.DataFr
     Forecast AR ``rolling`` omits trailing week(s) when either
     ``TIDE_CATALOG_EOY_AR_EXCLUDE_TRAILING_WEEKS`` forces it or the last week is
     much lower than the prior (partial week — see
-    ``TIDE_CATALOG_EOY_PARTIAL_LAST_WEEK_RATIO``). Omitted rows still appear as
-    Actuals when they fall in ``target_year``.
+    ``TIDE_CATALOG_EOY_PARTIAL_LAST_WEEK_RATIO``). Those same indices are omitted
+    from ``Actual`` rows by default so the last actual volume aligns with
+    ``LAG1W_STREAMS`` on the first forecast. Set
+    ``TIDE_CATALOG_EOY_INCLUDE_TRAILING_PARTIAL_ACTUALS=1`` to show them again.
+
+    Per-artist ``artist_hist_log_median`` for the model is inferred from this
+    release's observed weekly streams (see ``_artist_history_log_map_for_inference``).
+    Disable with ``TIDE_CATALOG_EOY_USE_RELEASE_ARTIST_HIST=0`` to restore the
+    global-default-only path.
     """
     if not str(mrelg_id or "").strip():
         raise ValueError("mrelg_id is required.")
@@ -352,6 +579,7 @@ def get_eoy_search_forecast(mrelg_id: str, target_year: int = 2026) -> pd.DataFr
     top_genres: List[str] = list(bundle["top_genres"])
     top_artists: List[str] = list(bundle["top_artists"])
     artist_hist_default = float(bundle.get("artist_history_default_log_median", 0.0))
+    target_transform = str(bundle.get("target_transform") or "none").strip().lower()
 
     with get_snowflake_connection() as sf:
         meta = _resolve_mrelg_metadata_local(mrelg_id)
@@ -376,15 +604,30 @@ def get_eoy_search_forecast(mrelg_id: str, target_year: int = 2026) -> pd.DataFr
     if not any(v > 0 for v in series):
         raise ValueError(f"No positive stream history for mrelg_id: {mrelg_id}")
 
+    # Match training: per-artist log-median prior. Training uses corpus-wide artist
+    # profiles; at serve time we approximate with this release's weekly levels.
+    artist_hist_map = _artist_history_log_map_for_inference(
+        artist,
+        series,
+        default_log_median=artist_hist_default,
+    )
+
     week_ends = pd.to_datetime(hist_df[date_col]).dt.normalize()
     release_dt = pd.to_datetime(release_date).normalize()
     first_sale_dt = release_dt
+
+    trim_tail = _catalog_eoy_ar_seed_trailing_trim(series)
+    omit_trailing_actuals = trim_tail > 0 and not _catalog_eoy_include_trailing_partial_actuals()
+    trim_from_i = len(series) - trim_tail  # drop actuals for indices >= this (same tail as AR seed)
 
     rows_out: List[Dict[str, Any]] = []
 
     # Actuals: weeks in ``target_year`` only (parquet-aligned rows).
     for i, we in enumerate(week_ends):
         if int(we.year) != int(target_year):
+            continue
+        if omit_trailing_actuals and i >= trim_from_i:
+            # Skip weeks excluded from AR seed so last actual matches forecast lags.
             continue
         prefix = series[:i]
         lag1w = float(prefix[-1]) if prefix else 0.0
@@ -412,7 +655,6 @@ def get_eoy_search_forecast(mrelg_id: str, target_year: int = 2026) -> pd.DataFr
     # Forecast: weekly steps from first week after last known through end of target year.
     last_known_date = week_ends.iloc[-1]
     eoy = pd.Timestamp(year=int(target_year), month=12, day=31)
-    trim_tail = _catalog_eoy_ar_seed_trailing_trim(series)
     ar_seed = series[: len(series) - trim_tail] if trim_tail else list(series)
     rolling = list(ar_seed)
     current = last_known_date + pd.Timedelta(days=7)
@@ -426,6 +668,7 @@ def get_eoy_search_forecast(mrelg_id: str, target_year: int = 2026) -> pd.DataFr
             feature_columns=feature_columns,
             top_genres=top_genres,
             top_artists=top_artists,
+            artist_history_log_median=artist_hist_map,
             artist_history_default_log_median=artist_hist_default,
             mrelg_id=mrelg_id,
             title=title,
@@ -438,6 +681,7 @@ def get_eoy_search_forecast(mrelg_id: str, target_year: int = 2026) -> pd.DataFr
             lag1w=lag1w,
             lag4w=lag4w,
             lag12w=lag12w,
+            target_transform=target_transform,
         )
         rows_out.append(
             {
@@ -1442,6 +1686,12 @@ def search_releases_by_artist_title(
         info["matched"] = len(candidates)
 
     results = candidates[:limit]
+    for row in results:
+        mid = row.get("mrelg_id")
+        row["catalog_revenue_2025"] = catalog_revenue_2025_for_mrelg(
+            str(mid) if mid is not None else None
+        )
+
     _perf_summary(
         span,
         endpoint="search_global_streaming",
