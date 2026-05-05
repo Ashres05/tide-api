@@ -26,9 +26,17 @@ import marketshare_from_csv
 import album_art
 from model.marketshare_75k_simulation import DISTRIBUTIONS, NUM_WEEKS
 from model.train_catalog_decay import (
+    BASELINE52_EPS,
+    CATALOG_DECAY_TARGET_HYBRID_SPIKE_GATE_BASELINE52,
+    CATALOG_DECAY_TARGET_REL_RESIDUAL_BASELINE52,
+    CATALOG_DECAY_TARGET_RETAINED_MULT_LAG1,
+    REL_RESIDUAL_CLIP_HIGH,
+    REL_RESIDUAL_CLIP_LOW,
     _build_feature_frame,
     _normalize_artist_value,
+    baseline52_median_from_history_stream,
     extract_main_genre,
+    hybrid_inference_denominator_and_features,
 )
 from snowflake_conn import load_sql
 from model.forecast_engine_server import ForecastEngine
@@ -128,7 +136,10 @@ GLOBAL_1M_FORECASTER = None
 
 # Default: catalog decay forecaster artifact in S3 (override with TIDE_CATALOG_DECAY_MODEL_S3_URI).
 _CATALOG_DECAY_MODEL_S3_URI_DEFAULT = (
-    "s3://parquetgarage/model/catalog_decay_artifacts_slow/catalog_decay_model.pkl"
+    #"s3://parquetgarage/model/catalog_decay_artifacts_slow/catalog_decay_model.pkl"
+    #"s3://parquetgarage/model/decay_artifacts_multiplier/catalog_decay_model.pkl"
+    #"s3://parquetgarage/model/decay_artifacts_multiplier_baseline/catalog_decay_model.pkl"
+    "s3://parquetgarage/model/decay_artifacts_hybrid/catalog_decay_model.pkl"
 )
 # used to be _80k
 
@@ -191,6 +202,59 @@ def _catalog_eoy_include_trailing_partial_actuals() -> bool:
     """
     v = os.environ.get("TIDE_CATALOG_EOY_INCLUDE_TRAILING_PARTIAL_ACTUALS", "0").strip().lower()
     return v in ("1", "true", "yes")
+
+
+def _catalog_decay_blend_alpha_and_mode() -> tuple[float, str]:
+    """
+    Optional convex blend after decoding the catalog-decay head:
+    ``pred = alpha * model_level + (1 - alpha) * baseline_level``.
+
+    - ``TIDE_CATALOG_DECAY_BLEND_ALPHA``: weight on the model in ``[0, 1]``.
+      Default ``1.0`` (no blend). Example ``0.65`` keeps 65% model, 35% baseline.
+    - ``TIDE_CATALOG_DECAY_BLEND_BASELINE``: ``lag1`` (repeat last week, default)
+      or ``b52`` (prior 52-week median level from rolling history, matches training baseline).
+    """
+    try:
+        alpha = float(os.environ.get("TIDE_CATALOG_DECAY_BLEND_ALPHA", "1.0").strip() or 1.0)
+    except ValueError:
+        alpha = 1.0
+    alpha = max(0.0, min(1.0, alpha))
+    mode = (os.environ.get("TIDE_CATALOG_DECAY_BLEND_BASELINE", "lag1") or "lag1").strip().lower()
+    if mode not in ("lag1", "b52"):
+        mode = "lag1"
+    return alpha, mode
+
+
+def _catalog_decay_simple_baseline_level(
+    mode: str,
+    *,
+    lag1w: float,
+    baseline_52w: float,
+) -> float:
+    """Simple non-learned level reference for blending (same units as streams/week)."""
+    lf = float(lag1w)
+    lag1 = max(0.0, lf if math.isfinite(lf) else 0.0)
+    b = float(baseline_52w) if math.isfinite(baseline_52w) else float("nan")
+    if mode == "b52" and math.isfinite(b) and b >= BASELINE52_EPS:
+        return b
+    return max(lag1, BASELINE52_EPS)
+
+
+def _apply_catalog_decay_baseline_blend(
+    model_level: float,
+    *,
+    lag1w: float,
+    baseline_52w: float,
+) -> float:
+    """Blend decoded model weekly level with a simple baseline (see env in ``_catalog_decay_blend_alpha_and_mode``)."""
+    alpha, mode = _catalog_decay_blend_alpha_and_mode()
+    if alpha >= 1.0 - 1e-15:
+        return float(model_level) if math.isfinite(float(model_level)) else 0.0
+    base = _catalog_decay_simple_baseline_level(
+        mode, lag1w=lag1w, baseline_52w=baseline_52w
+    )
+    mp = float(model_level) if math.isfinite(float(model_level)) else 0.0
+    return max(0.0, alpha * mp + (1.0 - alpha) * base)
 
 
 def _parse_s3_uri_to_bucket_key(uri: str) -> tuple[str, str]:
@@ -264,10 +328,13 @@ def _normalize_mrelg_id_key(raw: Any) -> str:
     return s
 
 
-def get_catalog_revenue_2025_by_mrelg() -> Dict[str, float]:
+def _load_catalog_revenue_2025_csv_map() -> Dict[str, float]:
     """
     Lazy-load a map of MRELG_ID -> 2025 revenue from the configured S3 CSV.
     Returns an empty dict if the file is missing or unreadable.
+
+    (Named distinctly from ``get_catalog_revenue_2025_by_mrelg(mrelg_id)``, which
+    reads a single id from SQLite for the Live Revenue API route.)
     """
     global _CATALOG_REVENUE_2025_BY_MRELG, _CATALOG_REVENUE_2025_LOAD_FAILED
     if _CATALOG_REVENUE_2025_LOAD_FAILED:
@@ -354,7 +421,7 @@ def catalog_revenue_2025_for_mrelg(mrelg_id: Optional[str]) -> Optional[float]:
     key = _normalize_mrelg_id_key(mrelg_id)
     if not key:
         return None
-    m = get_catalog_revenue_2025_by_mrelg()
+    m = _load_catalog_revenue_2025_csv_map()
     if not m:
         return None
     v = m.get(key)
@@ -449,7 +516,7 @@ def _mean_tail(seq: List[float], n: int) -> float:
 
 
 def _catalog_decay_level_from_raw_pred(raw: float, target_transform: str) -> float:
-    """Invert training target transform (see ``train_catalog_decay.fit_catalog_decay_model``)."""
+    """Invert training target for **level** heads (not retained-multiplier models)."""
     tt = (target_transform or "none").strip().lower()
     if tt != "log1p":
         return max(0.0, float(raw))
@@ -514,6 +581,13 @@ def _predict_catalog_decay_step(
     lag4w: float,
     lag12w: float,
     target_transform: str = "none",
+    target_is_multiplier: bool = False,
+    catalog_decay_target: str = CATALOG_DECAY_TARGET_RETAINED_MULT_LAG1,
+    baseline_52w_median: Optional[float] = None,
+    hybrid_volatility_context: float = 0.0,
+    hybrid_baseline_ratio: float = 1.0,
+    hybrid_spike_state: float = 0.0,
+    hybrid_decode_denom: Optional[float] = None,
 ) -> float:
     chunk = pd.DataFrame(
         [
@@ -530,6 +604,11 @@ def _predict_catalog_decay_step(
         ]
     )
     chunk["PARSED_MAIN_GENRE"] = chunk["GENRES"].map(extract_main_genre)
+    ct0 = str(catalog_decay_target or CATALOG_DECAY_TARGET_RETAINED_MULT_LAG1).strip()
+    if ct0 == CATALOG_DECAY_TARGET_HYBRID_SPIKE_GATE_BASELINE52:
+        chunk["Volatility_Context"] = [float(hybrid_volatility_context)]
+        chunk["Baseline_Ratio"] = [float(hybrid_baseline_ratio)]
+        chunk["Spike_State"] = [float(hybrid_spike_state)]
     base = _build_feature_frame(
         chunk,
         top_genres=top_genres,
@@ -542,6 +621,35 @@ def _predict_catalog_decay_step(
     base["Lag12W_Avg_Streams"] = [float(lag12w)]
     x = base.reindex(columns=list(feature_columns)).fillna(0.0)
     raw = float(model.predict(x)[0])
+    ct = str(catalog_decay_target or CATALOG_DECAY_TARGET_RETAINED_MULT_LAG1).strip()
+    if ct == CATALOG_DECAY_TARGET_REL_RESIDUAL_BASELINE52:
+        r = raw if math.isfinite(raw) else 0.0
+        r = max(REL_RESIDUAL_CLIP_LOW, min(REL_RESIDUAL_CLIP_HIGH, r))
+        b = float(baseline_52w_median) if baseline_52w_median is not None else float("nan")
+        lag1 = float(lag1w)
+        if not math.isfinite(lag1) or lag1 < 0.0:
+            lag1 = 0.0
+        if not math.isfinite(b) or b < BASELINE52_EPS:
+            b = max(lag1, BASELINE52_EPS)
+        return max(0.0, b * (1.0 + r))
+    if ct == CATALOG_DECAY_TARGET_HYBRID_SPIKE_GATE_BASELINE52:
+        m = raw if math.isfinite(raw) else 0.0
+        m = max(0.0, min(5.0, m))
+        dd = float(hybrid_decode_denom) if hybrid_decode_denom is not None else float("nan")
+        lag1 = float(lag1w)
+        if not math.isfinite(lag1) or lag1 < 0.0:
+            lag1 = 0.0
+        if not math.isfinite(dd) or dd < BASELINE52_EPS:
+            dd = max(lag1, BASELINE52_EPS)
+        return max(0.0, m * dd)
+    if target_is_multiplier:
+        # Matches ``train_catalog_decay.forecast_catalog_projects``: clip m, then m * lag1.
+        m = raw if math.isfinite(raw) else 0.0
+        m = max(0.0, min(5.0, m))
+        lag1 = float(lag1w)
+        if not math.isfinite(lag1) or lag1 < 0.0:
+            lag1 = 0.0
+        return max(0.0, m * lag1)
     return _catalog_decay_level_from_raw_pred(raw, target_transform)
 
 
@@ -568,6 +676,11 @@ def get_eoy_search_forecast(mrelg_id: str, target_year: int = 2026) -> pd.DataFr
     release's observed weekly streams (see ``_artist_history_log_map_for_inference``).
     Disable with ``TIDE_CATALOG_EOY_USE_RELEASE_ARTIST_HIST=0`` to restore the
     global-default-only path.
+
+    Optional blend of the decoded model level with a simple baseline (tames
+    over-decay from small / weak fits): set ``TIDE_CATALOG_DECAY_BLEND_ALPHA`` to
+    a value in ``(0, 1)`` and optionally ``TIDE_CATALOG_DECAY_BLEND_BASELINE`` to
+    ``lag1`` or ``b52``; see ``_catalog_decay_blend_alpha_and_mode``.
     """
     if not str(mrelg_id or "").strip():
         raise ValueError("mrelg_id is required.")
@@ -580,6 +693,20 @@ def get_eoy_search_forecast(mrelg_id: str, target_year: int = 2026) -> pd.DataFr
     top_artists: List[str] = list(bundle["top_artists"])
     artist_hist_default = float(bundle.get("artist_history_default_log_median", 0.0))
     target_transform = str(bundle.get("target_transform") or "none").strip().lower()
+    # Retained-multiplier models (current ``train_catalog_decay``) decode as m * lag1;
+    # log1p-level bundles use ``expm1`` only. Bundles omitting the flag are treated as
+    # multiplier unless ``target_transform`` is log1p; set ``target_is_multiplier`` false
+    # in the artifact dict for a legacy raw-level ``none`` model.
+    if target_transform == "log1p":
+        target_is_multiplier = False
+    elif "target_is_multiplier" in bundle:
+        target_is_multiplier = bool(bundle["target_is_multiplier"])
+    else:
+        target_is_multiplier = True
+
+    catalog_decay_target = str(
+        bundle.get("catalog_decay_target") or CATALOG_DECAY_TARGET_RETAINED_MULT_LAG1
+    ).strip()
 
     with get_snowflake_connection() as sf:
         meta = _resolve_mrelg_metadata_local(mrelg_id)
@@ -663,6 +790,15 @@ def get_eoy_search_forecast(mrelg_id: str, target_year: int = 2026) -> pd.DataFr
         lag4w = _mean_tail(rolling, 4)
         lag12w = _mean_tail(rolling, 12)
         wsr = max(0.0, (current.normalize() - release_dt).days / 7.0)
+        bl52 = baseline52_median_from_history_stream(rolling)
+        if catalog_decay_target == CATALOG_DECAY_TARGET_REL_RESIDUAL_BASELINE52 and not math.isfinite(
+            bl52
+        ):
+            bl52 = float(rolling[-1]) if rolling else 0.0
+        h_vol = h_br = h_sp = 0.0
+        h_dd: Optional[float] = None
+        if catalog_decay_target == CATALOG_DECAY_TARGET_HYBRID_SPIKE_GATE_BASELINE52:
+            h_vol, h_br, h_sp, h_dd = hybrid_inference_denominator_and_features(rolling)
         pred = _predict_catalog_decay_step(
             model=model,
             feature_columns=feature_columns,
@@ -682,6 +818,16 @@ def get_eoy_search_forecast(mrelg_id: str, target_year: int = 2026) -> pd.DataFr
             lag4w=lag4w,
             lag12w=lag12w,
             target_transform=target_transform,
+            target_is_multiplier=target_is_multiplier,
+            catalog_decay_target=catalog_decay_target,
+            baseline_52w_median=bl52,
+            hybrid_volatility_context=h_vol,
+            hybrid_baseline_ratio=h_br,
+            hybrid_spike_state=h_sp,
+            hybrid_decode_denom=h_dd,
+        )
+        pred = _apply_catalog_decay_baseline_blend(
+            float(pred), lag1w=lag1w, baseline_52w=bl52
         )
         rows_out.append(
             {
