@@ -732,6 +732,15 @@ def get_eoy_search_forecast(mrelg_id: str, target_year: int = 2026) -> pd.DataFr
         title = (meta.get("title") or "").strip()
         genres_json = _metadata_genre_to_parquet_genres(meta.get("genre"))
         hist_df = _get_known_vols_global_streaming(mrelg_id, release_date, sf)
+        stream_decay_df = _build_global_streaming_forecast(
+            mrelg_id=mrelg_id,
+            release_date=release_date,
+            artist=artist,
+            title=title,
+            genre=meta.get("genre"),
+            fw_streams_peak=0.0,
+            sf=sf,
+        )
 
     if hist_df.empty:
         raise ValueError(f"No historical streaming weeks for mrelg_id: {mrelg_id}")
@@ -762,7 +771,27 @@ def get_eoy_search_forecast(mrelg_id: str, target_year: int = 2026) -> pd.DataFr
     omit_trailing_actuals = trim_tail > 0 and not _catalog_eoy_include_trailing_partial_actuals()
     trim_from_i = len(series) - trim_tail  # drop actuals for indices >= this (same tail as AR seed)
 
+    # Search/live uses the worldwide-streams archetype for the first 78 weeks.
+    # At/after week 78, we hand off to catalog decay. If the handoff happens
+    # inside target_year, bridge weeks are emitted as DATA_TYPE=Actual so the
+    # chart transitions continuously from stream-decay into catalog-decay.
+    MODEL_HORIZON_WEEKS = 78.0
+    stream_decay_by_week_end: Dict[pd.Timestamp, float] = {}
+    if not stream_decay_df.empty:
+        for _, r in stream_decay_df.iterrows():
+            try:
+                we = pd.to_datetime(r.get("week_ending_date")).normalize()
+            except Exception:
+                continue
+            if int(we.year) != int(target_year):
+                continue
+            wsr = max(0.0, (we - release_dt).days / 7.0)
+            if wsr < MODEL_HORIZON_WEEKS:
+                v = float(r.get("pred_worldwide_streams") or 0.0)
+                stream_decay_by_week_end[we] = max(0.0, v)
+
     rows_out: List[Dict[str, Any]] = []
+    emitted_weeks: set[str] = set()
 
     # Actuals: weeks in ``target_year`` only (parquet-aligned rows).
     for i, we in enumerate(week_ends):
@@ -776,6 +805,8 @@ def get_eoy_search_forecast(mrelg_id: str, target_year: int = 2026) -> pd.DataFr
         lag4w = _mean_tail(prefix, 4)
         lag12w = _mean_tail(prefix, 12)
         wsr = max(0.0, (we - release_dt).days / 7.0)
+        stream_bridge = stream_decay_by_week_end.get(we)
+        observed_or_bridged = float(stream_bridge) if stream_bridge is not None else float(series[i])
         rows_out.append(
             {
                 "MRELG_ID": mrelg_id,
@@ -785,7 +816,7 @@ def get_eoy_search_forecast(mrelg_id: str, target_year: int = 2026) -> pd.DataFr
                 "FIRST_SALE_DATE": first_sale_dt.strftime("%Y-%m-%d"),
                 "WEEK_END_DATE": we.strftime("%Y-%m-%d"),
                 "WEEKS_SINCE_RELEASE": float(wsr),
-                "WORLDWIDE_STREAMS": float(series[i]),
+                "WORLDWIDE_STREAMS": observed_or_bridged,
                 "LAG1W_STREAMS": lag1w,
                 "LAG4W_AVG_STREAMS": lag4w,
                 "LAG12W_AVG_STREAMS": lag12w,
@@ -793,18 +824,88 @@ def get_eoy_search_forecast(mrelg_id: str, target_year: int = 2026) -> pd.DataFr
                 "DATA_TYPE": "Actual",
             }
         )
+        emitted_weeks.add(we.strftime("%Y-%m-%d"))
 
-    # Forecast: weekly steps from first week after last known through end of target year.
+    # AR seed for catalog-decay. We also append any stream-decay bridge weeks
+    # beyond observed history (still <78w) so catalog picks up from that level.
     last_known_date = week_ends.iloc[-1]
     eoy = pd.Timestamp(year=int(target_year), month=12, day=31)
     ar_seed = series[: len(series) - trim_tail] if trim_tail else list(series)
     rolling = list(ar_seed)
-    current = last_known_date + pd.Timedelta(days=7)
-    while current <= eoy:
+    rolling_last_date = week_ends.iloc[len(ar_seed) - 1] if ar_seed else last_known_date
+
+    bridge_future = sorted(
+        d
+        for d in stream_decay_by_week_end.keys()
+        if d > rolling_last_date and d <= eoy
+    )
+    for d in bridge_future:
         lag1w = float(rolling[-1]) if rolling else 0.0
         lag4w = _mean_tail(rolling, 4)
         lag12w = _mean_tail(rolling, 12)
+        wsr = max(0.0, (d - release_dt).days / 7.0)
+        v = float(stream_decay_by_week_end[d])
+        week_iso = d.strftime("%Y-%m-%d")
+        if week_iso not in emitted_weeks:
+            rows_out.append(
+                {
+                    "MRELG_ID": mrelg_id,
+                    "TITLE": title,
+                    "GENRES": genres_json,
+                    "RELEASE_DATE": release_dt.strftime("%Y-%m-%d"),
+                    "FIRST_SALE_DATE": first_sale_dt.strftime("%Y-%m-%d"),
+                    "WEEK_END_DATE": week_iso,
+                    "WEEKS_SINCE_RELEASE": float(wsr),
+                    "WORLDWIDE_STREAMS": v,
+                    "LAG1W_STREAMS": lag1w,
+                    "LAG4W_AVG_STREAMS": lag4w,
+                    "LAG12W_AVG_STREAMS": lag12w,
+                    "DISPLAY_ARTIST": artist,
+                    "DATA_TYPE": "Actual",
+                }
+            )
+            emitted_weeks.add(week_iso)
+        rolling.append(v)
+        rolling_last_date = d
+
+    # Forecast: catalog-decay from the week after the stream-decay window/seed.
+    current = rolling_last_date + pd.Timedelta(days=7)
+    while current <= eoy:
         wsr = max(0.0, (current.normalize() - release_dt).days / 7.0)
+        week_iso = current.strftime("%Y-%m-%d")
+        if wsr < MODEL_HORIZON_WEEKS and current.normalize() in stream_decay_by_week_end:
+            # Defensive path: if a pre-78w week wasn't emitted in bridge loop,
+            # treat stream-decay as actual to preserve a seamless handoff.
+            lag1w = float(rolling[-1]) if rolling else 0.0
+            lag4w = _mean_tail(rolling, 4)
+            lag12w = _mean_tail(rolling, 12)
+            v = float(stream_decay_by_week_end[current.normalize()])
+            if week_iso not in emitted_weeks:
+                rows_out.append(
+                    {
+                        "MRELG_ID": mrelg_id,
+                        "TITLE": title,
+                        "GENRES": genres_json,
+                        "RELEASE_DATE": release_dt.strftime("%Y-%m-%d"),
+                        "FIRST_SALE_DATE": first_sale_dt.strftime("%Y-%m-%d"),
+                        "WEEK_END_DATE": week_iso,
+                        "WEEKS_SINCE_RELEASE": float(wsr),
+                        "WORLDWIDE_STREAMS": v,
+                        "LAG1W_STREAMS": lag1w,
+                        "LAG4W_AVG_STREAMS": lag4w,
+                        "LAG12W_AVG_STREAMS": lag12w,
+                        "DISPLAY_ARTIST": artist,
+                        "DATA_TYPE": "Actual",
+                    }
+                )
+                emitted_weeks.add(week_iso)
+            rolling.append(v)
+            current = current + pd.Timedelta(days=7)
+            continue
+
+        lag1w = float(rolling[-1]) if rolling else 0.0
+        lag4w = _mean_tail(rolling, 4)
+        lag12w = _mean_tail(rolling, 12)
         bl52 = baseline52_median_from_history_stream(rolling)
         if catalog_decay_target == CATALOG_DECAY_TARGET_REL_RESIDUAL_BASELINE52 and not math.isfinite(
             bl52
@@ -861,6 +962,7 @@ def get_eoy_search_forecast(mrelg_id: str, target_year: int = 2026) -> pd.DataFr
                 "DATA_TYPE": "Forecast",
             }
         )
+        emitted_weeks.add(week_iso)
         rolling.append(pred)
         current = current + pd.Timedelta(days=7)
 
