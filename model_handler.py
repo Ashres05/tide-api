@@ -139,7 +139,8 @@ _CATALOG_DECAY_MODEL_S3_URI_DEFAULT = (
     #"s3://parquetgarage/model/catalog_decay_artifacts_slow/catalog_decay_model.pkl"
     #"s3://parquetgarage/model/decay_artifacts_multiplier/catalog_decay_model.pkl"
     #"s3://parquetgarage/model/decay_artifacts_multiplier_baseline/catalog_decay_model.pkl"
-    "s3://parquetgarage/model/decay_artifacts_hybrid/catalog_decay_model.pkl"
+    #"s3://parquetgarage/model/decay_artifacts_hybrid/catalog_decay_model.pkl"
+    "s3://parquetgarage/model/decay_artifacts_hybrid_baseline/catalog_decay_model.pkl"
 )
 # used to be _80k
 
@@ -371,6 +372,7 @@ def _load_catalog_revenue_2025_csv_map() -> Dict[str, float]:
         mrelg_candidates = ("MRELG", "MRELGID", "MRELGIDS", "RELEASE_GROUP_ID")
         mrelg_col = next((col_lookup[c] for c in mrelg_candidates if c in col_lookup), None)
     rev_candidates = (
+        "2025_REVENUE",
         "REVENUE_2025",
         "CATALOG_REVENUE_2025",
         "TOTAL_REVENUE_2025",
@@ -621,7 +623,20 @@ def _predict_catalog_decay_step(
     base["Lag12W_Avg_Streams"] = [float(lag12w)]
     x = base.reindex(columns=list(feature_columns)).fillna(0.0)
     raw = float(model.predict(x)[0])
-    ct = str(catalog_decay_target or CATALOG_DECAY_TARGET_RETAINED_MULT_LAG1).strip()
+    ct = ct0
+    # Stable legacy catalog (no spike chaos): floor multiplier-like raw preds before decode to
+    # slow AR "death spiral" from tree bias slightly below 1.0.
+    if (
+        float(weeks_since_release) > 156.0
+        and float(hybrid_volatility_context) < 0.1
+        and ct != CATALOG_DECAY_TARGET_REL_RESIDUAL_BASELINE52
+        and (
+            ct == CATALOG_DECAY_TARGET_HYBRID_SPIKE_GATE_BASELINE52
+            or (ct == CATALOG_DECAY_TARGET_RETAINED_MULT_LAG1 and target_is_multiplier)
+        )
+        and math.isfinite(raw)
+    ):
+        raw = max(raw, 0.998)
     if ct == CATALOG_DECAY_TARGET_REL_RESIDUAL_BASELINE52:
         r = raw if math.isfinite(raw) else 0.0
         r = max(REL_RESIDUAL_CLIP_LOW, min(REL_RESIDUAL_CLIP_HIGH, r))

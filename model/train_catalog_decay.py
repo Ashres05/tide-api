@@ -453,9 +453,10 @@ def _build_feature_frame(
     artist_history_default_log_median: float = 0.0,
 ) -> pd.DataFrame:
     cols: dict[str, Any] = {}
-    if "PARSED_MAIN_GENRE" not in df.columns:
-        df = df.copy()
-        df["PARSED_MAIN_GENRE"] = df["GENRES"].map(extract_main_genre)
+    if "PARSED_MAIN_GENRE" in df.columns:
+        parsed_main_genre = df["PARSED_MAIN_GENRE"]
+    else:
+        parsed_main_genre = df["GENRES"].map(extract_main_genre)
     w = df["WEEKS_SINCE_RELEASE"].astype(float).clip(lower=0.0)
 
     # Age effects (explicitly excluding static log/sqrt age curves).
@@ -478,7 +479,7 @@ def _build_feature_frame(
     rel_year = df["FIRST_SALE_DATE"].dt.year.fillna(df["RELEASE_DATE"].dt.year).fillna(2010)
     cols["release_year_centered"] = rel_year.astype(float) - 2015.0
 
-    genre = df["PARSED_MAIN_GENRE"].map(_normalize_genre_value)
+    genre = parsed_main_genre.map(_normalize_genre_value)
     for g in top_genres:
         cols[f"genre__{_safe_feature_token(g)}"] = (genre == g).astype(float)
     cols["genre__other"] = (~genre.isin(top_genres)).astype(float)
@@ -535,7 +536,7 @@ def _build_feature_frame(
         else:
             cols[name] = float(default)
 
-    return pd.DataFrame(cols, index=df.index).copy()
+    return pd.DataFrame(cols, index=df.index)
 
 
 def _safe_ratio(numer: pd.Series, denom: pd.Series, *, fallback: float = 1.0) -> pd.Series:
@@ -574,6 +575,86 @@ def _compute_weeks_since_peak_by_track(df: pd.DataFrame, anomaly_col: str) -> pd
     return out.reindex(df.index).astype(float)
 
 
+def _impute_and_reconcile_catalog_training(
+    base: pd.DataFrame,
+    extras: pd.DataFrame,
+    *,
+    catalog_decay_target: str,
+    y_level: pd.Series,
+) -> None:
+    """
+    In-place: impute young-catalog / short-history NaNs in ``base`` and align
+    ``extras`` targets and baseline so ``dropna`` is only a safety net.
+    """
+    # --- 1. Lags: 12w <- 4w <- 1w, then 1w <- 0 ---
+    l1 = pd.to_numeric(base["Lag1W_Streams"], errors="coerce").astype(float)
+    l4 = pd.to_numeric(base["Lag4W_Avg_Streams"], errors="coerce").astype(float)
+    l12 = pd.to_numeric(base["Lag12W_Avg_Streams"], errors="coerce").astype(float)
+    l12 = l12.fillna(l4)
+    l4 = l4.fillna(l1)
+    l12 = l12.fillna(l1)
+    l1 = l1.fillna(0.0)
+    l4 = l4.fillna(l1)
+    l12 = l12.fillna(l1)
+    base["Lag1W_Streams"] = l1
+    base["Lag4W_Avg_Streams"] = l4
+    base["Lag12W_Avg_Streams"] = l12
+
+    # --- 2. Momentum, volatility, weeks-since-peak ---
+    if "Short_Momentum" in base.columns:
+        base["Short_Momentum"] = base["Short_Momentum"].fillna(1.0)
+    if "Long_Momentum" in base.columns:
+        base["Long_Momentum"] = base["Long_Momentum"].fillna(1.0)
+    if "Volatility_Context" in base.columns:
+        base["Volatility_Context"] = base["Volatility_Context"].fillna(0.0)
+    if "Weeks_Since_Peak" in base.columns:
+        base["Weeks_Since_Peak"] = base["Weeks_Since_Peak"].fillna(0.0)
+
+    yv = (
+        pd.to_numeric(y_level.reindex(base.index), errors="coerce")
+        .astype(float)
+        .to_numpy(dtype=np.float64)
+    )
+    l1_np = l1.to_numpy(dtype=np.float64)
+    l4_np = l4.to_numpy(dtype=np.float64)
+
+    # --- 3. Baseline + target reconciliation (heads that use 52w median) ---
+    if "BASELINE_52W_MEDIAN" in extras.columns:
+        b = pd.to_numeric(extras["BASELINE_52W_MEDIAN"], errors="coerce").astype(float)
+        b = b.fillna(l4).fillna(l1)
+        extras["BASELINE_52W_MEDIAN"] = b.to_numpy(dtype=np.float64)
+
+        b_np = pd.to_numeric(extras["BASELINE_52W_MEDIAN"], errors="coerce").astype(float).to_numpy()
+
+        if catalog_decay_target == CATALOG_DECAY_TARGET_REL_RESIDUAL_BASELINE52:
+            targ = (yv - b_np) / np.maximum(b_np, BASELINE52_EPS)
+            targ = np.clip(targ, REL_RESIDUAL_CLIP_LOW, REL_RESIDUAL_CLIP_HIGH)
+            extras["target_rel_residual_baseline52"] = targ
+
+        elif catalog_decay_target == CATALOG_DECAY_TARGET_HYBRID_SPIKE_GATE_BASELINE52:
+            sm = base["Short_Momentum"].to_numpy(dtype=np.float64)
+            lm = base["Long_Momentum"].to_numpy(dtype=np.float64)
+            anomaly_i = ((sm > 1.5) & (lm > 2.0)).astype(np.float64)
+            br = l1_np / np.maximum(b_np, BASELINE52_EPS)
+            br = np.where(np.isfinite(br), br, 1.0)
+            spike = np.maximum(anomaly_i, (br > SPIKE_GATE_BASELINE_RATIO_THR).astype(np.float64))
+            d_np = np.where(
+                spike > 0.5,
+                l1_np,
+                np.where(np.isfinite(b_np) & (b_np >= BASELINE52_EPS), b_np, l1_np),
+            )
+            targ_h = np.clip(yv / np.maximum(d_np, BASELINE52_EPS), 0.0, 5.0)
+            extras["target_hybrid_volgate"] = targ_h
+            base["Baseline_Ratio"] = br
+            base["Spike_State"] = spike
+            base["Anomaly_Flag"] = anomaly_i
+
+    # Retained multiplier: refresh target vs imputed lag1
+    if catalog_decay_target == CATALOG_DECAY_TARGET_RETAINED_MULT_LAG1 and "target_multiplier" in extras.columns:
+        mult = yv / np.maximum(l1_np, BASELINE52_EPS)
+        extras["target_multiplier"] = np.clip(mult, 0.0, 5.0)
+
+
 def prepare_df_model(
     df: pd.DataFrame,
     *,
@@ -595,11 +676,12 @@ def prepare_df_model(
     stable else ``lag1``; adds ``Volatility_Context``, ``Baseline_Ratio``, ``Spike_State``.
     Decode ``y_hat = clip(r_hat,0,5) * d`` with row-specific ``d`` at AR time.
     """
-    d = df.copy()
-    lag1 = pd.to_numeric(d["LAG1W_STREAMS"], errors="coerce").astype(float)
-    lag4 = pd.to_numeric(d["LAG4W_AVG_STREAMS"], errors="coerce").astype(float)
-    lag12 = pd.to_numeric(d["LAG12W_AVG_STREAMS"], errors="coerce").astype(float)
-    y_level = pd.to_numeric(d["WORLDWIDE_STREAMS"], errors="coerce").astype(float)
+    # Avoid ``df.copy()`` here: operate on the caller's frame (training path owns ``train_df``).
+    work = df
+    lag1 = pd.to_numeric(work["LAG1W_STREAMS"], errors="coerce").astype(float)
+    lag4 = pd.to_numeric(work["LAG4W_AVG_STREAMS"], errors="coerce").astype(float)
+    lag12 = pd.to_numeric(work["LAG12W_AVG_STREAMS"], errors="coerce").astype(float)
+    y_level = pd.to_numeric(work["WORLDWIDE_STREAMS"], errors="coerce").astype(float)
 
     short_momentum = _safe_ratio(lag1, lag4, fallback=1.0)
     long_momentum = _safe_ratio(lag1, lag12, fallback=1.0)
@@ -607,8 +689,8 @@ def prepare_df_model(
     weeks_since_peak = _compute_weeks_since_peak_by_track(
         pd.DataFrame(
             {
-                "MRELG_ID": d["MRELG_ID"].astype(str),
-                "WEEK_END_DATE": pd.to_datetime(d["WEEK_END_DATE"], errors="coerce"),
+                "MRELG_ID": work["MRELG_ID"].astype(str),
+                "WEEK_END_DATE": pd.to_datetime(work["WEEK_END_DATE"], errors="coerce"),
                 "anomaly_flag": anomaly_flag,
             }
         ),
@@ -621,7 +703,7 @@ def prepare_df_model(
         CATALOG_DECAY_TARGET_REL_RESIDUAL_BASELINE52,
         CATALOG_DECAY_TARGET_HYBRID_SPIKE_GATE_BASELINE52,
     ):
-        baseline_ser = _panel_baseline52_median_worldwide(d)
+        baseline_ser = _panel_baseline52_median_worldwide(work)
 
     targ: pd.Series | None = None
     baseline_col: np.ndarray | None = None
@@ -630,7 +712,7 @@ def prepare_df_model(
         if baseline_ser is None:
             raise ValueError("internal: baseline_ser required for rel_residual_baseline52")
         b = pd.to_numeric(baseline_ser, errors="coerce").astype(float)
-        b = pd.Series(b.values, index=d.index, dtype="float64")
+        b = pd.Series(b.values, index=work.index, dtype="float64")
         targ = ((y_level - b) / np.maximum(b, BASELINE52_EPS)).clip(
             REL_RESIDUAL_CLIP_LOW, REL_RESIDUAL_CLIP_HIGH
         )
@@ -638,7 +720,7 @@ def prepare_df_model(
     elif catalog_decay_target == CATALOG_DECAY_TARGET_HYBRID_SPIKE_GATE_BASELINE52:
         if baseline_ser is None:
             raise ValueError("internal: baseline_ser required for hybrid_spike_gate_baseline52")
-        vol = _panel_volatility_cv_last4_worldwide(d)
+        vol = _panel_volatility_cv_last4_worldwide(work)
         b = pd.to_numeric(baseline_ser, errors="coerce").astype(float)
         br = lag1 / np.maximum(b, BASELINE52_EPS)
         br = br.where(np.isfinite(br), 1.0)
@@ -653,19 +735,19 @@ def prepare_df_model(
         )
         targ = pd.Series(
             np.clip(y_level.to_numpy(dtype=float) / np.maximum(d_np, BASELINE52_EPS), 0.0, 5.0),
-            index=d.index,
+            index=work.index,
             dtype="float64",
         )
-        d["Volatility_Context"] = vol
-        d["Baseline_Ratio"] = br
-        d["Spike_State"] = spike
+        work["Volatility_Context"] = vol
+        work["Baseline_Ratio"] = br
+        work["Spike_State"] = spike
         baseline_col = b.to_numpy(dtype=float)
     else:
         targ = None
         baseline_col = None
 
     base = _build_feature_frame(
-        d,
+        work,
         top_genres=top_genres,
         top_artists=top_artists,
         lag1_streams=lag1,
@@ -682,41 +764,54 @@ def prepare_df_model(
     if catalog_decay_target == CATALOG_DECAY_TARGET_REL_RESIDUAL_BASELINE52:
         extras = pd.DataFrame(
             {
-                "target_worldwide_streams": pd.to_numeric(d["WORLDWIDE_STREAMS"], errors="coerce"),
+                "target_worldwide_streams": pd.to_numeric(work["WORLDWIDE_STREAMS"], errors="coerce"),
                 "target_rel_residual_baseline52": targ.astype(float),
                 "BASELINE_52W_MEDIAN": baseline_col,
-                "MRELG_ID": d["MRELG_ID"].astype(str).values,
-                "WEEK_END_DATE": pd.to_datetime(d["WEEK_END_DATE"]).values,
-                "WEEKS_SINCE_RELEASE": pd.to_numeric(d["WEEKS_SINCE_RELEASE"], errors="coerce").values,
+                "MRELG_ID": work["MRELG_ID"].astype(str).values,
+                "WEEK_END_DATE": pd.to_datetime(work["WEEK_END_DATE"]).values,
+                "WEEKS_SINCE_RELEASE": pd.to_numeric(work["WEEKS_SINCE_RELEASE"], errors="coerce").values,
             },
             index=base.index,
         )
     elif catalog_decay_target == CATALOG_DECAY_TARGET_HYBRID_SPIKE_GATE_BASELINE52:
         extras = pd.DataFrame(
             {
-                "target_worldwide_streams": pd.to_numeric(d["WORLDWIDE_STREAMS"], errors="coerce"),
+                "target_worldwide_streams": pd.to_numeric(work["WORLDWIDE_STREAMS"], errors="coerce"),
                 "target_hybrid_volgate": targ.astype(float),
                 "BASELINE_52W_MEDIAN": baseline_col,
-                "MRELG_ID": d["MRELG_ID"].astype(str).values,
-                "WEEK_END_DATE": pd.to_datetime(d["WEEK_END_DATE"]).values,
-                "WEEKS_SINCE_RELEASE": pd.to_numeric(d["WEEKS_SINCE_RELEASE"], errors="coerce").values,
+                "MRELG_ID": work["MRELG_ID"].astype(str).values,
+                "WEEK_END_DATE": pd.to_datetime(work["WEEK_END_DATE"]).values,
+                "WEEKS_SINCE_RELEASE": pd.to_numeric(work["WEEKS_SINCE_RELEASE"], errors="coerce").values,
             },
             index=base.index,
         )
     else:
         extras = pd.DataFrame(
             {
-                "target_worldwide_streams": pd.to_numeric(d["WORLDWIDE_STREAMS"], errors="coerce"),
+                "target_worldwide_streams": pd.to_numeric(work["WORLDWIDE_STREAMS"], errors="coerce"),
                 "target_multiplier": target_multiplier,
-                "MRELG_ID": d["MRELG_ID"].astype(str).values,
-                "WEEK_END_DATE": pd.to_datetime(d["WEEK_END_DATE"]).values,
-                "WEEKS_SINCE_RELEASE": pd.to_numeric(d["WEEKS_SINCE_RELEASE"], errors="coerce").values,
+                "MRELG_ID": work["MRELG_ID"].astype(str).values,
+                "WEEK_END_DATE": pd.to_datetime(work["WEEK_END_DATE"]).values,
+                "WEEKS_SINCE_RELEASE": pd.to_numeric(work["WEEKS_SINCE_RELEASE"], errors="coerce").values,
             },
             index=base.index,
         )
 
-    # Single concat avoids DataFrame fragmentation from repeated column inserts.
-    return pd.concat([base, extras], axis=1, copy=False).copy()
+    _impute_and_reconcile_catalog_training(
+        base,
+        extras,
+        catalog_decay_target=catalog_decay_target,
+        y_level=y_level,
+    )
+
+    for _heavy in ("TITLE", "DISPLAY_ARTIST", "GENRES"):
+        if _heavy in work.columns:
+            work.drop(columns=[_heavy], inplace=True)
+
+    out = pd.concat([base, extras], axis=1, copy=False)
+    del base, extras
+    gc.collect()
+    return out.copy()
 
 
 def fit_catalog_decay_model(
@@ -884,10 +979,12 @@ def fit_catalog_decay_model(
         )
 
     lgbm_kw: dict[str, Any] = dict(
-        objective="regression_l1",
+        objective="huber",
+        alpha=0.9,
         n_estimators=500,
         learning_rate=0.05,
-        num_leaves=127,
+        num_leaves=63,
+        histogram_pool_size=2048,
         subsample=0.8,
         colsample_bytree=0.8,
         reg_alpha=float(max(ridge_alpha, 0.0)),
