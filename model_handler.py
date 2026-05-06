@@ -591,6 +591,9 @@ def _predict_catalog_decay_step(
     hybrid_spike_state: float = 0.0,
     hybrid_decode_denom: Optional[float] = None,
 ) -> float:
+    is_legacy = float(weeks_since_release) > 156.0
+    is_whale = float(lag1w) > 5000000.0  # Tracks doing >5M streams/week
+
     chunk = pd.DataFrame(
         [
             {
@@ -624,11 +627,11 @@ def _predict_catalog_decay_step(
     x = base.reindex(columns=list(feature_columns)).fillna(0.0)
     raw = float(model.predict(x)[0])
     ct = ct0
-    # Stable legacy catalog (no spike chaos): floor multiplier-like raw preds before decode to
+    # Stable legacy catalog OR High-Volume "Whales": floor multiplier-like raw preds before decode to
     # slow AR "death spiral" from tree bias slightly below 1.0.
     if (
-        float(weeks_since_release) > 156.0
-        and float(hybrid_volatility_context) < 0.1
+        (is_legacy or is_whale)
+        and float(hybrid_volatility_context) < 0.15
         and ct != CATALOG_DECAY_TARGET_REL_RESIDUAL_BASELINE52
         and (
             ct == CATALOG_DECAY_TARGET_HYBRID_SPIKE_GATE_BASELINE52
@@ -636,7 +639,7 @@ def _predict_catalog_decay_step(
         )
         and math.isfinite(raw)
     ):
-        raw = max(raw, 0.998)
+        raw = max(raw, 0.99)
     if ct == CATALOG_DECAY_TARGET_REL_RESIDUAL_BASELINE52:
         r = raw if math.isfinite(raw) else 0.0
         r = max(REL_RESIDUAL_CLIP_LOW, min(REL_RESIDUAL_CLIP_HIGH, r))
@@ -656,6 +659,12 @@ def _predict_catalog_decay_step(
             lag1 = 0.0
         if not math.isfinite(dd) or dd < BASELINE52_EPS:
             dd = max(lag1, BASELINE52_EPS)
+
+        # ANTI-GRAVITY FIX: If it's a floored legacy/whale track, and the baseline is higher than lag1,
+        # anchor the denominator to current reality to prevent phantom inflation.
+        if (is_legacy or is_whale) and dd > lag1 and hybrid_spike_state < 0.5:
+            dd = max(lag1, BASELINE52_EPS)
+
         return max(0.0, m * dd)
     if target_is_multiplier:
         # Matches ``train_catalog_decay.forecast_catalog_projects``: clip m, then m * lag1.
@@ -948,6 +957,8 @@ import threading as _threading  # noqa: E402  (kept local to forecast cache)
 
 _FORECAST_CACHE: Dict[Tuple[str, str], Tuple[float, pd.DataFrame]] = {}
 _FORECAST_CACHE_LOCK = _threading.Lock()
+_MARKETSHARE_YTD_CACHE: Optional[pd.DataFrame] = None
+_MARKETSHARE_YTD_CACHE_LOCK = _threading.Lock()
 
 
 def _forecast_cache_key(mrelg_id: str) -> Tuple[str, str]:
@@ -987,6 +998,13 @@ def forecast_cache_clear() -> None:
     """Drop all cached forecast responses (used after a data refresh)."""
     with _FORECAST_CACHE_LOCK:
         _FORECAST_CACHE.clear()
+
+
+def marketshare_cache_clear() -> None:
+    """Drop cached marketshare unified_ytd frame (explicit invalidation only)."""
+    global _MARKETSHARE_YTD_CACHE
+    with _MARKETSHARE_YTD_CACHE_LOCK:
+        _MARKETSHARE_YTD_CACHE = None
 
 
 def _cap_weekly_series(values: List[float] | None, max_weeks: int) -> List[float]:
@@ -1180,6 +1198,7 @@ def create_release(
             cursor = conn.cursor()
             id = cursor.execute(query, params).fetchone()[0]
             conn.commit()
+        marketshare_cache_clear()
         return id
     except sqlite3.Error as e:
         raise sqlite3.Error(f"Error creating release: {e}") from e
@@ -1235,7 +1254,7 @@ def _create_backfilled_release(
                 f"MRELG ID {mrelg_id} has no {col} in the metadata. Try create_release() instead."
             )
 
-    return create_release(
+    rid = create_release(
         mrelg_id=mrelg_id,
         name=name,
         artist=artist,
@@ -1249,6 +1268,8 @@ def _create_backfilled_release(
         product_ratio_coefficient=0.3,
         cluster=0,
     )
+    marketshare_cache_clear()
+    return rid
 
 
 def backfill_releases(
@@ -1435,6 +1456,7 @@ def update_release(
             cursor = conn.cursor()
             cursor.execute(query, params)
             conn.commit()
+        marketshare_cache_clear()
     except sqlite3.Error as e:
         raise sqlite3.Error(f"Error updating release: {e}") from e
 
@@ -1450,6 +1472,7 @@ def delete_release(id: int) -> None:
             cursor = conn.cursor()
             cursor.execute(query, (id,))
             conn.commit()
+        marketshare_cache_clear()
     except sqlite3.Error as e:
         raise sqlite3.Error(f"Error deleting release: {e}")
 
@@ -2040,9 +2063,19 @@ def get_marketshare_forecasts(week_ending_date: str | None = None) -> pd.DataFra
     The week ending date must be in the format YYYY-MM-DD if provided.
     If no week ending date is provided, all marketshare forecasts are returned.
     """
+    global _MARKETSHARE_YTD_CACHE
+
     # Verify the week ending date (if provided).
     if week_ending_date is not None:
         _validate_date(week_ending_date)
+
+    with _MARKETSHARE_YTD_CACHE_LOCK:
+        cached = None if _MARKETSHARE_YTD_CACHE is None else _MARKETSHARE_YTD_CACHE.copy()
+    if cached is not None:
+        if week_ending_date is None:
+            return cached
+        mask = cached["Week Ending Date"].astype(str) == week_ending_date.strip()
+        return cached.loc[mask].copy()
 
     # Get all releases and verify the parquet file.
     releases = [_sqlite_row_to_release_map(row) for row in _get_all_release_rows()]
@@ -2055,11 +2088,13 @@ def get_marketshare_forecasts(week_ending_date: str | None = None) -> pd.DataFra
     if unified_ytd.empty:
         return unified_ytd
     unified_ytd = _apply_weekly_actuals_to_unified_ytd(unified_ytd)
+    with _MARKETSHARE_YTD_CACHE_LOCK:
+        _MARKETSHARE_YTD_CACHE = unified_ytd.copy()
     if week_ending_date is None:
-        return unified_ytd
+        return unified_ytd.copy()
     else:
         mask = unified_ytd["Week Ending Date"].astype(str) == week_ending_date.strip()
-        return unified_ytd.loc[mask]
+        return unified_ytd.loc[mask].copy()
 
 
 def get_release_forecasts(id: int, week_ending_date: str | None = None) -> pd.DataFrame:
@@ -2308,6 +2343,7 @@ def reload_artifacts() -> None:
     GLOBAL_FORECAST_ENGINE = None
     GLOBAL_WORLDWIDE_ARTIFACTS = None
     forecast_cache_clear()
+    marketshare_cache_clear()
     marketshare_from_csv.clear_cache()
     album_art.clear_cache()
 

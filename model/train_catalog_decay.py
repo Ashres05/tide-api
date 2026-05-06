@@ -1191,6 +1191,21 @@ def forecast_catalog_projects(
             preds = np.maximum(0.0, b * (1.0 + r))
             predicted_multiplier = r  # legacy column name: raw model head, not m=y/lag1
         elif ct == CATALOG_DECAY_TARGET_HYBRID_SPIKE_GATE_BASELINE52:
+            wsr_arr = (
+                pd.to_numeric(chunk["WEEKS_SINCE_RELEASE"], errors="coerce")
+                .fillna(0.0)
+                .to_numpy(dtype=float)
+            )
+            is_legacy_arr = wsr_arr > 156.0
+            is_whale_arr = lag1_arr > 5000000.0
+            vol_arr = np.asarray(vol_list, dtype=float)
+            sp_arr = np.asarray(sp_list, dtype=float)
+            floor_mask = (
+                (is_legacy_arr | is_whale_arr)
+                & (vol_arr < 0.15)
+                & np.isfinite(raw_head)
+            )
+            raw_head = np.where(floor_mask, np.maximum(raw_head, 0.99), raw_head)
             mhat = np.clip(np.nan_to_num(raw_head, nan=0.0), 0.0, 5.0)
             d_list: list[float] = []
             for mid in chunk["MRELG_ID"]:
@@ -1198,6 +1213,11 @@ def forecast_catalog_projects(
                 _v, _br, _s, d_i = hybrid_inference_denominator_and_features(series)
                 d_list.append(max(float(d_i), BASELINE52_EPS))
             d_arr = np.asarray(d_list, dtype=float)
+            lag1_safe = np.maximum(lag1_arr, 0.0)
+            # Match ``model_handler._predict_catalog_decay_step`` anti-gravity: anchor denominator to lag1
+            # for legacy/whale stable tracks so m≈1 does not inflate above current volume.
+            anti_grav = (is_legacy_arr | is_whale_arr) & (d_arr > lag1_safe) & (sp_arr < 0.5)
+            d_arr = np.where(anti_grav, np.maximum(lag1_safe, BASELINE52_EPS), d_arr)
             preds = np.maximum(0.0, mhat * d_arr)
             predicted_multiplier = mhat
         else:
