@@ -394,7 +394,7 @@ def search_global_streaming(
 
 
 @app.get("/v1/revenue/global_streaming_by_mrelg/{mrelg_id}")
-def global_streaming_by_mrelg(mrelg_id: str):
+def global_streaming_by_mrelg(mrelg_id: str, scenario: str = "Base"):
     """
     Returns observed + forecasted global weekly streams for a Luminate MRELG
     release group. Metadata (artist/title/release_date/genre) is resolved
@@ -402,10 +402,17 @@ def global_streaming_by_mrelg(mrelg_id: str):
     back to a direct Snowflake lookup. Pair with
     GET /v1/releases/search_global_streaming so the front end never has to
     resolve MRELG IDs by hand.
+
+    ``scenario`` query param ("Base" / "Bear" / "Bull"; default Base) routes
+    through to the worldwide_streams archetype simulation. The asymptotic
+    floor is invariant under scenario; only the future weeks above the floor
+    are scaled (post-fit shock).
     """
     try:
         payload = model_handler.df_to_json(
-            model_handler.get_global_streaming_forecast_by_mrelg(mrelg_id)
+            model_handler.get_global_streaming_forecast_by_mrelg(
+                mrelg_id, scenario=scenario
+            )
         )
         return Response(content=payload, media_type="application/json")
     except ValueError as e:
@@ -415,7 +422,9 @@ def global_streaming_by_mrelg(mrelg_id: str):
 
 
 @app.get("/v1/forecast/search/{mrelg_id}")
-def search_catalog_eoy_forecast(mrelg_id: str, target_year: int = 2026):
+def search_catalog_eoy_forecast(
+    mrelg_id: str, target_year: int = 2026, scenario: str = "Base"
+):
     """
     Autoregressive catalog-decay forecast of weekly **worldwide streams** through
     the end of ``target_year`` (columns match ``catalog_streams_pruned_80k.parquet``).
@@ -423,9 +432,22 @@ def search_catalog_eoy_forecast(mrelg_id: str, target_year: int = 2026):
     Returns JSON array of row objects: actual weeks in ``target_year`` from Snowflake
     history, then forecast weeks from the first week after the last observed point
     through ``{target_year}-12-31``.
+
+    ``scenario`` query param ("Base" / "Bear" / "Bull"; default Base) shocks
+    the worldwide_streams archetype that powers the first 78 forecast weeks.
+    The catalog-decay AR continuation past week 78 has no learned
+    scenario_multipliers of its own, but inherits the shock through its lag
+    features because ``rolling`` is seeded with the already-shocked bridge
+    weeks before AR steps begin. Visible scenario impact concentrates in
+    weeks ~1–50 of the curve; the AR tail re-converges as the archetype
+    decays to its dynamic floor by week ~77 (which is the same level across
+    Bear / Base / Bull). Use ``/v1/revenue/global_streaming_by_mrelg/{mrelg_id}``
+    for the strict 78-week archetype-only view.
     """
     try:
-        df = model_handler.get_eoy_search_forecast(mrelg_id, target_year)
+        df = model_handler.get_eoy_search_forecast(
+            mrelg_id, target_year, scenario=scenario
+        )
         payload = model_handler.df_to_json(df)
         return Response(content=payload, media_type="application/json")
     except ValueError as e:

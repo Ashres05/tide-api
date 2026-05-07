@@ -24,41 +24,9 @@ from .all_data_archetypes_simulator_ae import (
     simulate_future_drop,
     fit_backfill_forecast,
     SimulatorArtifacts,
-    archetype_scenario_shape_ratio,
-    normalize_archetype_scenario_label,
+    resolve_scenario_multiplier,
 )
 logger = logging.getLogger(__name__)
-
-
-# Clusters used to derive a scenario-wide scalar when the release has no
-# explicit archetype cluster. Mirrors the keys of
-# ARCHETYPE_SCENARIO_MULTIPLIERS in all_data_archetypes_simulator_ae.
-_SCENARIO_AVERAGE_CLUSTERS: Tuple[int, ...] = (0, 1, 2, 3)
-
-
-def _ratio_from_table(
-    table: Dict[str, Dict[str, float]],
-    cluster_key: str,
-    label: str,
-) -> Optional[float]:
-    """Bear/Base or Bull/Base ratio for a cluster from a multipliers table.
-
-    Returns None when the cluster entry is missing, malformed, or has a
-    non-positive Base percentile.
-    """
-    row = table.get(cluster_key)
-    if not isinstance(row, dict):
-        return None
-    try:
-        base = float(row.get("Base", 0.0))
-        scen = float(row.get(label, base))
-    except (TypeError, ValueError):
-        return None
-    if not np.isfinite(base) or base <= 0:
-        return None
-    if not np.isfinite(scen):
-        return None
-    return float(scen / base)
 
 
 def _resolve_scenario_multiplier(
@@ -66,55 +34,20 @@ def _resolve_scenario_multiplier(
     cluster_id: Optional[int] = None,
     artifacts: Optional[SimulatorArtifacts] = None,
 ) -> float:
-    """Map a user scenario choice to a single scalar multiplier.
+    """Thin shim around ``resolve_scenario_multiplier`` for marketshare code.
 
-    The multiplier is applied as a *post-fit* Bear/Bull shock on the future
-    portion of the curve in ``_get_curve``. The fit itself is always run with
-    ``scenario="Base"`` so the asymptotic floor and trajectory reflect Base
-    reality and never shift between scenarios — this is the entire point of
-    isolating fitting from scenario shocking.
-
-    Resolution order:
-      1. If ``artifacts.scenario_multipliers`` is present (learned natively
-         from this metric's parquet during training, e.g. worldwide_streams
-         p20/p50/p80), use it. With a known cluster_id, return
-         ``scenario_pct / base_pct`` for that cluster. Without a cluster_id,
-         average the per-cluster ratios across all clusters in the table.
-      2. Otherwise fall back to the hardcoded global
-         ``ARCHETYPE_SCENARIO_MULTIPLIERS`` via
-         ``archetype_scenario_shape_ratio``. This preserves behavior for
-         older artifacts that don't ship a scenario_multipliers.json.
+    Pulls the learned scenario_multipliers table from ``artifacts`` (when
+    supplied) and forwards to the source-of-truth helper in
+    ``all_data_archetypes_simulator_ae`` so streams, sales, and songs
+    channels each consult their own metric's table while sharing a single
+    resolution implementation with worldwide_streams.
     """
-    label = normalize_archetype_scenario_label(scenario)
-    if label == "Base":
-        return 1.0
-
     learned = getattr(artifacts, "scenario_multipliers", None) if artifacts else None
-    if learned:
-        if cluster_id is not None:
-            try:
-                ratio = _ratio_from_table(learned, str(int(cluster_id)), label)
-            except (TypeError, ValueError):
-                ratio = None
-            if ratio is not None:
-                return ratio
-        learned_ratios = [
-            r
-            for r in (
-                _ratio_from_table(learned, c_key, label) for c_key in learned.keys()
-            )
-            if r is not None
-        ]
-        if learned_ratios:
-            return float(np.mean(learned_ratios))
-
-    if cluster_id is not None:
-        try:
-            return float(archetype_scenario_shape_ratio(int(cluster_id), label))
-        except (TypeError, ValueError):
-            pass
-    ratios = [archetype_scenario_shape_ratio(c, label) for c in _SCENARIO_AVERAGE_CLUSTERS]
-    return float(np.mean(ratios))
+    return resolve_scenario_multiplier(
+        scenario,
+        cluster_id=cluster_id,
+        scenario_multipliers=learned,
+    )
 
 # --- Static coefficients & tables (also persisted in artifacts) ---
 
@@ -340,7 +273,14 @@ def generate_archetype_decay_curve(
                 archetype_cluster_id=archetype_cluster_id,
                 **sim_tuning_kwargs,
             )
-            curve = pred_df["pred_weekly_streams"].iloc[:num_weeks].to_numpy(dtype=float)
+            # NB: pandas/numpy can hand back a read-only view from
+            # ``to_numpy(dtype=float)`` when no dtype conversion is needed.
+            # The post-fit shock writes back into ``curve`` (``curve[k:] =
+            # ...``), so force a writable copy here — without it, Bear/Bull
+            # raise ``ValueError: assignment destination is read-only`` and the
+            # outer ``except`` quietly returns a zero curve, which presents as
+            # "the scenario went lower than Base" on the frontend.
+            curve = pred_df["pred_weekly_streams"].iloc[:num_weeks].to_numpy(dtype=float, copy=True)
             if scenario_multiplier != 1.0:
                 # Anchor the shock to the same floor simulate_future_drop used.
                 # When the caller pinned stream_floor, that's authoritative;

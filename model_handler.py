@@ -677,10 +677,24 @@ def _predict_catalog_decay_step(
     return _catalog_decay_level_from_raw_pred(raw, target_transform)
 
 
-def get_eoy_search_forecast(mrelg_id: str, target_year: int = 2026) -> pd.DataFrame:
+def get_eoy_search_forecast(
+    mrelg_id: str,
+    target_year: int = 2026,
+    scenario: str = "Base",
+) -> pd.DataFrame:
     """
     Given an MRELG from search, load weekly worldwide streams history from Snowflake,
     then autoregress with the catalog-decay LightGBM bundle to ``target_year``-12-31.
+
+    ``scenario`` ("Base" / "Bear" / "Bull") shocks the worldwide_streams archetype
+    that powers the first 78 forecast weeks (the bridge weeks between the last
+    actual and the AR handoff). The catalog-decay AR continuation past week 78
+    has no learned scenario_multipliers itself, but inherits the shock through
+    its ``lag1w / lag4w / lag12w`` features because ``rolling`` is seeded with
+    the already-shocked bridge weeks before AR starts. By week ~77 the
+    archetype has converged to the dynamic floor regardless of scenario, so
+    the AR tail past the handoff is similar across Bear / Base / Bull — the
+    user-visible scenario impact lives in weeks ~1–50 of the curve.
 
     Output columns match ``catalog_streams_pruned_80k.parquet`` (see
     ``_CATALOG_STREAMS_PARQUET_OUTPUT_COLS``). ``WORLDWIDE_STREAMS`` holds observed
@@ -709,6 +723,16 @@ def get_eoy_search_forecast(mrelg_id: str, target_year: int = 2026) -> pd.DataFr
     if not str(mrelg_id or "").strip():
         raise ValueError("mrelg_id is required.")
     mrelg_id = str(mrelg_id).strip()
+    scenario = _normalize_scenario_label(scenario)
+
+    # Cache hit short-circuits the entire pipeline (Snowflake history pull,
+    # worldwide_streams archetype simulation, and the per-week catalog-decay
+    # AR loop) so repeated Bear/Bull/Base toggles on the same release within
+    # the TTL window return immediately. Keyed on (mrelg_id, target_year,
+    # scenario, today) — see _SEARCH_FORECAST_CACHE.
+    cached = _search_forecast_cache_lookup(mrelg_id, target_year, scenario)
+    if cached is not None:
+        return cached.copy()
 
     bundle = _unpack_catalog_decay_bundle(get_1m_forecaster())
     model = bundle["model"]
@@ -741,6 +765,19 @@ def get_eoy_search_forecast(mrelg_id: str, target_year: int = 2026) -> pd.DataFr
         title = (meta.get("title") or "").strip()
         genres_json = _metadata_genre_to_parquet_genres(meta.get("genre"))
         hist_df = _get_known_vols_global_streaming(mrelg_id, release_date, sf)
+        # The first 78 forecast weeks come from the worldwide_streams archetype,
+        # which is the only piece that owns scenario_multipliers. Pass the
+        # scenario through so Bear / Bull shock those bridge weeks; the
+        # catalog-decay AR (weeks 79..EOY) then inherits that shock through
+        # its lag1w / lag4w / lag12w features without needing its own
+        # multiplier table. The shock peaks early (weeks 5–50) and tapers
+        # toward the dynamic floor by week 77, so the AR tail naturally
+        # re-converges across scenarios — visible scenario impact lives in
+        # the user-facing portion of the curve.
+        #
+        # ``hist_df`` is forwarded so _build_global_streaming_forecast doesn't
+        # re-issue the same Snowflake query we just ran above — that was the
+        # second-largest fixed cost on every search request before.
         stream_decay_df = _build_global_streaming_forecast(
             mrelg_id=mrelg_id,
             release_date=release_date,
@@ -749,6 +786,8 @@ def get_eoy_search_forecast(mrelg_id: str, target_year: int = 2026) -> pd.DataFr
             genre=meta.get("genre"),
             fw_streams_peak=0.0,
             sf=sf,
+            scenario=scenario,
+            hist_df=hist_df,
         )
 
     if hist_df.empty:
@@ -781,9 +820,14 @@ def get_eoy_search_forecast(mrelg_id: str, target_year: int = 2026) -> pd.DataFr
     trim_from_i = len(series) - trim_tail  # drop actuals for indices >= this (same tail as AR seed)
 
     # Search/live uses the worldwide-streams archetype for the first 78 weeks.
-    # At/after week 78, we hand off to catalog decay. If the handoff happens
-    # inside target_year, bridge weeks are emitted as DATA_TYPE=Actual so the
-    # chart transitions continuously from stream-decay into catalog-decay.
+    # At/after week 78, we hand off to catalog decay. Bridge weeks (archetype
+    # output for weeks that fall after the last Snowflake observation but
+    # still inside the 78-week archetype horizon) are emitted as
+    # DATA_TYPE="Forecast" — they're model output, not real observations.
+    # The chart can still render them continuously by concatenating Actual +
+    # Forecast in chronological order; only the label changed (commits prior
+    # to this used "Actual" for chart-styling reasons but that mislabeled
+    # forecast weeks as actuals on the live-streaming popup).
     MODEL_HORIZON_WEEKS = 78.0
     stream_decay_by_week_end: Dict[pd.Timestamp, float] = {}
     if not stream_decay_df.empty:
@@ -837,6 +881,16 @@ def get_eoy_search_forecast(mrelg_id: str, target_year: int = 2026) -> pd.DataFr
 
     # AR seed for catalog-decay. We also append any stream-decay bridge weeks
     # beyond observed history (still <78w) so catalog picks up from that level.
+    #
+    # These ``bridge_future`` rows are forecasts produced by the
+    # worldwide_streams archetype, NOT real Snowflake observations, so we now
+    # label them DATA_TYPE="Forecast". (Previously they were emitted as
+    # "Actual" to keep the chart line continuous, but that hid them from any
+    # consumer that counts DATA_TYPE labels — e.g. the live-streaming popup
+    # which was reporting "Nw actuals + 0w forecast" for releases where the
+    # 78-week archetype window covered the rest of target_year.) The values
+    # in WORLDWIDE_STREAMS are unchanged, so revenue totals and the chart
+    # itself are unaffected; only the label flips.
     last_known_date = week_ends.iloc[-1]
     eoy = pd.Timestamp(year=int(target_year), month=12, day=31)
     ar_seed = series[: len(series) - trim_tail] if trim_tail else list(series)
@@ -870,7 +924,7 @@ def get_eoy_search_forecast(mrelg_id: str, target_year: int = 2026) -> pd.DataFr
                     "LAG4W_AVG_STREAMS": lag4w,
                     "LAG12W_AVG_STREAMS": lag12w,
                     "DISPLAY_ARTIST": artist,
-                    "DATA_TYPE": "Actual",
+                    "DATA_TYPE": "Forecast",
                 }
             )
             emitted_weeks.add(week_iso)
@@ -883,8 +937,10 @@ def get_eoy_search_forecast(mrelg_id: str, target_year: int = 2026) -> pd.DataFr
         wsr = max(0.0, (current.normalize() - release_dt).days / 7.0)
         week_iso = current.strftime("%Y-%m-%d")
         if wsr < MODEL_HORIZON_WEEKS and current.normalize() in stream_decay_by_week_end:
-            # Defensive path: if a pre-78w week wasn't emitted in bridge loop,
-            # treat stream-decay as actual to preserve a seamless handoff.
+            # Defensive path: if a pre-78w week wasn't emitted in the bridge
+            # loop above, emit it here. These are also archetype-bridge
+            # forecasts (same provenance as bridge_future), so we keep the
+            # label consistent at "Forecast".
             lag1w = float(rolling[-1]) if rolling else 0.0
             lag4w = _mean_tail(rolling, 4)
             lag12w = _mean_tail(rolling, 12)
@@ -904,7 +960,7 @@ def get_eoy_search_forecast(mrelg_id: str, target_year: int = 2026) -> pd.DataFr
                         "LAG4W_AVG_STREAMS": lag4w,
                         "LAG12W_AVG_STREAMS": lag12w,
                         "DISPLAY_ARTIST": artist,
-                        "DATA_TYPE": "Actual",
+                        "DATA_TYPE": "Forecast",
                     }
                 )
                 emitted_weeks.add(week_iso)
@@ -978,7 +1034,9 @@ def get_eoy_search_forecast(mrelg_id: str, target_year: int = 2026) -> pd.DataFr
     out = pd.DataFrame(rows_out)
     if out.empty:
         return out
-    return out.reindex(columns=list(_CATALOG_STREAMS_PARQUET_OUTPUT_COLS))
+    out = out.reindex(columns=list(_CATALOG_STREAMS_PARQUET_OUTPUT_COLS))
+    _search_forecast_cache_store(mrelg_id, target_year, out, scenario)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1057,21 +1115,52 @@ _FORECAST_CACHE_MAX = 256
 
 import threading as _threading  # noqa: E402  (kept local to forecast cache)
 
-_FORECAST_CACHE: Dict[Tuple[str, str], Tuple[float, pd.DataFrame]] = {}
+_FORECAST_CACHE: Dict[Tuple[str, str, str], Tuple[float, pd.DataFrame]] = {}
 _FORECAST_CACHE_LOCK = _threading.Lock()
+# Search forecast cache (catalog-EOY view powering /v1/forecast/search). The
+# search path is materially more expensive than the 78-week revenue path
+# because it adds a per-week catalog-decay AR loop on top of the worldwide
+# archetype, and on every call without this cache the request paid for two
+# Snowflake history queries + a full archetype simulate + ~52 LightGBM
+# inference steps. Keyed on (mrelg_id, target_year, scenario, today) so that
+# Bear/Bull toggles on the same release day-of return immediately and
+# different target years stay isolated.
+_SEARCH_FORECAST_CACHE: Dict[Tuple[str, int, str, str], Tuple[float, pd.DataFrame]] = {}
+_SEARCH_FORECAST_CACHE_LOCK = _threading.Lock()
 _MARKETSHARE_YTD_CACHE: Optional[pd.DataFrame] = None
 _MARKETSHARE_YTD_CACHE_LOCK = _threading.Lock()
 
 
-def _forecast_cache_key(mrelg_id: str) -> Tuple[str, str]:
+def _normalize_scenario_label(scenario: Optional[str]) -> str:
+    """Coerce arbitrary user input to canonical Bear / Base / Bull (defaulting to Base).
+
+    Mirrors ``normalize_archetype_scenario_label`` in the simulator without
+    pulling that import into model_handler's hot path. Used for the forecast
+    cache key so Bear/Bull don't collide with Base in cached responses.
+    """
+    if scenario is None:
+        return "Base"
+    s = str(scenario).strip().lower()
+    if s == "bear":
+        return "Bear"
+    if s == "bull":
+        return "Bull"
+    return "Base"
+
+
+def _forecast_cache_key(mrelg_id: str, scenario: str = "Base") -> Tuple[str, str, str]:
     # Bind to the calendar date so refreshed Snowflake data is picked up the
     # next day even if the worker has not been restarted; the TTL still
     # guards against same-day invalidation if the daily snapshot changes.
-    return (mrelg_id, date.today().isoformat())
+    # Scenario is part of the key because Bear / Base / Bull return materially
+    # different forecast frames for the same release on the same day.
+    return (mrelg_id, _normalize_scenario_label(scenario), date.today().isoformat())
 
 
-def _forecast_cache_lookup(mrelg_id: str) -> Optional[pd.DataFrame]:
-    key = _forecast_cache_key(mrelg_id)
+def _forecast_cache_lookup(
+    mrelg_id: str, scenario: str = "Base"
+) -> Optional[pd.DataFrame]:
+    key = _forecast_cache_key(mrelg_id, scenario)
     with _FORECAST_CACHE_LOCK:
         entry = _FORECAST_CACHE.get(key)
         if entry is None:
@@ -1083,10 +1172,12 @@ def _forecast_cache_lookup(mrelg_id: str) -> Optional[pd.DataFrame]:
     return df
 
 
-def _forecast_cache_store(mrelg_id: str, df: pd.DataFrame) -> None:
+def _forecast_cache_store(
+    mrelg_id: str, df: pd.DataFrame, scenario: str = "Base"
+) -> None:
     if df is None or df.empty:
         return
-    key = _forecast_cache_key(mrelg_id)
+    key = _forecast_cache_key(mrelg_id, scenario)
     with _FORECAST_CACHE_LOCK:
         _FORECAST_CACHE[key] = (time.time(), df.copy())
         # Cheap LRU-ish eviction: drop the oldest entries beyond the cap.
@@ -1096,10 +1187,52 @@ def _forecast_cache_store(mrelg_id: str, df: pd.DataFrame) -> None:
                 _FORECAST_CACHE.pop(k, None)
 
 
+def _search_forecast_cache_key(
+    mrelg_id: str, target_year: int, scenario: str = "Base"
+) -> Tuple[str, int, str, str]:
+    return (
+        mrelg_id,
+        int(target_year),
+        _normalize_scenario_label(scenario),
+        date.today().isoformat(),
+    )
+
+
+def _search_forecast_cache_lookup(
+    mrelg_id: str, target_year: int, scenario: str = "Base"
+) -> Optional[pd.DataFrame]:
+    key = _search_forecast_cache_key(mrelg_id, target_year, scenario)
+    with _SEARCH_FORECAST_CACHE_LOCK:
+        entry = _SEARCH_FORECAST_CACHE.get(key)
+        if entry is None:
+            return None
+        ts, df = entry
+        if (time.time() - ts) > _FORECAST_CACHE_TTL_S:
+            _SEARCH_FORECAST_CACHE.pop(key, None)
+            return None
+    return df
+
+
+def _search_forecast_cache_store(
+    mrelg_id: str, target_year: int, df: pd.DataFrame, scenario: str = "Base"
+) -> None:
+    if df is None or df.empty:
+        return
+    key = _search_forecast_cache_key(mrelg_id, target_year, scenario)
+    with _SEARCH_FORECAST_CACHE_LOCK:
+        _SEARCH_FORECAST_CACHE[key] = (time.time(), df.copy())
+        if len(_SEARCH_FORECAST_CACHE) > _FORECAST_CACHE_MAX:
+            evict = sorted(_SEARCH_FORECAST_CACHE.items(), key=lambda kv: kv[1][0])
+            for k, _ in evict[: len(_SEARCH_FORECAST_CACHE) - _FORECAST_CACHE_MAX]:
+                _SEARCH_FORECAST_CACHE.pop(k, None)
+
+
 def forecast_cache_clear() -> None:
     """Drop all cached forecast responses (used after a data refresh)."""
     with _FORECAST_CACHE_LOCK:
         _FORECAST_CACHE.clear()
+    with _SEARCH_FORECAST_CACHE_LOCK:
+        _SEARCH_FORECAST_CACHE.clear()
 
 
 def marketshare_cache_clear() -> None:
@@ -2707,7 +2840,7 @@ def _verify_mrelg_id(mrelg_id: str, _sf: Snowflake) -> pd.DataFrame:
     return mrelg_metadata
 
 
-def get_global_streaming_forecast(id: int) -> pd.DataFrame:
+def get_global_streaming_forecast(id: int, scenario: str = "Base") -> pd.DataFrame:
     """
     Returns a DataFrame of worldwide streaming forecasts for a single release.
 
@@ -2720,6 +2853,13 @@ def get_global_streaming_forecast(id: int) -> pd.DataFrame:
              data_type, pred_worldwide_streams, cumulative_worldwide_streams
 
     data_type is "Actual" for observed weeks and "Forecast" for model-predicted weeks.
+
+    ``scenario`` ("Base" / "Bear" / "Bull") is forwarded to
+    ``_build_global_streaming_forecast`` for the post-fit shock; defaults to
+    Base so legacy callers remain unaffected. Stored release.scenario is
+    intentionally not used here — the caller passes scenario explicitly so a
+    single release can be charted under multiple scenarios without mutating
+    the SQLite row.
 
     Deprecated: prefer get_global_streaming_forecast_by_mrelg(mrelg_id), which
     is what the new front end uses after the search endpoint resolves an MRELG.
@@ -2744,12 +2884,16 @@ def get_global_streaming_forecast(id: int) -> pd.DataFrame:
         title=release.get("title") or release.get("name") or "",
         genre=release.get("genre"),
         fw_streams_peak=fw_peak,
+        scenario=scenario,
     )
     df.insert(0, "release_id", id)
     return df
 
 
-def get_global_streaming_forecast_by_mrelg(mrelg_id: str) -> pd.DataFrame:
+def get_global_streaming_forecast_by_mrelg(
+    mrelg_id: str,
+    scenario: str = "Base",
+) -> pd.DataFrame:
     """
     Returns a DataFrame of worldwide streaming forecasts for a given MRELG ID,
     independent of any local SQLite release record.
@@ -2762,21 +2906,30 @@ def get_global_streaming_forecast_by_mrelg(mrelg_id: str) -> pd.DataFrame:
     Output schema mirrors get_global_streaming_forecast (minus release_id):
     mrelg_id, artist, title, week, data_type, week_ending_date,
     pred_worldwide_streams, cumulative_worldwide_streams.
+
+    ``scenario`` ("Base" / "Bear" / "Bull") forwards a post-fit Bear/Bull
+    shock through ``_build_global_streaming_forecast`` →
+    ``simulate_one_worldwide_streams``. The fit (and therefore the asymptotic
+    floor) is identical across scenarios — only the future weeks above the
+    floor are scaled. The forecast cache is keyed on (mrelg_id, scenario)
+    so each scenario is memoized independently.
     """
     if not isinstance(mrelg_id, str) or not mrelg_id.strip():
         raise ValueError("mrelg_id is required.")
     mrelg_id = mrelg_id.strip()
+    scenario = _normalize_scenario_label(scenario)
 
     span: Dict[str, Any] = {}
     t_start = _now()
 
-    cached = _forecast_cache_lookup(mrelg_id)
+    cached = _forecast_cache_lookup(mrelg_id, scenario)
     if cached is not None:
         _perf_summary(
             span,
             endpoint="global_streaming_by_mrelg",
             t_start=t_start,
             mrelg_id=mrelg_id,
+            scenario=scenario,
             cache="hit",
             rows=len(cached),
         )
@@ -2809,15 +2962,17 @@ def get_global_streaming_forecast_by_mrelg(mrelg_id: str) -> pd.DataFrame:
             fw_streams_peak=0.0,
             span=span,
             sf=sf,
+            scenario=scenario,
         )
 
-    _forecast_cache_store(mrelg_id, df)
+    _forecast_cache_store(mrelg_id, df, scenario)
 
     _perf_summary(
         span,
         endpoint="global_streaming_by_mrelg",
         t_start=t_start,
         mrelg_id=mrelg_id,
+        scenario=scenario,
         cache="miss",
         rows=len(df),
     )
@@ -2960,6 +3115,8 @@ def _build_global_streaming_forecast(
     fw_streams_peak: float,
     span: Optional[Dict[str, Any]] = None,
     sf: Optional[Snowflake] = None,
+    scenario: str = "Base",
+    hist_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
     Shared backbone for both the legacy release_id-driven and the new MRELG-driven
@@ -2968,9 +3125,18 @@ def _build_global_streaming_forecast(
     the actual-plus-forecast frame.
 
     ``sf`` lets callers pass an already-open Snowflake session so we don't pay
-    the connect/auth cost more than once per request. ``span`` enables phase-
-    level timing logs without polluting the production code path with
-    bookkeeping when omitted (single-shot scripts).
+    the connect/auth cost more than once per request. ``hist_df`` lets callers
+    that have already pulled the same observed-weekly-streams frame skip the
+    duplicate Snowflake query entirely — the search/EOY path needs the same
+    data to seed its catalog-decay AR loop, so reusing it cuts the search
+    request's Snowflake cost roughly in half. ``span`` enables phase-level
+    timing logs without polluting the production code path with bookkeeping
+    when omitted (single-shot scripts).
+
+    ``scenario`` ("Base" / "Bear" / "Bull") is forwarded into the simulation's
+    release_dict so the worldwide_streams engine can apply the corresponding
+    post-fit shock — see ``simulate_one_worldwide_streams``. Defaults to "Base"
+    so all existing callers and tests are unaffected.
     """
     @contextlib.contextmanager
     def _phase(name: str, **extra: Any):
@@ -2988,10 +3154,15 @@ def _build_global_streaming_forecast(
             with get_snowflake_connection() as _sf:
                 yield _sf
 
-    with _phase("snowflake_streams_query") as info:
-        with _sf_session() as session:
-            hist_df = _get_known_vols_global_streaming(mrelg_id, release_date, session)
-        info["rows"] = len(hist_df)
+    if hist_df is None:
+        with _phase("snowflake_streams_query") as info:
+            with _sf_session() as session:
+                hist_df = _get_known_vols_global_streaming(mrelg_id, release_date, session)
+            info["rows"] = len(hist_df)
+    else:
+        with _phase("snowflake_streams_query_skipped") as info:
+            info["rows"] = len(hist_df)
+            info["reused"] = True
 
     if hist_df.empty:
         raise ValueError(f"No historical observed weeks found for mrelg_id: {mrelg_id}")
@@ -3031,6 +3202,7 @@ def _build_global_streaming_forecast(
         "date": release_date,
         "known_worldwide_streams": known,
         "fw_worldwide_streams": float(fw_streams_peak or 0.0),
+        "scenario": _normalize_scenario_label(scenario),
     }
 
     with _phase("simulation") as info:

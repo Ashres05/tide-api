@@ -15,6 +15,8 @@ import pandas as pd
 from .all_data_archetypes_simulator_ae import (
     SimulatorArtifacts,
     fit_backfill_forecast,
+    normalize_archetype_scenario_label,
+    resolve_scenario_multiplier,
     simulate_future_drop,
 )
 
@@ -53,6 +55,13 @@ def simulate_one_worldwide_streams(
       - known_worldwide_streams — optional observed early weeks (raw counts)
       - peak_week — optional, default 1.0 for cold start
       - stream_floor — optional override for tail floor
+      - scenario — "Bear" / "Base" / "Bull"; default "Base". Translated via the
+        artifact's ``scenario_multipliers`` (worldwide_streams' learned p20/p50/
+        p80) into a post-fit shock on the future weeks above the floor. The fit
+        itself is always Base, so the asymptotic floor is invariant under the
+        scenario toggle.
+      - cluster — optional Archetype_Cluster id; sharpens scenario lookup to
+        that specific cluster's percentile band when the user pins it.
     """
     artist = str(release.get("artist") or release.get("name") or "").strip()
     if not artist:
@@ -85,6 +94,27 @@ def simulate_one_worldwide_streams(
     else:
         peak_week = None
 
+    # Translate the scenario label into a post-fit multiplier using the
+    # artifact's learned scenario_multipliers (currently shipped with the
+    # worldwide_streams artifact dir). The fit is always run with
+    # scenario="Base" so the asymptotic floor is identical across scenarios;
+    # Bear/Bull is delivered exclusively via scenario_multiplier.
+    scenario_label = normalize_archetype_scenario_label(release.get("scenario"))
+    cluster_raw = release.get("cluster")
+    archetype_cluster_id: Optional[int]
+    if cluster_raw is None:
+        archetype_cluster_id = None
+    else:
+        try:
+            archetype_cluster_id = int(cluster_raw)
+        except (TypeError, ValueError):
+            archetype_cluster_id = None
+    scenario_multiplier = resolve_scenario_multiplier(
+        scenario_label,
+        cluster_id=archetype_cluster_id,
+        scenario_multipliers=getattr(artifacts, "scenario_multipliers", None),
+    )
+
     horizon = int(artifacts.horizon_weeks)
     end_week = int(max(1, min(int(end_week), horizon)))
 
@@ -97,6 +127,9 @@ def simulate_one_worldwide_streams(
             artifacts=artifacts,
             end_week=end_week,
             stream_floor=stream_floor,
+            scenario="Base",
+            archetype_cluster_id=archetype_cluster_id,
+            scenario_multiplier=scenario_multiplier,
         )
     elif has_known_weeks and not has_positive_known:
         if fw <= 0:
@@ -112,6 +145,8 @@ def simulate_one_worldwide_streams(
             genre=genre,
             artifacts=artifacts,
             stream_floor=stream_floor,
+            scenario="Base",
+            archetype_cluster_id=archetype_cluster_id,
         )
     else:
         if fw <= 0:
@@ -123,9 +158,32 @@ def simulate_one_worldwide_streams(
             genre=genre,
             artifacts=artifacts,
             stream_floor=stream_floor,
+            scenario="Base",
+            archetype_cluster_id=archetype_cluster_id,
         )
 
     pred_df = pred_df.iloc[:end_week].copy()
+
+    # simulate_future_drop has no scenario_multiplier kwarg, so apply the post-
+    # fit shock here for symmetry with fit_backfill_forecast (which applies it
+    # internally). Anchor the scaling at the floor used by the simulator: the
+    # caller-provided override when present, otherwise the curve's asymptote
+    # (≈min) since simulate_future_drop converges to its dynamic floor by
+    # construction.
+    if scenario_multiplier != 1.0 and not has_positive_known:
+        curve = pred_df["pred_weekly_streams"].to_numpy(dtype=float).copy()
+        if curve.size:
+            if stream_floor is not None:
+                floor = float(stream_floor)
+            else:
+                floor = float(np.min(curve))
+            k = int(len(known_arr))  # observed weeks (zero or partial-zero block)
+            if k < curve.size:
+                above = np.clip(curve[k:] - floor, 0.0, None)
+                curve[k:] = floor + above * scenario_multiplier
+            pred_df["pred_weekly_streams"] = curve
+            pred_df["cumulative_pred_streams"] = np.cumsum(curve)
+
     weekly = _weekly_table(pred_df)
     return {
         "input": {
@@ -135,6 +193,8 @@ def simulate_one_worldwide_streams(
             "date": release.get("date"),
             "fw_worldwide_streams": fw,
             "known_worldwide_streams": [float(x) for x in known_arr.tolist()],
+            "scenario": scenario_label,
+            "scenario_multiplier": float(scenario_multiplier),
         },
         "summary": _public_summary(summary),
         "weekly": weekly,

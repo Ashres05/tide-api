@@ -66,6 +66,99 @@ def archetype_scenario_shape_ratio(cluster_id: int, scenario: Optional[str]) -> 
     return float(row.get(scen, base)) / base
 
 
+# Cluster ids used to derive a scenario-wide scalar when the caller has no
+# specific cluster pinned. Matches the keys of ARCHETYPE_SCENARIO_MULTIPLIERS.
+_SCENARIO_FALLBACK_CLUSTERS: Tuple[int, ...] = (0, 1, 2, 3)
+
+
+def _ratio_from_learned_table(
+    table: Dict[str, Dict[str, float]],
+    cluster_key: str,
+    label: str,
+) -> Optional[float]:
+    """Bear/Base or Bull/Base ratio for a cluster from a multipliers table.
+
+    Returns None when the cluster entry is missing, malformed, or has a
+    non-positive Base percentile.
+    """
+    row = table.get(cluster_key)
+    if not isinstance(row, dict):
+        return None
+    try:
+        base = float(row.get("Base", 0.0))
+        scen = float(row.get(label, base))
+    except (TypeError, ValueError):
+        return None
+    if not (np.isfinite(base) and base > 0):
+        return None
+    if not np.isfinite(scen):
+        return None
+    return float(scen / base)
+
+
+def resolve_scenario_multiplier(
+    scenario: Optional[str],
+    cluster_id: Optional[int] = None,
+    scenario_multipliers: Optional[Dict[str, Dict[str, float]]] = None,
+) -> float:
+    """Translate a user scenario label into a single scalar multiplier.
+
+    The returned value is intended to be applied as a *post-fit* shock on the
+    future portion of a decay curve relative to the asymptotic floor — see the
+    ``scenario_multiplier`` argument on ``fit_backfill_forecast`` and the
+    upstream wrappers. The fit itself must always run with ``scenario="Base"``
+    so the floor never shifts between scenarios; this helper exists purely to
+    answer "by how much should I shock the future weeks above the floor".
+
+    Resolution order:
+
+      1. If ``scenario_multipliers`` is provided (e.g. learned natively from a
+         specific metric's parquet during training, currently the
+         worldwide_streams artifact's ``scenario_multipliers.json``), use it.
+         With a known cluster_id, return ``scenario_pct / base_pct`` for that
+         cluster. Without a cluster_id, average the per-cluster ratios across
+         every cluster in the table.
+      2. Otherwise fall back to the hardcoded global
+         ``ARCHETYPE_SCENARIO_MULTIPLIERS`` via
+         ``archetype_scenario_shape_ratio`` — preserving behavior for older
+         artifacts that don't ship a learned table.
+
+    Returns 1.0 for Base, or any time inputs are degenerate.
+    """
+    label = normalize_archetype_scenario_label(scenario)
+    if label == "Base":
+        return 1.0
+
+    if scenario_multipliers:
+        if cluster_id is not None:
+            try:
+                ratio = _ratio_from_learned_table(
+                    scenario_multipliers, str(int(cluster_id)), label
+                )
+            except (TypeError, ValueError):
+                ratio = None
+            if ratio is not None:
+                return ratio
+        learned_ratios = [
+            r
+            for r in (
+                _ratio_from_learned_table(scenario_multipliers, c_key, label)
+                for c_key in scenario_multipliers.keys()
+            )
+            if r is not None
+        ]
+        if learned_ratios:
+            return float(np.mean(learned_ratios))
+
+    if cluster_id is not None:
+        try:
+            return float(archetype_scenario_shape_ratio(int(cluster_id), label))
+        except (TypeError, ValueError):
+            pass
+    ratios = [archetype_scenario_shape_ratio(c, label) for c in _SCENARIO_FALLBACK_CLUSTERS]
+    return float(np.mean(ratios))
+
+
 def extract_main_genre(genre_val: Any) -> str:
     """
     Extract the "MAIN_GENRE" from the GENRES JSON blob.
