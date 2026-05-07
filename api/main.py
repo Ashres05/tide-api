@@ -64,7 +64,7 @@ class ReleaseCreateBody(BaseModel):
     fy_vol: float = 0.0
     avg_historical_w1_product_ratio: float = 0.3
     product_ratio_coefficient: float = 0.3
-    cluster: int = 0
+    cluster: int | None = None
 
 
 class ReleaseUpdateBody(ReleaseCreateBody):

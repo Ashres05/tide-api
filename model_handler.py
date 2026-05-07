@@ -1265,7 +1265,7 @@ def create_release(
     known_vols: list[float] | None = None,
     avg_historical_w1_product_ratio: float = 0.3, 
     product_ratio_coefficient: float = 0.3,
-    cluster: int = 0,
+    cluster: int | None = None,
     **_kwargs,
 ) -> int:
     """
@@ -1368,7 +1368,7 @@ def _create_backfilled_release(
         fy_vol=0.0,
         avg_historical_w1_product_ratio=0.3,
         product_ratio_coefficient=0.3,
-        cluster=0,
+        cluster=None,
     )
     marketshare_cache_clear()
     return rid
@@ -1523,7 +1523,7 @@ def update_release(
     known_vols: list[float] | None = None,
     avg_historical_w1_product_ratio: float = 0.3, 
     product_ratio_coefficient: float = 0.3,
-    cluster: int = 0,
+    cluster: int | None = None,
     **_kwargs,
 ) -> None:
     """Updates a release in the database."""
@@ -2545,7 +2545,6 @@ def _sqlite_row_to_release_map(row: sqlite3.Row) -> dict:
         "label": row["LABEL_NAME"],
         "date": date_str,
         "genre": row["GENRE"],
-        "cluster": int(row["CLUSTER"] or 0),
         "fw_vol": fw_vol,
         "fw_streams": _sql_float("FW_STREAMS"),
         "fw_songs": _sql_float("FW_SONGS"),
@@ -2557,6 +2556,9 @@ def _sqlite_row_to_release_map(row: sqlite3.Row) -> dict:
         "avg_historical_w1_product_ratio": float(row["AVG_HISTORICAL_W1_PRODUCT_RATIO"] or 0),
         "product_ratio_coefficient": float(row["PRODUCT_RATIO_COEFFICIENT"] or 0),
     }
+
+    _cl = row["CLUSTER"] if "CLUSTER" in row.keys() else None
+    release_map["cluster"] = int(_cl) if _cl is not None else None
 
     if component_vols["streams"]:
         release_map["known_streams"] = component_vols["streams"]
@@ -2601,10 +2603,14 @@ def _verify_release_fields(inputs: dict) -> None:
         if math.isnan(f) or math.isinf(f):
             raise ValueError(f"{field} must be a finite number.")
 
-    # Verify cluster is a non-negative integer.
-    cluster = data.get("cluster", 0)
-    if not _is_integral(cluster) or int(cluster) < 0:
-        raise ValueError("cluster must be a non-negative integer.")
+    # Optional manual archetype cluster 0..3; None / omitted => computed mixture.
+    cluster = data.get("cluster", None)
+    if cluster is not None:
+        if not _is_integral(cluster):
+            raise ValueError("cluster must be null (auto) or an integer 0-3.")
+        ci = int(cluster)
+        if ci < 0 or ci > 3:
+            raise ValueError("cluster must be between 0 and 3 inclusive when set.")
 
     # Verify known volumes is a list of real numbers.
     known_vols = data.get("known_vols", [])

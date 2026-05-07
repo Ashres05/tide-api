@@ -1,8 +1,9 @@
 """
 75k parlay simulation core: archetypal decay and enrichment.
 
-Uses genre/label archetype priors (DISTRIBUTIONS), Bear/Base/Bull multipliers
-(ARCHETYPE_MULTIPLIERS), trained archetype decay artifacts (streams / sales / songs),
+Uses genre/label archetype priors (DISTRIBUTIONS), Bear/Base/Bull shape scaling and
+optional manual archetype cluster (see ``simulate_future_drop`` in
+``all_data_archetypes_simulator_ae``), trained decay artifacts (streams / sales / songs),
 GLOBAL_PRODUCT_COEF for product tail scaling, and release inputs (fw_vol, fy_vol,
 scenario, cluster, dates, known_vols). Optional per-release fields (e.g. empirical W2,
 product ratio) may be supplied on the release dict when callers have external estimates.
@@ -19,8 +20,101 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from .all_data_archetypes_simulator_ae import simulate_future_drop, fit_backfill_forecast, SimulatorArtifacts
+from .all_data_archetypes_simulator_ae import (
+    simulate_future_drop,
+    fit_backfill_forecast,
+    SimulatorArtifacts,
+    archetype_scenario_shape_ratio,
+    normalize_archetype_scenario_label,
+)
 logger = logging.getLogger(__name__)
+
+
+# Clusters used to derive a scenario-wide scalar when the release has no
+# explicit archetype cluster. Mirrors the keys of
+# ARCHETYPE_SCENARIO_MULTIPLIERS in all_data_archetypes_simulator_ae.
+_SCENARIO_AVERAGE_CLUSTERS: Tuple[int, ...] = (0, 1, 2, 3)
+
+
+def _ratio_from_table(
+    table: Dict[str, Dict[str, float]],
+    cluster_key: str,
+    label: str,
+) -> Optional[float]:
+    """Bear/Base or Bull/Base ratio for a cluster from a multipliers table.
+
+    Returns None when the cluster entry is missing, malformed, or has a
+    non-positive Base percentile.
+    """
+    row = table.get(cluster_key)
+    if not isinstance(row, dict):
+        return None
+    try:
+        base = float(row.get("Base", 0.0))
+        scen = float(row.get(label, base))
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(base) or base <= 0:
+        return None
+    if not np.isfinite(scen):
+        return None
+    return float(scen / base)
+
+
+def _resolve_scenario_multiplier(
+    scenario: Optional[str],
+    cluster_id: Optional[int] = None,
+    artifacts: Optional[SimulatorArtifacts] = None,
+) -> float:
+    """Map a user scenario choice to a single scalar multiplier.
+
+    The multiplier is applied as a *post-fit* Bear/Bull shock on the future
+    portion of the curve in ``_get_curve``. The fit itself is always run with
+    ``scenario="Base"`` so the asymptotic floor and trajectory reflect Base
+    reality and never shift between scenarios — this is the entire point of
+    isolating fitting from scenario shocking.
+
+    Resolution order:
+      1. If ``artifacts.scenario_multipliers`` is present (learned natively
+         from this metric's parquet during training, e.g. worldwide_streams
+         p20/p50/p80), use it. With a known cluster_id, return
+         ``scenario_pct / base_pct`` for that cluster. Without a cluster_id,
+         average the per-cluster ratios across all clusters in the table.
+      2. Otherwise fall back to the hardcoded global
+         ``ARCHETYPE_SCENARIO_MULTIPLIERS`` via
+         ``archetype_scenario_shape_ratio``. This preserves behavior for
+         older artifacts that don't ship a scenario_multipliers.json.
+    """
+    label = normalize_archetype_scenario_label(scenario)
+    if label == "Base":
+        return 1.0
+
+    learned = getattr(artifacts, "scenario_multipliers", None) if artifacts else None
+    if learned:
+        if cluster_id is not None:
+            try:
+                ratio = _ratio_from_table(learned, str(int(cluster_id)), label)
+            except (TypeError, ValueError):
+                ratio = None
+            if ratio is not None:
+                return ratio
+        learned_ratios = [
+            r
+            for r in (
+                _ratio_from_table(learned, c_key, label) for c_key in learned.keys()
+            )
+            if r is not None
+        ]
+        if learned_ratios:
+            return float(np.mean(learned_ratios))
+
+    if cluster_id is not None:
+        try:
+            return float(archetype_scenario_shape_ratio(int(cluster_id), label))
+        except (TypeError, ValueError):
+            pass
+    ratios = [archetype_scenario_shape_ratio(c, label) for c in _SCENARIO_AVERAGE_CLUSTERS]
+    return float(np.mean(ratios))
 
 # --- Static coefficients & tables (also persisted in artifacts) ---
 
@@ -30,13 +124,6 @@ NUM_WEEKS = 78 # Releases limited to 18 months
 
 # When release_dict supplies empirical_w2_over_w1, blend tail toward it; alpha = min(1, n_releases / K).
 W2_RETENTION_BLEND_K = 4.0 # 4 or more releases means we fully trust artist history and note archetype curve
-
-ARCHETYPE_MULTIPLIERS = {
-    0: {"Bear": 3.35, "Base": 6.20, "Bull": 7.72},
-    1: {"Bear": 2.68, "Base": 4.34, "Bull": 5.14},
-    2: {"Bear": 3.20, "Base": 5.68, "Bull": 6.73},
-    3: {"Bear": 6.74, "Base": 10.85, "Bull": 13.14},
-}
 
 DISTRIBUTIONS = {
     "Genre": {
@@ -148,6 +235,24 @@ def generate_archetype_decay_curve(
 ) -> List[float]:
     artist = release_dict.get("name", release_dict.get("artist", "Unknown"))
     genre = release_dict.get("genre")
+    scenario = release_dict.get("scenario") or "Base"
+    cluster_raw = release_dict.get("cluster")
+    archetype_cluster_id: Optional[int]
+    if cluster_raw is None:
+        archetype_cluster_id = None
+    else:
+        try:
+            archetype_cluster_id = int(cluster_raw)
+        except (TypeError, ValueError):
+            archetype_cluster_id = None
+
+    # Intercept the user's scenario choice here. The fit must always run with
+    # scenario="Base" so the basis functions, NNLS mixture, fitted peak_volume,
+    # and dynamic_floor never shift between scenarios — Bear/Bull is layered in
+    # strictly post-fit. The actual scalar multiplier is resolved *per channel*
+    # inside _get_curve so each metric (streams, sales, songs) consults its own
+    # learned scenario_multipliers.json (when present).
+    fit_scenario = "Base"
     
     known_streams = release_dict.get("known_streams", [])
     known_sales = release_dict.get("known_sales", [])
@@ -194,11 +299,22 @@ def generate_archetype_decay_curve(
         if radius is not None:
             sim_tuning_kwargs["peak_sim_log_radius"] = radius
 
+        # Per-channel scenario shock: resolved against the channel's own
+        # artifacts so streams uses streams' learned p20/p50/p80, sales uses
+        # sales' learned table, etc. Falls back to the global hardcoded
+        # ARCHETYPE_SCENARIO_MULTIPLIERS when scenario_multipliers.json was
+        # not present in the artifact dir.
+        scenario_multiplier = _resolve_scenario_multiplier(
+            scenario, archetype_cluster_id, artifacts=artifacts
+        )
+
         if not known and fw == 0:
             return [0.0] * num_weeks
         if known:
             try:
                 # fit_backfill_forecast does not accept peak_sim_* tuning args (simulate_future_drop does).
+                # Scenario hygiene: the fit is always Base so dynamic_floor never shifts;
+                # Bear/Bull is delivered exclusively via scenario_multiplier post-fit.
                 pred_df, _ = fit_backfill_forecast(
                     artist=artist,
                     genre=genre,
@@ -206,18 +322,39 @@ def generate_archetype_decay_curve(
                     artifacts=artifacts,
                     end_week=num_weeks,
                     stream_floor=force_floor,
+                    scenario=fit_scenario,
+                    archetype_cluster_id=archetype_cluster_id,
+                    scenario_multiplier=scenario_multiplier,
                 )
                 return pred_df["pred_weekly_streams"].tolist()
             except Exception as e:
                 logger.warning(f"Backfill failed for {artist}: {e}. Falling back to day-0 sim.")
                 fw = float(known[0])
         try:
+            # Same scenario hygiene as above: simulate at Base, then shock the
+            # future-only portion of the returned curve relative to its floor.
             pred_df, _ = simulate_future_drop(
                 artist=artist, peak_volume=fw, peak_week=1.0, genre=genre,
                 artifacts=artifacts, stream_floor=force_floor,
+                scenario=fit_scenario,
+                archetype_cluster_id=archetype_cluster_id,
                 **sim_tuning_kwargs,
             )
-            return pred_df["pred_weekly_streams"].iloc[:num_weeks].tolist()
+            curve = pred_df["pred_weekly_streams"].iloc[:num_weeks].to_numpy(dtype=float)
+            if scenario_multiplier != 1.0:
+                # Anchor the shock to the same floor simulate_future_drop used.
+                # When the caller pinned stream_floor, that's authoritative;
+                # otherwise the dynamic floor equals the curve's asymptote, so
+                # min(curve) is a safe proxy.
+                if force_floor is not None:
+                    floor = float(force_floor)
+                else:
+                    floor = float(np.min(curve)) if curve.size else 0.0
+                k = len(known)
+                if k < curve.size:
+                    above = np.clip(curve[k:] - floor, 0.0, None)
+                    curve[k:] = floor + above * scenario_multiplier
+            return curve.tolist()
         except Exception as e:
             logger.error(f"Simulation failed for {artist}: {e}. Returning zeros.")
             return [0.0] * num_weeks
@@ -281,13 +418,13 @@ def run_archetype_scenario(
             
         req_date = pd.to_datetime(drop_date)
         full_curve = generate_archetype_decay_curve(
-            release, 
-            artifacts_streams, 
-            artifacts_sales, 
-            artifacts_songs, 
-            NUM_WEEKS
+            release_dict,
+            artifacts_streams,
+            artifacts_sales,
+            artifacts_songs,
+            NUM_WEEKS,
         )
-        
+
         temp_curve_rows = []
         # --- UPDATE: Loop through the full year instead of just the future ---
         for current_date in tracker_dates:
@@ -332,10 +469,17 @@ def run_archetype_scenario(
             weeks_active = min(max(0, (end_of_year_date - drop_dt).days // 7 + 1), NUM_WEEKS)
             cy_total = sum(full_curve[:weeks_active])
             
+        cl_disp = "auto"
+        if release.get("cluster") is not None:
+            try:
+                cl_disp = str(int(release["cluster"]))
+            except (TypeError, ValueError):
+                cl_disp = "auto"
         volume_report_data.append({
             "Artist / Release": release_name,
             "Drop Date": release.get("date"),
-            "Cluster": "Dynamic Mixture", 
+            "Cluster": cl_disp,
+            "Scenario": str(release.get("scenario") or "Base"),
             "2026 CY Volume": cy_total,
         })
         if artist_curve is not None:

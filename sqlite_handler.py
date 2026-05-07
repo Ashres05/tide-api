@@ -75,6 +75,20 @@ def ensure_expected_releases_fw_columns(conn: sqlite3.Connection) -> None:
             if "duplicate column" not in str(e).lower():
                 raise
 
+    # CLUSTER=0 was historically the API default while the field was unused; NULL means
+    # "auto" (computed mixture). One-time bump of user_version avoids re-running.
+    cur.execute("PRAGMA user_version")
+    _uv_row = cur.fetchone()
+    user_ver = int(_uv_row[0]) if _uv_row and _uv_row[0] is not None else 0
+    if user_ver < 2:
+        try:
+            cur.execute(
+                "UPDATE EXPECTED_RELEASES SET CLUSTER = NULL WHERE CLUSTER = 0"
+            )
+        except sqlite3.OperationalError:
+            pass
+        cur.execute("PRAGMA user_version = 2")
+
 
 def _chunked(values: list[str], size: int) -> list[list[str]]:
     return [values[i:i + size] for i in range(0, len(values), size)]

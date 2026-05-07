@@ -1153,6 +1153,10 @@ def train_artifacts_main(*, csv_only: bool = False) -> None:
                     sanity_peak_volume=None,
                     sanity_peak_week=None,
                     sanity_genre=None,
+                    # AE panel metrics keep using the hardcoded global
+                    # ARCHETYPE_SCENARIO_MULTIPLIERS table; only worldwide_streams
+                    # learns its own empirical Bear/Base/Bull table.
+                    compute_scenario_multipliers=False,
                 )
                 train_archetype_model(archetype_args)
             logger.info("Wrote archetype artifacts to %s", archetypes_base)
@@ -1194,6 +1198,10 @@ def train_artifacts_main(*, csv_only: bool = False) -> None:
                 sanity_peak_volume=None,
                 sanity_peak_week=None,
                 sanity_genre=None,
+                # worldwide_streams is the only metric that learns its own
+                # Bear/Base/Bull table natively. AE panel metrics continue to
+                # rely on the hardcoded ARCHETYPE_SCENARIO_MULTIPLIERS values.
+                compute_scenario_multipliers=True,
             )
             train_archetype_model(archetype_args)
             logger.info("Wrote worldwide_streams archetype artifacts to %s", out_dir)

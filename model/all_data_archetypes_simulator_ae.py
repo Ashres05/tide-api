@@ -31,6 +31,41 @@ def gamma_norm(t: np.ndarray, a: float, t_peak: float) -> np.ndarray:
     return (ratio**a) * np.exp(-a * (ratio - 1.0))
 
 
+# Bear/Base/Bull shape scaling relative to Base per trained archetype cluster (0..3).
+# Used as a multiplier on each cluster's gamma_norm contribution; Base => ratio 1.0.
+ARCHETYPE_SCENARIO_MULTIPLIERS: Dict[int, Dict[str, float]] = {
+    0: {"Bear": 3.35, "Base": 6.20, "Bull": 7.72},
+    1: {"Bear": 2.68, "Base": 4.34, "Bull": 5.14},
+    2: {"Bear": 3.20, "Base": 5.68, "Bull": 6.73},
+    3: {"Bear": 6.74, "Base": 10.85, "Bull": 13.14},
+}
+
+
+def normalize_archetype_scenario_label(scenario: Optional[str]) -> str:
+    if scenario is None or not str(scenario).strip():
+        return "Base"
+    key = str(scenario).strip().lower()
+    if key == "bear":
+        return "Bear"
+    if key == "bull":
+        return "Bull"
+    if key == "base":
+        return "Base"
+    return "Base"
+
+
+def archetype_scenario_shape_ratio(cluster_id: int, scenario: Optional[str]) -> float:
+    """Scale normalized decay shape vs Base for this cluster (1.0 when scenario is Base)."""
+    scen = normalize_archetype_scenario_label(scenario)
+    row = ARCHETYPE_SCENARIO_MULTIPLIERS.get(int(cluster_id))
+    if not row:
+        return 1.0
+    base = float(row.get("Base", 0.0))
+    if base <= 0:
+        return 1.0
+    return float(row.get(scen, base)) / base
+
+
 def extract_main_genre(genre_val: Any) -> str:
     """
     Extract the "MAIN_GENRE" from the GENRES JSON blob.
@@ -492,6 +527,104 @@ def slice_forecast_output(
     return pred2, summary
 
 
+def compute_scenario_multipliers(
+    df: pd.DataFrame,
+    features_with_clusters: pd.DataFrame,
+    *,
+    mature_weeks: int = 52,
+    bear_pct: float = 0.20,
+    base_pct: float = 0.50,
+    bull_pct: float = 0.80,
+) -> Dict[str, Dict[str, float]]:
+    """Compute empirical Bear/Base/Bull multipliers per Archetype_Cluster.
+
+    For every release that has been observed for at least ``mature_weeks`` weeks,
+    we compute its empirical lifecycle multiplier as
+
+        empirical_multiplier = sum(TARGET_METRIC over weeks 1..mature_weeks)
+                               / peak_volume_obs
+
+    i.e. the cumulative volume in the first ``mature_weeks`` expressed in units
+    of the release's observed peak. Per ``Archetype_Cluster`` we then take the
+    {bear_pct, base_pct, bull_pct} percentiles (defaults 20/50/80) of that
+    distribution. The resulting nested dict is metric-specific (e.g. it will
+    differ between worldwide_streams and product_sales artifacts) and is
+    consumed downstream as a post-fit shock anchored to the Base percentile
+    (so the asymptotic floor is never disturbed by scenario choice).
+
+    Returns a dict shaped like::
+
+        {
+            "0": {"Bear": ..., "Base": ..., "Bull": ...},
+            "1": {"Bear": ..., "Base": ..., "Bull": ...},
+            ...
+        }
+
+    Clusters with insufficient mature releases (<2 samples) are omitted; callers
+    should fall back to a global table when that happens.
+    """
+    if "week" not in df.columns or "TARGET_METRIC" not in df.columns:
+        raise ValueError(
+            "compute_scenario_multipliers requires 'week' and 'TARGET_METRIC' "
+            "columns on df (run compute_week_index first)."
+        )
+
+    needed = {"MRELG_ID", "Archetype_Cluster", "peak_volume_obs"}
+    missing = needed - set(features_with_clusters.columns)
+    if missing:
+        raise ValueError(
+            f"compute_scenario_multipliers requires columns on features_with_clusters: "
+            f"{sorted(missing)} are missing."
+        )
+
+    max_week_per_release = (
+        df.groupby("MRELG_ID", sort=False)["week"].max().rename("max_observed_week")
+    )
+    mature_ids = max_week_per_release.index[max_week_per_release >= int(mature_weeks)]
+    if len(mature_ids) == 0:
+        return {}
+
+    df_mature = df[df["MRELG_ID"].isin(mature_ids) & (df["week"] <= int(mature_weeks))]
+    sum_to_horizon = (
+        df_mature.groupby("MRELG_ID", sort=False)["TARGET_METRIC"]
+        .sum()
+        .rename("sum_to_horizon")
+    )
+
+    feats = features_with_clusters[
+        ["MRELG_ID", "Archetype_Cluster", "peak_volume_obs"]
+    ].copy()
+    feats = feats.dropna(subset=["Archetype_Cluster", "peak_volume_obs"])
+    feats["Archetype_Cluster"] = feats["Archetype_Cluster"].astype(int)
+
+    merged = feats.merge(sum_to_horizon, on="MRELG_ID", how="inner")
+    merged = merged[
+        np.isfinite(merged["peak_volume_obs"]) & (merged["peak_volume_obs"] > 0)
+    ]
+    if merged.empty:
+        return {}
+
+    merged["empirical_multiplier"] = (
+        merged["sum_to_horizon"].astype(float) / merged["peak_volume_obs"].astype(float)
+    )
+    merged = merged[np.isfinite(merged["empirical_multiplier"])]
+    if merged.empty:
+        return {}
+
+    out: Dict[str, Dict[str, float]] = {}
+    for cluster_id, sub in merged.groupby("Archetype_Cluster", sort=True):
+        vals = sub["empirical_multiplier"].to_numpy(dtype=float)
+        if vals.size < 2:
+            continue
+        bear_v, base_v, bull_v = np.quantile(vals, [bear_pct, base_pct, bull_pct])
+        out[str(int(cluster_id))] = {
+            "Bear": float(bear_v),
+            "Base": float(base_v),
+            "Bull": float(bull_v),
+        }
+    return out
+
+
 @dataclass
 class SimulatorArtifacts:
     horizon_weeks: int
@@ -500,6 +633,13 @@ class SimulatorArtifacts:
     artist_cluster_probs: pd.DataFrame
     artist_genre_cluster_probs: Optional[pd.DataFrame] = None
     artist_release_history: Optional[pd.DataFrame] = None
+    # Empirical Bear/Base/Bull multipliers per Archetype_Cluster, learned from the
+    # training parquet for this metric (e.g. worldwide_streams). Keyed by
+    # str(cluster_id), inner keys "Bear" / "Base" / "Bull". Populated by train()
+    # via compute_scenario_multipliers and persisted as scenario_multipliers.json.
+    # When None (older artifacts), callers fall back to the hardcoded global
+    # ARCHETYPE_SCENARIO_MULTIPLIERS table.
+    scenario_multipliers: Optional[Dict[str, Dict[str, float]]] = None
 
 
 def resolve_peak_match_column(peak_match_on: str, hist: pd.DataFrame) -> str:
@@ -530,6 +670,8 @@ def simulate_future_drop(
     peak_sim_min_artist_releases: int = 20,
     peak_match_on: str = "trained_metric",
     peak_match_target: Optional[float] = None,
+    scenario: str = "Base",
+    archetype_cluster_id: Optional[int] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
     peak_match_target: optional volume used only for similar-peak subset selection (log-radius).
@@ -621,6 +763,14 @@ def simulate_future_drop(
                 artifacts.artist_cluster_probs["DISPLAY_ARTIST"] == artist
             ][["Archetype_Cluster", "prob"]].copy()
 
+    if archetype_cluster_id is not None:
+        c_ov = int(archetype_cluster_id)
+        if str(c_ov) not in artifacts.archetype_params:
+            raise ValueError(
+                f"archetype_cluster_id={c_ov} is not present in trained archetype parameters."
+            )
+        probs = pd.DataFrame({"Archetype_Cluster": [c_ov], "prob": [1.0]})
+
     if probs.empty:
         raise ValueError(f"No fitted archetype mixture available for artist={artist}, genre={genre}")
 
@@ -633,6 +783,7 @@ def simulate_future_drop(
         probs["prob"] = probs["prob"] / probs_sum
 
     # Generate the normalized curve
+    scen_lbl = normalize_archetype_scenario_label(scenario)
     y_norm = np.zeros_like(t, dtype=float)
     for _, row in probs.iterrows():
         c = int(row["Archetype_Cluster"])
@@ -641,7 +792,8 @@ def simulate_future_drop(
         if par is None:
             continue
         a = float(par["a"])
-        y_norm += p * gamma_norm(t, a=a, t_peak=peak_week)
+        r = archetype_scenario_shape_ratio(c, scen_lbl)
+        y_norm += p * r * gamma_norm(t, a=a, t_peak=peak_week)
 
     # ==========================================
     # --- UNIFIED ASYMPTOTIC FLOOR LOGIC ---
@@ -698,6 +850,8 @@ def simulate_future_drop(
         "peak_match_target": peak_match_target if peak_match_target is not None else peak_volume,
         "total_lifecycle_pred_streams": total_pred,
         "cluster_probs": probs.sort_values("prob", ascending=False)[["Archetype_Cluster", "prob"]].to_dict(orient="records"),
+        "scenario_applied": scen_lbl,
+        "archetype_cluster_override": archetype_cluster_id,
     }
     
     return out, summary
@@ -717,6 +871,8 @@ def simulate_future_drop_average(
     peak_sim_min_artist_releases: int = 20,
     peak_match_on: str = "trained_metric",
     peak_match_target: Optional[float] = None,
+    scenario: str = "Base",
+    archetype_cluster_id: Optional[int] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """Average simulated curves over multiple DISPLAY_ARTIST names."""
     if not artists:
@@ -750,6 +906,8 @@ def simulate_future_drop_average(
                 peak_sim_min_artist_releases=peak_sim_min_artist_releases,
                 peak_match_on=peak_match_on,
                 peak_match_target=peak_match_target,
+                scenario=scenario,
+                archetype_cluster_id=archetype_cluster_id,
             )
         except Exception as e:
             skipped.append({"artist": a, "reason": str(e)[:400]})
@@ -875,6 +1033,9 @@ def fit_backfill_forecast(
     peak_week_margin: int = 3,
     stream_floor: Optional[float] = None,
     mixture_fit_weight: float = 0.5,
+    scenario: str = "Base",
+    archetype_cluster_id: Optional[int] = None,
+    scenario_multiplier: float = 1.0,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
     Backfill + forecast:
@@ -884,6 +1045,12 @@ def fit_backfill_forecast(
     We fit the artist/genre mixture by estimating:
       - peak_week (t_peak) on a discrete grid
       - peak_volume (amplitude) by least squares scaling
+
+    Forecasting best practice: fitting and scenario shocks are strictly isolated.
+    The fit always reflects the Base trajectory and asymptotic floor. After the
+    boundary-aligned curve is built, ``scenario_multiplier`` scales the volume
+    *above the floor* for unobserved (future) weeks only — actuals and floor
+    are untouched.
     """
     horizon = int(artifacts.horizon_weeks)
     if end_week is None:
@@ -947,6 +1114,9 @@ def fit_backfill_forecast(
                 peak_week_margin=peak_week_margin,
                 stream_floor=stream_floor,
                 mixture_fit_weight=mixture_fit_weight,
+                scenario=scenario,
+                archetype_cluster_id=archetype_cluster_id,
+                scenario_multiplier=scenario_multiplier,
             )
             preds.append(pred_c["pred_weekly_streams"].to_numpy(dtype=float))
             summaries.append(summ_c)
@@ -966,6 +1136,9 @@ def fit_backfill_forecast(
             "fit_peak_volume": float(np.mean([s.get("fit_peak_volume") for s in summaries if "fit_peak_volume" in s])),
             "fit_sse": float(np.mean([s.get("fit_sse") for s in summaries if "fit_sse" in s])),
             "total_lifecycle_pred_streams": float(out["cumulative_pred_streams"].iloc[-1]),
+            "scenario_applied": normalize_archetype_scenario_label(scenario),
+            "archetype_cluster_override": archetype_cluster_id,
+            "scenario_multiplier": float(scenario_multiplier),
         }
         return out, summary
 
@@ -989,6 +1162,14 @@ def fit_backfill_forecast(
         raise ValueError(f"No archetype mixture found for artist={artist_canon}, genre={genre}")
 
     probs_df["Archetype_Cluster"] = probs_df["Archetype_Cluster"].astype(int)
+
+    if archetype_cluster_id is not None:
+        c_ov = int(archetype_cluster_id)
+        if str(c_ov) not in artifacts.archetype_params:
+            raise ValueError(
+                f"archetype_cluster_id={c_ov} is not in trained archetype parameters."
+            )
+        probs_df = pd.DataFrame({"Archetype_Cluster": [c_ov], "prob": [1.0]})
 
     # Pull 'a' for each cluster we will use in gamma_norm.
     cluster_a: Dict[int, float] = {}
@@ -1059,11 +1240,14 @@ def fit_backfill_forecast(
     #  - fit the mixture weights p across clusters to match the *normalized shape*
     #  - estimate peak_volume via least squares scaling
     #  - score error (log-space by default) on the original scale
+    scen_fit = normalize_archetype_scenario_label(scenario)
     for t_peak in range(lo, hi + 1):
         # G[t, j] = gamma_norm(week_t; a_j, t_peak)
         G = np.zeros((k, C), dtype=float)
         for j, a in enumerate(a_list):
-            G[:, j] = gamma_norm(t_obs, a=a, t_peak=float(t_peak))
+            c_id = cluster_ids[j]
+            rj = archetype_scenario_shape_ratio(c_id, scen_fit)
+            G[:, j] = gamma_norm(t_obs, a=a, t_peak=float(t_peak)) * rj
 
         # Fit non-negative mixture weights to match the normalized target curve.
         # NNLS can hit iteration limits for some candidate peak-week settings,
@@ -1108,7 +1292,9 @@ def fit_backfill_forecast(
         # Analytically calculate the scaling factor (amplitude) for the default curve
         G_fallback = np.zeros((k, C), dtype=float)
         for j, a in enumerate(a_list):
-            G_fallback[:, j] = gamma_norm(t_obs, a=a, t_peak=float(observed_peak_week))
+            c_id = cluster_ids[j]
+            rj = archetype_scenario_shape_ratio(c_id, scen_fit)
+            G_fallback[:, j] = gamma_norm(t_obs, a=a, t_peak=float(observed_peak_week)) * rj
             
         y_norm_fallback = G_fallback @ best_p
         denom = float(np.sum(y_norm_fallback * y_norm_fallback))
@@ -1122,7 +1308,9 @@ def fit_backfill_forecast(
     t_full = np.arange(1, end_week + 1, dtype=float)
     G_full = np.zeros((len(t_full), C), dtype=float)
     for j, a in enumerate(a_list):
-        G_full[:, j] = gamma_norm(t_full, a=a, t_peak=float(best["t_peak"]))
+        c_id = cluster_ids[j]
+        rj = archetype_scenario_shape_ratio(c_id, scen_fit)
+        G_full[:, j] = gamma_norm(t_full, a=a, t_peak=float(best["t_peak"])) * rj
 
     # best_p is the mixture weights used for the observed fit (already regularized).
     #y_norm_full = G_full @ best_p
@@ -1195,6 +1383,18 @@ def fit_backfill_forecast(
             y_pred_full = np.clip(y_pred_full * scale, 0, None)
             best_peak_volume_scaled = float(best["peak_volume"] * scale)
 
+    # --- APPLY SCENARIO SHOCK (Future Weeks Only) ---
+    # The fit above is deliberately scenario-free so that the trajectory and
+    # asymptotic floor reflect the Base reality of the actuals. Bear/Bull
+    # scenarios are layered in here as a multiplicative shock on the volume
+    # *above the floor* for unobserved weeks K+1..end_week. Observed weeks
+    # (and the floor itself) are left untouched, preserving boundary
+    # continuity at week K and the empirical retention floor.
+    if scenario_multiplier != 1.0:
+        future_above_floor = y_pred_full[k:] - dynamic_floor
+        future_above_floor = np.clip(future_above_floor, 0, None)
+        y_pred_full[k:] = dynamic_floor + (future_above_floor * scenario_multiplier)
+
     # Backfill actuals for observed weeks
     y_out = y_pred_full.copy()
     y_out[:k] = y_obs
@@ -1210,6 +1410,9 @@ def fit_backfill_forecast(
         "fit_peak_volume": best_peak_volume_scaled,
         "fit_sse": best["sse"],
         "total_lifecycle_pred_streams": float(out["cumulative_pred_streams"].iloc[-1]),
+        "scenario_applied": scen_fit,
+        "archetype_cluster_override": archetype_cluster_id,
+        "scenario_multiplier": float(scenario_multiplier),
     }
     return out, summary
 
@@ -1226,8 +1429,14 @@ def fit_backfill_forecast_average(
     peak_week_margin: int = 3,
     stream_floor: Optional[float] = None,
     mixture_fit_weight: float = 0.5,
+    scenario_multiplier: float = 1.0,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """Average backfill+forecast curves over multiple DISPLAY_ARTIST names."""
+    """Average backfill+forecast curves over multiple DISPLAY_ARTIST names.
+
+    ``scenario_multiplier`` is forwarded to each per-artist fit and applied as a
+    post-fit Bear/Bull shock to the future portion of the curve relative to the
+    asymptotic floor. The fit itself is always scenario-free.
+    """
     if not artists:
         raise ValueError("artists list is empty")
 
@@ -1257,6 +1466,7 @@ def fit_backfill_forecast_average(
                 fit_logspace=fit_logspace,
                 peak_week_margin=peak_week_margin,
                 mixture_fit_weight=mixture_fit_weight,
+                scenario_multiplier=scenario_multiplier,
             )
         except Exception as e:
             skipped.append({"artist": a, "reason": str(e)[:400]})
@@ -1299,6 +1509,7 @@ def fit_backfill_forecast_average(
         "fit_peak_volume": float(np.mean([s.get("fit_peak_volume", np.nan) for s in summaries])),
         "fit_sse": float(np.mean([s.get("fit_sse", np.nan) for s in summaries])),
         "total_lifecycle_pred_streams": float(out["cumulative_pred_streams"].iloc[-1]),
+        "scenario_multiplier": float(scenario_multiplier),
     }
     return out, summary
 
@@ -1545,6 +1756,7 @@ def save_artifacts(
     artist_cluster_probs: pd.DataFrame,
     artist_genre_cluster_probs: Optional[pd.DataFrame] = None,
     artist_release_history: Optional[pd.DataFrame] = None,
+    scenario_multipliers: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> None:
     os.makedirs(out_dir, exist_ok=True)
 
@@ -1559,6 +1771,15 @@ def save_artifacts(
 
     if artist_release_history is not None:
         artist_release_history.to_parquet(os.path.join(out_dir, "artist_release_history.parquet"), index=False)
+
+    if scenario_multipliers:
+        # Per-cluster empirical Bear/Base/Bull multipliers for this metric.
+        # Consumed by upstream callers as a post-fit shock; absence is fine and
+        # falls back to the hardcoded global table.
+        with open(
+            os.path.join(out_dir, "scenario_multipliers.json"), "w", encoding="utf-8"
+        ) as f:
+            json.dump(scenario_multipliers, f, ensure_ascii=False, indent=2)
 
 
 def load_artifacts(out_dir: str) -> SimulatorArtifacts:
@@ -1583,6 +1804,33 @@ def load_artifacts(out_dir: str) -> SimulatorArtifacts:
     else:
         artist_release_history = None
 
+    scenario_path = os.path.join(out_dir, "scenario_multipliers.json")
+    scenario_multipliers: Optional[Dict[str, Dict[str, float]]] = None
+    if os.path.exists(scenario_path):
+        try:
+            with open(scenario_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                # Coerce to the expected nested shape with str cluster keys and
+                # float values, ignoring anything malformed.
+                scenario_multipliers = {}
+                for c_key, mults in raw.items():
+                    if not isinstance(mults, dict):
+                        continue
+                    coerced: Dict[str, float] = {}
+                    for k in ("Bear", "Base", "Bull"):
+                        if k in mults:
+                            try:
+                                coerced[k] = float(mults[k])
+                            except (TypeError, ValueError):
+                                pass
+                    if coerced:
+                        scenario_multipliers[str(c_key)] = coerced
+                if not scenario_multipliers:
+                    scenario_multipliers = None
+        except (OSError, json.JSONDecodeError):
+            scenario_multipliers = None
+
     return SimulatorArtifacts(
         horizon_weeks=horizon_weeks,
         archetype_params=archetype_params,
@@ -1590,6 +1838,7 @@ def load_artifacts(out_dir: str) -> SimulatorArtifacts:
         artist_cluster_probs=artist_cluster_probs,
         artist_genre_cluster_probs=artist_genre_cluster_probs,
         artist_release_history=artist_release_history,
+        scenario_multipliers=scenario_multipliers,
     )
 
 
@@ -1648,6 +1897,43 @@ def train(args: argparse.Namespace) -> None:
         features_with_clusters = features_with_clusters.merge(ap, on="MRELG_ID", how="left")
     else:
         features_with_clusters["peak_album_equiv_obs"] = np.nan
+
+    # Empirical Bear/Base/Bull multipliers per cluster, computed natively from
+    # this metric's parquet. Scoped intentionally: this is opt-in via the
+    # ``compute_scenario_multipliers`` arg and is currently only enabled by
+    # train_marketshare_artifacts for the worldwide_streams metric. The AE
+    # panel metrics (streams / sales / songs) deliberately keep using the
+    # hardcoded global ARCHETYPE_SCENARIO_MULTIPLIERS table — those scenario
+    # numbers come from offline calibration against album-equivalents and
+    # we don't want to silently replace them.
+    if bool(getattr(args, "compute_scenario_multipliers", False)):
+        print(
+            f"Computing empirical scenario multipliers for metric={args.metric} "
+            "(52-week, p20/p50/p80)..."
+        )
+        scenario_multipliers = compute_scenario_multipliers(
+            df=df,
+            features_with_clusters=features_with_clusters,
+            mature_weeks=52,
+            bear_pct=0.20,
+            base_pct=0.50,
+            bull_pct=0.80,
+        )
+        if scenario_multipliers:
+            for cid in sorted(scenario_multipliers.keys()):
+                mults = scenario_multipliers[cid]
+                print(
+                    f"  cluster {cid}: Bear={mults['Bear']:.3f}, "
+                    f"Base={mults['Base']:.3f}, Bull={mults['Bull']:.3f}"
+                )
+        else:
+            print(
+                "  no clusters had >=2 mature (>=52wk) releases — "
+                "scenario_multipliers.json will not be written; downstream will "
+                "fall back to global ARCHETYPE_SCENARIO_MULTIPLIERS."
+            )
+    else:
+        scenario_multipliers = None
 
     print("Fitting archetype curve functions...")
     archetype_params = fit_archetype_curves(
@@ -1719,6 +2005,7 @@ def train(args: argparse.Namespace) -> None:
         artist_cluster_probs=artist_cluster_probs,
         artist_genre_cluster_probs=artist_genre_cluster_probs,
         artist_release_history=artist_release_history,
+        scenario_multipliers=scenario_multipliers,
     )
 
     # Quick sanity sim
@@ -2110,6 +2397,18 @@ def parse_args() -> argparse.Namespace:
     train_p.add_argument("--sanity-peak-volume", type=float, default=None)
     train_p.add_argument("--sanity-peak-week", type=float, default=None)
     train_p.add_argument("--sanity-genre", type=str, default=None)
+    train_p.add_argument(
+        "--compute-scenario-multipliers",
+        action="store_true",
+        default=False,
+        help=(
+            "Compute and persist empirical Bear/Base/Bull multipliers per cluster as "
+            "scenario_multipliers.json in --out-dir. Currently intended for "
+            "--metric worldwide_streams only; AE panel metrics (streaming_equivalent / "
+            "product_sales / song_sale_equivalent) deliberately keep using the hardcoded "
+            "global ARCHETYPE_SCENARIO_MULTIPLIERS table and should leave this off."
+        ),
+    )
 
     sim_p = sub.add_parser("simulate")
     sim_p.add_argument("--out-dir", type=str, default="archetypes_artifacts")
