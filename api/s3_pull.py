@@ -14,7 +14,7 @@ Scopes:
   - "archetypes_artifacts" model/archetypes_artifacts/** (decay artifacts; forecast serving)
 
 Convenience entry points:
-  - sync_serving_inputs_from_s3()   -> startup: db + artifacts_75k + archetypes
+  - sync_serving_inputs_from_s3()   -> startup: db + csvs + artifacts_75k + archetypes
   - sync_weekly_inputs_from_s3()    -> refresh_weekly start: db + csvs + artifacts_75k
   - sync_weekly_outputs_to_s3()     -> refresh_weekly end: db + csvs + artifacts_75k
   - sync_full_inputs_from_s3()      -> full refresh_data: all scopes
@@ -372,9 +372,9 @@ def sync_artifacts_to_s3_if_configured(
 # ---------------------------------------------------------------------------
 
 def sync_serving_inputs_from_s3() -> None:
-    """API startup: only artifacts needed for forecast serving (no training inputs)."""
+    """API startup: db + weekly CSVs + forecast artifacts (same CSVs refresh_weekly pulls first)."""
     sync_artifacts_from_s3_if_configured(
-        scopes={SCOPE_DB, SCOPE_ARTIFACTS_75K, SCOPE_ARCHETYPES},
+        scopes={SCOPE_DB, SCOPE_CSVS, SCOPE_ARTIFACTS_75K, SCOPE_ARCHETYPES},
     )
 
 

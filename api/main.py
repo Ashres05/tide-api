@@ -28,7 +28,7 @@ except ModuleNotFoundError:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """Pull only the artifacts needed for forecast serving (db + artifacts_75k + archetypes)."""
+    """Pull from S3: db, model/data/*.csv (e.g. Current_Data), artifacts_75k, archetypes."""
     from api.s3_pull import sync_serving_inputs_from_s3
 
     sync_serving_inputs_from_s3()
@@ -38,7 +38,7 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="Tide Marketshare API", version="1.1.0", lifespan=lifespan)
 # TODO: When a release is officially released but does not have a MRELG ID, give a warning to the user.
 
-# TODO (Phase 3): Move CSV/parquet/artifact storage to S3.
+# CSVs + artifacts: see api/s3_pull.sync_serving_inputs_from_s3 (startup) and refresh_weekly.
 # TODO (Phase 4): Drop the duplicate Prophet market-model fit in train_artifacts_main.
 # TODO: Fix a misalignment between current's marketshare and api marketshare.
 # TODO: Add a search feature for revenue.

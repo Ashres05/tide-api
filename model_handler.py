@@ -2814,6 +2814,13 @@ def _validate_date(date_value: str | None) -> str:
         s = date_value.isoformat()
     else:
         s = str(date_value).strip()
+        # Snowflake/SQLite often return "YYYY-MM-DD HH:MM:SS[.fff]"; global_streaming SQL only needs the day.
+        if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+            try:
+                datetime.strptime(s[:10], "%Y-%m-%d")
+                s = s[:10]
+            except ValueError:
+                pass
     try:
         datetime.strptime(s, "%Y-%m-%d")
     except ValueError as e:
@@ -2890,10 +2897,89 @@ def get_global_streaming_forecast(id: int, scenario: str = "Base") -> pd.DataFra
     return df
 
 
-def get_global_streaming_forecast_by_mrelg(
-    mrelg_id: str,
-    scenario: str = "Base",
-) -> pd.DataFrame:
+def _sqlite_fw_peak_for_mrelg(mrelg_id: str) -> float:
+    """
+    First-week stream / AE volume from EXPECTED_RELEASES for this MRELG.
+    Used as ``fw_streams_peak`` when the MRELG-driven path would otherwise pass 0,
+    so sparse or all-zero Snowflake weeks can still cold-start the decay fit.
+    """
+    key = (mrelg_id or "").strip()
+    if not key:
+        return 0.0
+    try:
+        with sqlite3.connect(DATABASE_NAME) as conn:
+            ensure_expected_releases_fw_columns(conn)
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT FW_STREAMS, EXPECTED_ALBUM_EQUIVALENT
+                FROM EXPECTED_RELEASES
+                WHERE MRELG_ID IS NOT NULL AND UPPER(TRIM(MRELG_ID)) = UPPER(?)
+                LIMIT 1
+                """,
+                (key,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return 0.0
+            fs = float(row["FW_STREAMS"] or 0) if row["FW_STREAMS"] is not None else 0.0
+            ae = (
+                float(row["EXPECTED_ALBUM_EQUIVALENT"] or 0)
+                if row["EXPECTED_ALBUM_EQUIVALENT"] is not None
+                else 0.0
+            )
+            return float(max(fs, ae, 0.0))
+    except sqlite3.Error as e:
+        logger.warning("sqlite fw_peak lookup failed for mrelg_id=%s: %s", key, e)
+        return 0.0
+    except (TypeError, ValueError) as e:
+        logger.warning("sqlite fw_peak parse failed for mrelg_id=%s: %s", key, e)
+        return 0.0
+
+
+def _sqlite_fw_peak_for_mrelg(mrelg_id: str) -> pd.DataFrame:
+    """
+    First-week stream / AE volume from EXPECTED_RELEASES for this MRELG.
+    Used as ``fw_streams_peak`` when the MRELG-driven path would otherwise pass 0,
+    so sparse or all-zero Snowflake weeks can still cold-start the decay fit.
+    """
+    key = (mrelg_id or "").strip()
+    if not key:
+        return 0.0
+    try:
+        with sqlite3.connect(DATABASE_NAME) as conn:
+            ensure_expected_releases_fw_columns(conn)
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT FW_STREAMS, EXPECTED_ALBUM_EQUIVALENT
+                FROM EXPECTED_RELEASES
+                WHERE MRELG_ID IS NOT NULL AND UPPER(TRIM(MRELG_ID)) = UPPER(?)
+                LIMIT 1
+                """,
+                (key,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return 0.0
+            fs = float(row["FW_STREAMS"] or 0) if row["FW_STREAMS"] is not None else 0.0
+            ae = (
+                float(row["EXPECTED_ALBUM_EQUIVALENT"] or 0)
+                if row["EXPECTED_ALBUM_EQUIVALENT"] is not None
+                else 0.0
+            )
+            return float(max(fs, ae, 0.0))
+    except sqlite3.Error as e:
+        logger.warning("sqlite fw_peak lookup failed for mrelg_id=%s: %s", key, e)
+        return 0.0
+    except (TypeError, ValueError) as e:
+        logger.warning("sqlite fw_peak parse failed for mrelg_id=%s: %s", key, e)
+        return 0.0
+
+
+def get_global_streaming_forecast_by_mrelg(mrelg_id: str) -> pd.DataFrame:
     """
     Returns a DataFrame of worldwide streaming forecasts for a given MRELG ID,
     independent of any local SQLite release record.
@@ -2902,6 +2988,10 @@ def get_global_streaming_forecast_by_mrelg(
     MARKETSHARE_SEARCH_SUMMARY table when available and falls back to a direct
     Snowflake lookup so previously unseen Luminate releases can still be
     forecast on demand.
+
+    When an EXPECTED_RELEASES row exists for this MRELG, ``FW_STREAMS`` and/or
+    ``EXPECTED_ALBUM_EQUIVALENT`` are passed through as the worldwide first-week
+    peak hint (same role as ``get_global_streaming_forecast`` for release_id).
 
     Output schema mirrors get_global_streaming_forecast (minus release_id):
     mrelg_id, artist, title, week, data_type, week_ending_date,
@@ -2917,19 +3007,17 @@ def get_global_streaming_forecast_by_mrelg(
     if not isinstance(mrelg_id, str) or not mrelg_id.strip():
         raise ValueError("mrelg_id is required.")
     mrelg_id = mrelg_id.strip()
-    scenario = _normalize_scenario_label(scenario)
 
     span: Dict[str, Any] = {}
     t_start = _now()
 
-    cached = _forecast_cache_lookup(mrelg_id, scenario)
+    cached = _forecast_cache_lookup(mrelg_id)
     if cached is not None:
         _perf_summary(
             span,
             endpoint="global_streaming_by_mrelg",
             t_start=t_start,
             mrelg_id=mrelg_id,
-            scenario=scenario,
             cache="hit",
             rows=len(cached),
         )
@@ -2953,30 +3041,30 @@ def get_global_streaming_forecast_by_mrelg(
                 metadata = _resolve_mrelg_metadata_snowflake(mrelg_id, sf)
 
         release_date = _validate_date(metadata.get("release_date"))
+        fw_peak = _sqlite_fw_peak_for_mrelg(mrelg_id)
         df = _build_global_streaming_forecast(
             mrelg_id=mrelg_id,
             release_date=release_date,
             artist=metadata.get("artist") or "",
             title=metadata.get("title") or "",
             genre=metadata.get("genre"),
-            fw_streams_peak=0.0,
+            fw_streams_peak=fw_peak,
             span=span,
             sf=sf,
-            scenario=scenario,
         )
 
-    _forecast_cache_store(mrelg_id, df, scenario)
+    _forecast_cache_store(mrelg_id, df)
 
     _perf_summary(
         span,
         endpoint="global_streaming_by_mrelg",
         t_start=t_start,
         mrelg_id=mrelg_id,
-        scenario=scenario,
         cache="miss",
         rows=len(df),
     )
     return df
+
 
 
 def get_daily_global_streams_by_mrelg(mrelg_id: str) -> pd.DataFrame:
@@ -3154,29 +3242,42 @@ def _build_global_streaming_forecast(
             with get_snowflake_connection() as _sf:
                 yield _sf
 
-    if hist_df is None:
-        with _phase("snowflake_streams_query") as info:
-            with _sf_session() as session:
+    with _phase("snowflake_streams_query") as info:
+        with _sf_session() as session:
+            try:
                 hist_df = _get_known_vols_global_streaming(mrelg_id, release_date, session)
-            info["rows"] = len(hist_df)
-    else:
-        with _phase("snowflake_streams_query_skipped") as info:
-            info["rows"] = len(hist_df)
-            info["reused"] = True
-
-    if hist_df.empty:
-        raise ValueError(f"No historical observed weeks found for mrelg_id: {mrelg_id}")
+            except ValueError as err:
+                msg = str(err)
+                if fw_streams_peak > 0 and "No global streaming data found" in msg:
+                    logger.info(
+                        "global_streaming: %s; using cold-start (fw_streams_peak=%s) for mrelg_id=%s",
+                        msg,
+                        fw_streams_peak,
+                        mrelg_id,
+                    )
+                    hist_df = pd.DataFrame()
+                else:
+                    raise
+        info["rows"] = len(hist_df)
 
     artifacts = get_worldwide_artifacts()
     horizon_weeks = int(artifacts.horizon_weeks)
 
     known: List[float] = []
-    stream_col = next(
-        (c for c in hist_df.columns if "stream" in c.lower()),
-        hist_df.columns[-1],
-    )
-    series = pd.to_numeric(hist_df[stream_col], errors="coerce").fillna(0.0)
-    known = series.tolist()
+    if hist_df.empty:
+        if fw_streams_peak <= 0:
+            raise ValueError(
+                f"No global streaming data in Snowflake for mrelg_id: {mrelg_id} "
+                f"on/after release_date {release_date!r}, and no first-week peak "
+                "(set FW_STREAMS / EXPECTED_ALBUM_EQUIVALENT on EXPECTED_RELEASES, or fix Snowflake access)."
+            )
+    else:
+        stream_col = next(
+            (c for c in hist_df.columns if "stream" in c.lower()),
+            hist_df.columns[-1],
+        )
+        series = pd.to_numeric(hist_df[stream_col], errors="coerce").fillna(0.0)
+        known = series.tolist()
     if len(known) > horizon_weeks:
         logger.info(
             "global_streaming: truncating observed weeks for mrelg_id=%s from %d to %d",
