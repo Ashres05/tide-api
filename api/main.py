@@ -393,6 +393,29 @@ def search_global_streaming(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/v1/revenue/search_global_streaming_singles")
+def search_global_streaming_singles(
+    artist: str = "",
+    title: str = "",
+    limit: int = 20,
+):
+    """
+    Search MARKETSHARE_SEARCH_SUMMARY_SINGLES for singles release groups given
+    free-text artist and title. Same response shape as
+    GET /v1/revenue/search_global_streaming. Pair with
+    GET /v1/revenue/global_streaming_singles_by_mrelg/{mrelg_id}.
+    """
+    try:
+        payload = model_handler.search_releases_by_artist_title_singles_json(
+            artist=artist, title=title, limit=limit
+        )
+        return Response(content=payload, media_type="application/json")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/v1/revenue/global_streaming_by_mrelg/{mrelg_id}")
 def global_streaming_by_mrelg(mrelg_id: str, scenario: str = "Base"):
     """
@@ -411,6 +434,30 @@ def global_streaming_by_mrelg(mrelg_id: str, scenario: str = "Base"):
     try:
         payload = model_handler.df_to_json(
             model_handler.get_global_streaming_forecast_by_mrelg(
+                mrelg_id, scenario=scenario
+            )
+        )
+        return Response(content=payload, media_type="application/json")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v1/revenue/global_streaming_singles_by_mrelg/{mrelg_id}")
+def global_streaming_singles_by_mrelg(mrelg_id: str, scenario: str = "Base"):
+    """
+    Observed + forecasted global weekly streams for a singles MRELG release group.
+    Uses worldwide_streams_singles archetype artifacts. Same JSON array shape as
+    GET /v1/revenue/global_streaming_by_mrelg/{mrelg_id}. Pair with
+    GET /v1/revenue/search_global_streaming_singles.
+
+    ``scenario`` ("Base" / "Bear" / "Bull"; default Base) applies the learned
+    post-fit shock from the singles archetype bundle.
+    """
+    try:
+        payload = model_handler.df_to_json(
+            model_handler.get_global_streaming_forecast_singles_by_mrelg(
                 mrelg_id, scenario=scenario
             )
         )

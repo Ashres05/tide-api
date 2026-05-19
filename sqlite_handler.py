@@ -21,6 +21,9 @@ CREATE_MARKETSHARE_RELEASE_METRICS_TABLE = 'create_marketshare_release_metrics.s
 CREATE_WEEKLY_MARKETSHARE_TABLE = 'create_weekly_marketshare_table.sql'
 CREATE_YTD_MARKETSHARE_TABLE = 'create_ytd_marketshare_table.sql'
 CREATE_MARKETSHARE_SEARCH_SUMMARY_TABLE = 'create_marketshare_search_summary_table.sql'
+CREATE_MARKETSHARE_SEARCH_SUMMARY_SINGLES_TABLE = (
+    'create_marketshare_search_summary_table_singles.sql'
+)
 CREATE_DAILY_GLOBAL_STREAMS_TABLE = 'create_daily_global_streams_table.sql'
 CREATE_MARKETSHARE_REVENUE_2025_TABLE = 'create_marketshare_revenue_2025_table.sql'
 
@@ -30,6 +33,7 @@ YTD_MARKETSHARE_QUERY = 'query_ytd_marketshare_query.sql'
 MARKETSHARE_RELEASE_METRICS_QUERY = 'query_marketshare_release_metrics.sql'
 EXPECTED_RELEASES_QUERY = 'release_get_all.sql'
 MARKETSHARE_SEARCH_SUMMARY_QUERY = 'query_marketshare_search_summary.sql'
+MARKETSHARE_SEARCH_SUMMARY_SINGLES_QUERY = 'query_marketshare_search_summary_singles.sql'
 DAILY_GLOBAL_STREAMING_SF_QUERY = 'query_daily_global_streaming.sql'
 DAILY_GLOBAL_STREAMS_SQLITE_QUERY = 'query_daily_global_streams_sqlite.sql'
 MARKETSHARE_REVENUE_2025_BY_MRELG_QUERY = 'query_marketshare_revenue_2025_by_mrelg.sql'
@@ -39,11 +43,13 @@ INSERT_WEEKLY_MARKETSHARE = 'insert_weekly_marketshare.sql'
 INSERT_YTD_MARKETSHARE = 'insert_ytd_marketshare.sql'
 INSERT_MARKETSHARE_RELEASE_METRICS = 'insert_marketshare_release_metrics.sql'
 INSERT_MARKETSHARE_SEARCH_SUMMARY = 'insert_marketshare_search_summary.sql'
+INSERT_MARKETSHARE_SEARCH_SUMMARY_SINGLES = 'insert_marketshare_search_summary_singles.sql'
 INSERT_DAILY_GLOBAL_STREAMS = 'insert_daily_global_streams.sql'
 INSERT_MARKETSHARE_REVENUE_2025 = 'insert_marketshare_revenue_2025.sql'
 
 # Delete queries
 DELETE_MARKETSHARE_SEARCH_SUMMARY = 'delete_marketshare_search_summary.sql'
+DELETE_MARKETSHARE_SEARCH_SUMMARY_SINGLES = 'delete_marketshare_search_summary_singles.sql'
 DELETE_MARKETSHARE_REVENUE_2025 = 'delete_marketshare_revenue_2025.sql'
 
 def ensure_expected_releases_fw_columns(conn: sqlite3.Connection) -> None:
@@ -154,6 +160,38 @@ def ensure_marketshare_search_summary_columns(conn: sqlite3.Connection) -> None:
     )
 
 
+def ensure_marketshare_search_summary_singles_columns(conn: sqlite3.Connection) -> None:
+    """
+    Online migration for the singles search-summary table. Same persisted
+    normalized columns and streams index as the album table.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name='MARKETSHARE_SEARCH_SUMMARY_SINGLES'"
+    )
+    if cur.fetchone() is None:
+        return
+
+    cur.execute("PRAGMA table_info(MARKETSHARE_SEARCH_SUMMARY_SINGLES)")
+    existing = {row[1] for row in cur.fetchall()}
+    for col in ("ARTIST_SEARCH", "TITLE_SEARCH"):
+        if col in existing:
+            continue
+        try:
+            cur.execute(
+                f"ALTER TABLE MARKETSHARE_SEARCH_SUMMARY_SINGLES ADD COLUMN {col} TEXT"
+            )
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                raise
+
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS IDX_MARKETSHARE_SEARCH_SUMMARY_SINGLES_STREAMS "
+        "ON MARKETSHARE_SEARCH_SUMMARY_SINGLES (DAILY_GLOBAL_STREAMS DESC)"
+    )
+
+
 def refresh_marketshare_search_summary() -> int:
     """
     Rebuild the MARKETSHARE_SEARCH_SUMMARY table from Snowflake.
@@ -234,6 +272,80 @@ def refresh_marketshare_search_summary() -> int:
         conn.commit()
 
     logger.info("sqlite_handler: MARKETSHARE_SEARCH_SUMMARY rebuilt (rows=%d)", len(rows))
+    return len(rows)
+
+
+def refresh_marketshare_search_summary_singles() -> int:
+    """
+    Rebuild MARKETSHARE_SEARCH_SUMMARY_SINGLES from Snowflake
+    (query_marketshare_search_summary_singles.sql). Full replace on each run.
+    """
+    logger.info(
+        "sqlite_handler: refreshing MARKETSHARE_SEARCH_SUMMARY_SINGLES (db=%s)",
+        DATABASE_NAME,
+    )
+
+    with get_snowflake_connection() as sf:
+        df = sf.query(load_sql(MARKETSHARE_SEARCH_SUMMARY_SINGLES_QUERY))
+
+    df = df.rename(columns=str.upper) if not df.empty else df
+    logger.info("sqlite_handler: Snowflake singles search summary rows=%d", len(df))
+
+    column_map = {
+        'MRELG_ID': 'MRELG_ID',
+        'TITLE': 'TITLE',
+        'ARTIST': 'ARTIST',
+        'LABEL': 'LABEL_NAME',
+        'RELEASE_DATE': 'RELEASE_DATE',
+        'GENRE': 'GENRE',
+        'DAILY_STREAMS': 'DAILY_GLOBAL_STREAMS',
+    }
+    target_cols = [
+        'MRELG_ID', 'TITLE', 'ARTIST', 'LABEL_NAME', 'RELEASE_DATE', 'GENRE',
+        'DAILY_GLOBAL_STREAMS', 'ARTIST_SEARCH', 'TITLE_SEARCH',
+    ]
+
+    if not df.empty:
+        for src in column_map:
+            if src not in df.columns:
+                df[src] = None
+        df = df.rename(columns=column_map)
+
+        if "RELEASE_DATE" in df.columns:
+            df["RELEASE_DATE"] = df["RELEASE_DATE"].astype(str)
+
+        if "DAILY_GLOBAL_STREAMS" in df.columns:
+            streams = pd.to_numeric(df["DAILY_GLOBAL_STREAMS"], errors="coerce")
+            streams = streams.replace([float("inf"), float("-inf")], pd.NA).fillna(0)
+            df["DAILY_GLOBAL_STREAMS"] = streams.astype("int64")
+
+        for col in ("MRELG_ID", "TITLE", "ARTIST", "PARENT_NAME", "LABEL_NAME", "GENRE"):
+            if col in df.columns:
+                df[col] = df[col].astype(object).where(df[col].notna(), None)
+
+        df = df.loc[df["MRELG_ID"].astype(str).str.strip() != ""].copy()
+
+        df["ARTIST_SEARCH"] = df["ARTIST"].map(normalize_search_text)
+        df["TITLE_SEARCH"] = df["TITLE"].map(normalize_search_text)
+
+    rows = (
+        list(df[target_cols].itertuples(index=False, name=None))
+        if not df.empty
+        else []
+    )
+
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(load_sql(CREATE_MARKETSHARE_SEARCH_SUMMARY_SINGLES_TABLE))
+        ensure_marketshare_search_summary_singles_columns(conn)
+        cursor.execute(load_sql(DELETE_MARKETSHARE_SEARCH_SUMMARY_SINGLES))
+        if rows:
+            cursor.executemany(load_sql(INSERT_MARKETSHARE_SEARCH_SUMMARY_SINGLES), rows)
+        conn.commit()
+
+    logger.info(
+        "sqlite_handler: MARKETSHARE_SEARCH_SUMMARY_SINGLES rebuilt (rows=%d)", len(rows)
+    )
     return len(rows)
 
 
@@ -497,6 +609,11 @@ def update_sqlite_main() -> None:
         refresh_marketshare_search_summary()
     except Exception as e:
         logger.exception("sqlite_handler: search summary refresh failed: %s", e)
+
+    try:
+        refresh_marketshare_search_summary_singles()
+    except Exception as e:
+        logger.exception("sqlite_handler: singles search summary refresh failed: %s", e)
 
     logger.info("sqlite_handler: refresh complete")
 

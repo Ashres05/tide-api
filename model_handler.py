@@ -20,6 +20,7 @@ from sqlite_handler import (
     DATABASE_NAME,
     ensure_expected_releases_fw_columns,
     refresh_marketshare_search_summary,
+    refresh_marketshare_search_summary_singles,
 )
 from search_text import normalize_search_text
 import marketshare_from_csv
@@ -70,11 +71,18 @@ _ARCHETYPES_BASE = Path(__file__).resolve().parent / "model" / "archetypes_artif
 ARCHETYPES_STREAMS_DIR = _ARCHETYPES_BASE / "streams"
 ARCHETYPES_SALES_DIR   = _ARCHETYPES_BASE / "sales"
 ARCHETYPES_SONGS_DIR   = _ARCHETYPES_BASE / "songs"
-ARCHETYPES_WORLDWIDE_STREAMS_DIR   = _ARCHETYPES_BASE / "worldwide_streams"
+ARCHETYPES_WORLDWIDE_STREAMS_DIR = _ARCHETYPES_BASE / "worldwide_streams"
+ARCHETYPES_WORLDWIDE_STREAMS_SINGLES_DIR = _ARCHETYPES_BASE / "worldwide_streams_singles"
+
+# Forecast cache product discriminator (album vs single archetype bundles).
+_WORLDWIDE_STREAMING_PRODUCT_ALBUM = "album"
+_WORLDWIDE_STREAMING_PRODUCT_SINGLE = "single"
 
 
 # SQLite table name for observed per-release metrics (populated by sqlite_handler.py)
 MARKETSHARE_RELEASE_METRICS_TABLE = "MARKETSHARE_RELEASE_METRICS"
+MARKETSHARE_SEARCH_SUMMARY_TABLE = "MARKETSHARE_SEARCH_SUMMARY"
+MARKETSHARE_SEARCH_SUMMARY_SINGLES_TABLE = "MARKETSHARE_SEARCH_SUMMARY_SINGLES"
 
 # Query names for the database.
 RELEASE_CREATE_QUERY = "release_create.sql"
@@ -132,6 +140,7 @@ _ALLOWED_SCENARIOS = frozenset[str]({"Bear", "Base", "Bull"})
 
 GLOBAL_FORECAST_ENGINE = None
 GLOBAL_WORLDWIDE_ARTIFACTS = None
+GLOBAL_WORLDWIDE_SINGLES_ARTIFACTS = None
 GLOBAL_1M_FORECASTER = None
 
 # Default: catalog decay forecaster artifact in S3 (override with TIDE_CATALOG_DECAY_MODEL_S3_URI).
@@ -1148,19 +1157,34 @@ def _normalize_scenario_label(scenario: Optional[str]) -> str:
     return "Base"
 
 
-def _forecast_cache_key(mrelg_id: str, scenario: str = "Base") -> Tuple[str, str, str]:
+def _forecast_cache_key(
+    mrelg_id: str,
+    scenario: str = "Base",
+    *,
+    product: str = _WORLDWIDE_STREAMING_PRODUCT_ALBUM,
+) -> Tuple[str, str, str, str]:
     # Bind to the calendar date so refreshed Snowflake data is picked up the
     # next day even if the worker has not been restarted; the TTL still
     # guards against same-day invalidation if the daily snapshot changes.
     # Scenario is part of the key because Bear / Base / Bull return materially
     # different forecast frames for the same release on the same day.
-    return (mrelg_id, _normalize_scenario_label(scenario), date.today().isoformat())
+    # Product separates album vs singles archetype bundles when both endpoints
+    # share the same mrelg_id key space (defensive; Luminate MRELGs are unique).
+    return (
+        product,
+        mrelg_id,
+        _normalize_scenario_label(scenario),
+        date.today().isoformat(),
+    )
 
 
 def _forecast_cache_lookup(
-    mrelg_id: str, scenario: str = "Base"
+    mrelg_id: str,
+    scenario: str = "Base",
+    *,
+    product: str = _WORLDWIDE_STREAMING_PRODUCT_ALBUM,
 ) -> Optional[pd.DataFrame]:
-    key = _forecast_cache_key(mrelg_id, scenario)
+    key = _forecast_cache_key(mrelg_id, scenario, product=product)
     with _FORECAST_CACHE_LOCK:
         entry = _FORECAST_CACHE.get(key)
         if entry is None:
@@ -1173,11 +1197,15 @@ def _forecast_cache_lookup(
 
 
 def _forecast_cache_store(
-    mrelg_id: str, df: pd.DataFrame, scenario: str = "Base"
+    mrelg_id: str,
+    df: pd.DataFrame,
+    scenario: str = "Base",
+    *,
+    product: str = _WORLDWIDE_STREAMING_PRODUCT_ALBUM,
 ) -> None:
     if df is None or df.empty:
         return
-    key = _forecast_cache_key(mrelg_id, scenario)
+    key = _forecast_cache_key(mrelg_id, scenario, product=product)
     with _FORECAST_CACHE_LOCK:
         _FORECAST_CACHE[key] = (time.time(), df.copy())
         # Cheap LRU-ish eviction: drop the oldest entries beyond the cap.
@@ -1367,18 +1395,50 @@ def get_engine():
     return GLOBAL_FORECAST_ENGINE
 
 
+def _worldwide_streams_artifacts_dir(*, singles: bool) -> Path:
+    """Resolve on-disk archetype bundle directory (album or singles)."""
+    if singles:
+        override = os.environ.get("TIDE_WORLDWIDE_STREAMS_SINGLES_ARTIFACTS_DIR", "").strip()
+        if override:
+            return Path(override).expanduser().resolve()
+        return ARCHETYPES_WORLDWIDE_STREAMS_SINGLES_DIR
+    override = os.environ.get("TIDE_WORLDWIDE_STREAMS_ARTIFACTS_DIR", "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    return ARCHETYPES_WORLDWIDE_STREAMS_DIR
+
+
 def get_worldwide_artifacts():
-    """Loads worldwide-streams archetype artifacts once and returns them."""
+    """Loads album worldwide-streams archetype artifacts once and returns them."""
     global GLOBAL_WORLDWIDE_ARTIFACTS
     if GLOBAL_WORLDWIDE_ARTIFACTS is None:
         from model.all_data_archetypes_simulator_ae import load_artifacts
-        if not ARCHETYPES_WORLDWIDE_STREAMS_DIR.exists():
+
+        artifact_dir = _worldwide_streams_artifacts_dir(singles=False)
+        if not artifact_dir.exists():
             raise FileNotFoundError(
-                f"Worldwide streams artifacts not found at {ARCHETYPES_WORLDWIDE_STREAMS_DIR}. "
+                f"Worldwide streams artifacts not found at {artifact_dir}. "
                 "Run training with --metric worldwide_streams first."
             )
-        GLOBAL_WORLDWIDE_ARTIFACTS = load_artifacts(str(ARCHETYPES_WORLDWIDE_STREAMS_DIR))
+        GLOBAL_WORLDWIDE_ARTIFACTS = load_artifacts(str(artifact_dir))
     return GLOBAL_WORLDWIDE_ARTIFACTS
+
+
+def get_worldwide_singles_artifacts():
+    """Loads singles worldwide-streams archetype artifacts once and returns them."""
+    global GLOBAL_WORLDWIDE_SINGLES_ARTIFACTS
+    if GLOBAL_WORLDWIDE_SINGLES_ARTIFACTS is None:
+        from model.all_data_archetypes_simulator_ae import load_artifacts
+
+        artifact_dir = _worldwide_streams_artifacts_dir(singles=True)
+        if not artifact_dir.exists():
+            raise FileNotFoundError(
+                f"Worldwide streams (singles) artifacts not found at {artifact_dir}. "
+                "Sync from s3://parquetgarage/model/worldwide_streams_singles/ or set "
+                "TIDE_WORLDWIDE_STREAMS_SINGLES_ARTIFACTS_DIR."
+            )
+        GLOBAL_WORLDWIDE_SINGLES_ARTIFACTS = load_artifacts(str(artifact_dir))
+    return GLOBAL_WORLDWIDE_SINGLES_ARTIFACTS
 
 
 def create_release(
@@ -1837,6 +1897,8 @@ def _fetch_search_candidates(
     artist_norm: str,
     title_norm: str,
     span: Dict[str, Any],
+    search_table: str = MARKETSHARE_SEARCH_SUMMARY_TABLE,
+    endpoint: str = "search_global_streaming",
 ) -> List[sqlite3.Row]:
     """
     Two-stage retrieval: SQL prefilter on indexed normalized text columns to
@@ -1854,7 +1916,7 @@ def _fetch_search_candidates(
     fetch_sql = (
         "SELECT MRELG_ID, TITLE, ARTIST, LABEL_NAME, RELEASE_DATE, GENRE, "
         "DAILY_GLOBAL_STREAMS, ARTIST_SEARCH, TITLE_SEARCH "
-        "FROM MARKETSHARE_SEARCH_SUMMARY"
+        f"FROM {search_table}"
     )
 
     try:
@@ -1862,7 +1924,9 @@ def _fetch_search_candidates(
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
 
-            normalized_columns_present = _has_normalized_search_columns(cur)
+            normalized_columns_present = _has_normalized_search_columns(
+                cur, search_table
+            )
 
             if not normalized_columns_present:
                 # Legacy schema: fall back to the original full-table fetch so
@@ -1871,12 +1935,12 @@ def _fetch_search_candidates(
                 with _perf_phase(
                     span,
                     "db_fetch",
-                    endpoint="search_global_streaming",
+                    endpoint=endpoint,
                     mode="full_scan_legacy",
                 ) as info:
                     cur.execute(
-                        "SELECT MRELG_ID, TITLE, ARTIST, LABEL_NAME, RELEASE_DATE, "
-                        "GENRE, DAILY_GLOBAL_STREAMS FROM MARKETSHARE_SEARCH_SUMMARY"
+                        f"SELECT MRELG_ID, TITLE, ARTIST, LABEL_NAME, RELEASE_DATE, "
+                        f"GENRE, DAILY_GLOBAL_STREAMS FROM {search_table}"
                     )
                     rows = cur.fetchall()
                     info["rows"] = len(rows)
@@ -1899,7 +1963,7 @@ def _fetch_search_candidates(
                 with _perf_phase(
                     span,
                     "db_fetch",
-                    endpoint="search_global_streaming",
+                    endpoint=endpoint,
                     mode="prefilter",
                 ) as info:
                     info["tokens"] = len(tokens)
@@ -1915,7 +1979,7 @@ def _fetch_search_candidates(
             with _perf_phase(
                 span,
                 "db_fetch",
-                endpoint="search_global_streaming",
+                endpoint=endpoint,
                 mode="topk_no_tokens",
             ) as info:
                 cur.execute(
@@ -1926,13 +1990,17 @@ def _fetch_search_candidates(
                 info["rows"] = len(rows)
             return rows
     except sqlite3.Error as e:
-        raise sqlite3.Error(f"Error querying MARKETSHARE_SEARCH_SUMMARY: {e}") from e
+        raise sqlite3.Error(f"Error querying {search_table}: {e}") from e
 
 
 _HAS_NORMALIZED_SEARCH_COLUMNS: Optional[bool] = None
+_HAS_NORMALIZED_SEARCH_COLUMNS_BY_TABLE: Dict[str, bool] = {}
 
 
-def _has_normalized_search_columns(cur: sqlite3.Cursor) -> bool:
+def _has_normalized_search_columns(
+    cur: sqlite3.Cursor,
+    table: str = MARKETSHARE_SEARCH_SUMMARY_TABLE,
+) -> bool:
     """
     Cache whether the local SQLite schema has the persisted search columns
     AND whether they have been populated. The column check runs once per
@@ -1943,19 +2011,25 @@ def _has_normalized_search_columns(cur: sqlite3.Cursor) -> bool:
     columns and returning empty results).
     """
     global _HAS_NORMALIZED_SEARCH_COLUMNS
-    if _HAS_NORMALIZED_SEARCH_COLUMNS is True:
+    cached = _HAS_NORMALIZED_SEARCH_COLUMNS_BY_TABLE.get(table)
+    if cached is True:
         return True
-    cur.execute("PRAGMA table_info(MARKETSHARE_SEARCH_SUMMARY)")
+    if table == MARKETSHARE_SEARCH_SUMMARY_TABLE and _HAS_NORMALIZED_SEARCH_COLUMNS is True:
+        return True
+    cur.execute(f"PRAGMA table_info({table})")
     cols = {row[1] for row in cur.fetchall()}
     if "ARTIST_SEARCH" not in cols or "TITLE_SEARCH" not in cols:
-        _HAS_NORMALIZED_SEARCH_COLUMNS = False
+        _HAS_NORMALIZED_SEARCH_COLUMNS_BY_TABLE[table] = False
+        if table == MARKETSHARE_SEARCH_SUMMARY_TABLE:
+            _HAS_NORMALIZED_SEARCH_COLUMNS = False
         return False
     cur.execute(
-        "SELECT 1 FROM MARKETSHARE_SEARCH_SUMMARY "
+        f"SELECT 1 FROM {table} "
         "WHERE ARTIST_SEARCH IS NOT NULL OR TITLE_SEARCH IS NOT NULL LIMIT 1"
     )
     populated = cur.fetchone() is not None
-    if populated:
+    _HAS_NORMALIZED_SEARCH_COLUMNS_BY_TABLE[table] = populated
+    if populated and table == MARKETSHARE_SEARCH_SUMMARY_TABLE:
         _HAS_NORMALIZED_SEARCH_COLUMNS = True
     return populated
 
@@ -1964,10 +2038,13 @@ def search_releases_by_artist_title(
     artist: str,
     title: str,
     limit: int = _SEARCH_DEFAULT_LIMIT,
+    *,
+    search_table: str = MARKETSHARE_SEARCH_SUMMARY_TABLE,
+    endpoint: str = "search_global_streaming",
 ) -> List[Dict[str, Any]]:
     """
-    Search the MARKETSHARE_SEARCH_SUMMARY table for the best-matching
-    Luminate release groups given a free-text artist and album title.
+    Search a MARKETSHARE_SEARCH_SUMMARY* table for the best-matching
+    Luminate release groups given a free-text artist and title.
 
     Ranking: combined_score = TEXT_WEIGHT * text_score + STREAM_WEIGHT *
     popularity_score, where text_score is a fuzzy match on artist+title
@@ -2008,13 +2085,15 @@ def search_releases_by_artist_title(
         artist_norm=artist_norm,
         title_norm=title_norm,
         span=span,
+        search_table=search_table,
+        endpoint=endpoint,
     )
 
     if not rows:
         logger.info("search: candidate set is empty; returning no matches")
         _perf_summary(
             span,
-            endpoint="search_global_streaming",
+            endpoint=endpoint,
             t_start=t_start,
             results=0,
             candidates=0,
@@ -2022,7 +2101,7 @@ def search_releases_by_artist_title(
         return []
 
     candidates: List[Dict[str, Any]] = []
-    with _perf_phase(span, "score", endpoint="search_global_streaming") as info:
+    with _perf_phase(span, "score", endpoint=endpoint) as info:
         info["pool"] = len(rows)
         for row in rows:
             # Refresh writes pre-normalized columns; legacy rows are normalized
@@ -2077,14 +2156,14 @@ def search_releases_by_artist_title(
     if not candidates:
         _perf_summary(
             span,
-            endpoint="search_global_streaming",
+            endpoint=endpoint,
             t_start=t_start,
             results=0,
             candidates=len(rows),
         )
         return []
 
-    with _perf_phase(span, "rank", endpoint="search_global_streaming") as info:
+    with _perf_phase(span, "rank", endpoint=endpoint) as info:
         max_log_streams = max(math.log1p(c["_raw_streams"]) for c in candidates)
         if max_log_streams <= 0:
             max_log_streams = 1.0  # avoid divide-by-zero when nothing has streams
@@ -2113,12 +2192,27 @@ def search_releases_by_artist_title(
 
     _perf_summary(
         span,
-        endpoint="search_global_streaming",
+        endpoint=endpoint,
         t_start=t_start,
         results=len(results),
         candidates=len(rows),
     )
     return results
+
+
+def search_releases_by_artist_title_singles(
+    artist: str,
+    title: str,
+    limit: int = _SEARCH_DEFAULT_LIMIT,
+) -> List[Dict[str, Any]]:
+    """Search MARKETSHARE_SEARCH_SUMMARY_SINGLES for singles release groups."""
+    return search_releases_by_artist_title(
+        artist,
+        title,
+        limit=limit,
+        search_table=MARKETSHARE_SEARCH_SUMMARY_SINGLES_TABLE,
+        endpoint="search_global_streaming_singles",
+    )
 
 
 def search_releases_by_artist_title_json(
@@ -2128,6 +2222,17 @@ def search_releases_by_artist_title_json(
 ) -> str:
     """JSON-serialized form of search_releases_by_artist_title for the API layer."""
     return json.dumps(search_releases_by_artist_title(artist, title, limit=limit))
+
+
+def search_releases_by_artist_title_singles_json(
+    artist: str,
+    title: str,
+    limit: int = _SEARCH_DEFAULT_LIMIT,
+) -> str:
+    """JSON-serialized singles search for the API layer."""
+    return json.dumps(
+        search_releases_by_artist_title_singles(artist, title, limit=limit)
+    )
 
 
 def get_known_vols(
@@ -2380,6 +2485,12 @@ def train_model() -> None:
         logger.exception(
             "train_model: search summary refresh failed; search results may be stale"
         )
+    try:
+        refresh_marketshare_search_summary_singles()
+    except Exception:
+        logger.exception(
+            "train_model: singles search summary refresh failed; search results may be stale"
+        )
     forecast_cache_clear()
     # Persist refreshed CSV + parquets + artifacts + db for future incremental runs.
     sync_full_outputs_to_s3()
@@ -2574,9 +2685,10 @@ def reload_artifacts() -> None:
     has its own globals and will need an external reload signal. That's a
     Phase 3 concern once artifacts move to S3.
     """
-    global GLOBAL_FORECAST_ENGINE, GLOBAL_WORLDWIDE_ARTIFACTS
+    global GLOBAL_FORECAST_ENGINE, GLOBAL_WORLDWIDE_ARTIFACTS, GLOBAL_WORLDWIDE_SINGLES_ARTIFACTS
     GLOBAL_FORECAST_ENGINE = None
     GLOBAL_WORLDWIDE_ARTIFACTS = None
+    GLOBAL_WORLDWIDE_SINGLES_ARTIFACTS = None
     forecast_cache_clear()
     marketshare_cache_clear()
     marketshare_from_csv.clear_cache()
@@ -2938,84 +3050,68 @@ def _sqlite_fw_peak_for_mrelg(mrelg_id: str) -> float:
         return 0.0
 
 
-def _sqlite_fw_peak_for_mrelg(mrelg_id: str) -> pd.DataFrame:
+def get_global_streaming_forecast_by_mrelg(
+    mrelg_id: str,
+    scenario: str = "Base",
+) -> pd.DataFrame:
     """
-    First-week stream / AE volume from EXPECTED_RELEASES for this MRELG.
-    Used as ``fw_streams_peak`` when the MRELG-driven path would otherwise pass 0,
-    so sparse or all-zero Snowflake weeks can still cold-start the decay fit.
+    Album (release-group) worldwide streaming forecast for a Luminate MRELG ID.
+    Uses archetypes_artifacts/worldwide_streams.
     """
-    key = (mrelg_id or "").strip()
-    if not key:
-        return 0.0
-    try:
-        with sqlite3.connect(DATABASE_NAME) as conn:
-            ensure_expected_releases_fw_columns(conn)
-            conn.row_factory = sqlite3.Row
-            cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT FW_STREAMS, EXPECTED_ALBUM_EQUIVALENT
-                FROM EXPECTED_RELEASES
-                WHERE MRELG_ID IS NOT NULL AND UPPER(TRIM(MRELG_ID)) = UPPER(?)
-                LIMIT 1
-                """,
-                (key,),
-            )
-            row = cur.fetchone()
-            if row is None:
-                return 0.0
-            fs = float(row["FW_STREAMS"] or 0) if row["FW_STREAMS"] is not None else 0.0
-            ae = (
-                float(row["EXPECTED_ALBUM_EQUIVALENT"] or 0)
-                if row["EXPECTED_ALBUM_EQUIVALENT"] is not None
-                else 0.0
-            )
-            return float(max(fs, ae, 0.0))
-    except sqlite3.Error as e:
-        logger.warning("sqlite fw_peak lookup failed for mrelg_id=%s: %s", key, e)
-        return 0.0
-    except (TypeError, ValueError) as e:
-        logger.warning("sqlite fw_peak parse failed for mrelg_id=%s: %s", key, e)
-        return 0.0
+    return _get_global_streaming_forecast_by_mrelg(
+        mrelg_id,
+        scenario=scenario,
+        singles=False,
+        endpoint="global_streaming_by_mrelg",
+        cache_product=_WORLDWIDE_STREAMING_PRODUCT_ALBUM,
+    )
 
 
-def get_global_streaming_forecast_by_mrelg(mrelg_id: str) -> pd.DataFrame:
+def get_global_streaming_forecast_singles_by_mrelg(
+    mrelg_id: str,
+    scenario: str = "Base",
+) -> pd.DataFrame:
     """
-    Returns a DataFrame of worldwide streaming forecasts for a given MRELG ID,
-    independent of any local SQLite release record.
+    Singles worldwide streaming forecast for a Luminate MRELG ID.
+    Uses archetypes_artifacts/worldwide_streams_singles (same simulator as albums).
+    """
+    return _get_global_streaming_forecast_by_mrelg(
+        mrelg_id,
+        scenario=scenario,
+        singles=True,
+        endpoint="global_streaming_singles_by_mrelg",
+        cache_product=_WORLDWIDE_STREAMING_PRODUCT_SINGLE,
+    )
 
-    Metadata (artist, title, release_date, genre) is resolved from the local
-    MARKETSHARE_SEARCH_SUMMARY table when available and falls back to a direct
-    Snowflake lookup so previously unseen Luminate releases can still be
-    forecast on demand.
 
-    When an EXPECTED_RELEASES row exists for this MRELG, ``FW_STREAMS`` and/or
-    ``EXPECTED_ALBUM_EQUIVALENT`` are passed through as the worldwide first-week
-    peak hint (same role as ``get_global_streaming_forecast`` for release_id).
+def _get_global_streaming_forecast_by_mrelg(
+    mrelg_id: str,
+    *,
+    scenario: str,
+    singles: bool,
+    endpoint: str,
+    cache_product: str,
+) -> pd.DataFrame:
+    """
+    Shared MRELG global-streaming path for album and singles archetype bundles.
 
-    Output schema mirrors get_global_streaming_forecast (minus release_id):
-    mrelg_id, artist, title, week, data_type, week_ending_date,
-    pred_worldwide_streams, cumulative_worldwide_streams.
-
-    ``scenario`` ("Base" / "Bear" / "Bull") forwards a post-fit Bear/Bull
-    shock through ``_build_global_streaming_forecast`` →
-    ``simulate_one_worldwide_streams``. The fit (and therefore the asymptotic
-    floor) is identical across scenarios — only the future weeks above the
-    floor are scaled. The forecast cache is keyed on (mrelg_id, scenario)
-    so each scenario is memoized independently.
+    Metadata is resolved from MARKETSHARE_SEARCH_SUMMARY when available and
+    falls back to Snowflake. Forecast cache key includes product, mrelg_id,
+    scenario, and calendar date.
     """
     if not isinstance(mrelg_id, str) or not mrelg_id.strip():
         raise ValueError("mrelg_id is required.")
     mrelg_id = mrelg_id.strip()
+    scenario = _normalize_scenario_label(scenario)
 
     span: Dict[str, Any] = {}
     t_start = _now()
 
-    cached = _forecast_cache_lookup(mrelg_id)
+    cached = _forecast_cache_lookup(mrelg_id, scenario, product=cache_product)
     if cached is not None:
         _perf_summary(
             span,
-            endpoint="global_streaming_by_mrelg",
+            endpoint=endpoint,
             t_start=t_start,
             mrelg_id=mrelg_id,
             cache="hit",
@@ -3023,21 +3119,20 @@ def get_global_streaming_forecast_by_mrelg(mrelg_id: str) -> pd.DataFrame:
         )
         return cached.copy()
 
-    with _perf_phase(span, "metadata_lookup_local", endpoint="global_streaming_by_mrelg") as info:
-        local_meta = _resolve_mrelg_metadata_local(mrelg_id)
+    search_table = (
+        MARKETSHARE_SEARCH_SUMMARY_SINGLES_TABLE
+        if singles
+        else MARKETSHARE_SEARCH_SUMMARY_TABLE
+    )
+    with _perf_phase(span, "metadata_lookup_local", endpoint=endpoint) as info:
+        local_meta = _resolve_mrelg_metadata_local(mrelg_id, search_table=search_table)
         info["hit"] = bool(local_meta)
 
-    # Single Snowflake session per request: re-used for the (rare) metadata
-    # fallback AND the always-required global streams pull. This eliminates
-    # the previous double-connect on the metadata-miss path and removes one
-    # auth roundtrip on the hot path even when metadata is in SQLite.
     with get_snowflake_connection() as sf:
         if local_meta is not None:
             metadata = local_meta
         else:
-            with _perf_phase(
-                span, "metadata_lookup_snowflake", endpoint="global_streaming_by_mrelg"
-            ):
+            with _perf_phase(span, "metadata_lookup_snowflake", endpoint=endpoint):
                 metadata = _resolve_mrelg_metadata_snowflake(mrelg_id, sf)
 
         release_date = _validate_date(metadata.get("release_date"))
@@ -3051,13 +3146,15 @@ def get_global_streaming_forecast_by_mrelg(mrelg_id: str) -> pd.DataFrame:
             fw_streams_peak=fw_peak,
             span=span,
             sf=sf,
+            scenario=scenario,
+            singles=singles,
         )
 
-    _forecast_cache_store(mrelg_id, df)
+    _forecast_cache_store(mrelg_id, df, scenario, product=cache_product)
 
     _perf_summary(
         span,
-        endpoint="global_streaming_by_mrelg",
+        endpoint=endpoint,
         t_start=t_start,
         mrelg_id=mrelg_id,
         cache="miss",
@@ -3149,7 +3246,11 @@ def _resolve_mrelg_metadata(mrelg_id: str) -> Dict[str, Any]:
         return _resolve_mrelg_metadata_snowflake(mrelg_id, _sf)
 
 
-def _resolve_mrelg_metadata_local(mrelg_id: str) -> Optional[Dict[str, Any]]:
+def _resolve_mrelg_metadata_local(
+    mrelg_id: str,
+    *,
+    search_table: str = MARKETSHARE_SEARCH_SUMMARY_TABLE,
+) -> Optional[Dict[str, Any]]:
     """
     Try to resolve metadata from the daily SQLite snapshot. Returns ``None``
     when the row is not present so the caller can decide whether to fall
@@ -3160,8 +3261,8 @@ def _resolve_mrelg_metadata_local(mrelg_id: str) -> Optional[Dict[str, Any]]:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             cur.execute(
-                "SELECT MRELG_ID, TITLE, ARTIST, LABEL_NAME, RELEASE_DATE, GENRE "
-                "FROM MARKETSHARE_SEARCH_SUMMARY WHERE MRELG_ID = ? LIMIT 1",
+                f"SELECT MRELG_ID, TITLE, ARTIST, LABEL_NAME, RELEASE_DATE, GENRE "
+                f"FROM {search_table} WHERE MRELG_ID = ? LIMIT 1",
                 (mrelg_id,),
             )
             row = cur.fetchone()
@@ -3205,12 +3306,16 @@ def _build_global_streaming_forecast(
     sf: Optional[Snowflake] = None,
     scenario: str = "Base",
     hist_df: Optional[pd.DataFrame] = None,
+    singles: bool = False,
 ) -> pd.DataFrame:
     """
     Shared backbone for both the legacy release_id-driven and the new MRELG-driven
     global streaming forecast endpoints. Pulls observed weekly streams from
     Snowflake, runs the worldwide-streams archetype simulation, and returns
     the actual-plus-forecast frame.
+
+    ``singles=True`` loads archetypes from ``worldwide_streams_singles`` instead
+    of ``worldwide_streams``; simulation code is unchanged.
 
     ``sf`` lets callers pass an already-open Snowflake session so we don't pay
     the connect/auth cost more than once per request. ``hist_df`` lets callers
@@ -3260,7 +3365,11 @@ def _build_global_streaming_forecast(
                     raise
         info["rows"] = len(hist_df)
 
-    artifacts = get_worldwide_artifacts()
+    artifacts = (
+        get_worldwide_singles_artifacts()
+        if singles
+        else get_worldwide_artifacts()
+    )
     horizon_weeks = int(artifacts.horizon_weeks)
 
     known: List[float] = []
