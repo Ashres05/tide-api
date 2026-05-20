@@ -327,6 +327,13 @@ def build_feature_table(
         records.append(feats)
 
     features = pd.DataFrame.from_records(records)
+    if features.empty or "MRELG_ID" not in features.columns:
+        raise ValueError(
+            "No releases produced valid feature rows for archetype clustering. "
+            f"Checked {len(track_ids):,} releases; 0 had a positive peak on TARGET_METRIC. "
+            "Common for singles panels where PRODUCT_SALES or SONG_SALE_EQUIVALENT are all zero — "
+            "train only --metric streaming_equivalent, or verify the parquet column has non-zero values."
+        )
     features = features.merge(track_meta, on="MRELG_ID", how="left")
 
     features["main_genre"] = features["GENRES"].apply(extract_main_genre)
@@ -1960,6 +1967,25 @@ def train(args: argparse.Namespace) -> None:
     if missing:
         raise ValueError(f"Parquet missing required columns: {sorted(missing)}\nAvailable columns: {list(df.columns)}")
     df = compute_week_index(df, horizon_weeks=args.horizon_weeks, metric_col=target_metric_col)
+
+    # Releases need at least one week with TARGET_METRIC > 0 (see extract_track_features).
+    pos_by_release = (
+        df.groupby("MRELG_ID", sort=False)["TARGET_METRIC"]
+        .max()
+        .gt(0)
+        .sum()
+    )
+    n_releases = df["MRELG_ID"].nunique()
+    if pos_by_release == 0:
+        raise ValueError(
+            f"Metric column {target_metric_col!r} has no positive values in "
+            f"{args.parquet_path} (after week indexing). Skip this metric or fix the extract."
+        )
+    if pos_by_release < n_releases * 0.05:
+        print(
+            f"  Warning: only {pos_by_release:,}/{n_releases:,} releases have "
+            f"peak {target_metric_col} > 0; clustering may be sparse."
+        )
 
     print("Building feature table (missing-week-safe)...")
     features = build_feature_table(

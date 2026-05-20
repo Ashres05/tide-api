@@ -41,6 +41,28 @@ def _have_fastparquet() -> bool:
         return False
 
 
+def _pandas_read_csv(src: Path, *, encoding: str, chunksize: int | None = None):
+    """pandas engine=python does not support low_memory."""
+    import pandas as pd
+
+    kwargs = {"filepath_or_buffer": src, "encoding": encoding, "engine": "python"}
+    if chunksize is not None:
+        return pd.read_csv(chunksize=chunksize, **kwargs)
+    return pd.read_csv(**kwargs)
+
+
+def resolve_output_path(src: Path, output: Path) -> Path:
+    """
+    --output may be a directory; in that case write ``{input_stem}.parquet`` inside it.
+    """
+    out = output.expanduser().resolve()
+    if out.is_dir():
+        return out / f"{src.stem}.parquet"
+    if out.suffix.lower() != ".parquet":
+        return out.with_suffix(".parquet")
+    return out
+
+
 def _resolve_engine(requested: str) -> str:
     if requested == "auto":
         if _have_pyarrow():
@@ -57,6 +79,27 @@ def _resolve_engine(requested: str) -> str:
     return requested
 
 
+def read_csv_pyarrow(src: Path, *, encoding: str):
+    import pyarrow.csv as pacsv
+
+    read_options = pacsv.ReadOptions(encoding=encoding)
+    parse_options = pacsv.ParseOptions(newlines_in_values=True)
+    logger.info("Reading CSV with PyArrow (newlines_in_values=True)...")
+    return pacsv.read_csv(
+        str(src),
+        read_options=read_options,
+        parse_options=parse_options,
+    )
+
+
+def write_parquet_pyarrow(table, dst: Path, *, compression: str) -> int:
+    import pyarrow.parquet as pq
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table, dst, compression=compression)
+    return table.num_rows
+
+
 def convert_pyarrow(
     src: Path,
     dst: Path,
@@ -64,21 +107,8 @@ def convert_pyarrow(
     compression: str,
     encoding: str,
 ) -> int:
-    import pyarrow.csv as pacsv
-    import pyarrow.parquet as pq
-
-    read_options = pacsv.ReadOptions(encoding=encoding)
-    parse_options = pacsv.ParseOptions(newlines_in_values=True)
-
-    logger.info("Reading CSV with PyArrow (newlines_in_values=True)...")
-    table = pacsv.read_csv(
-        str(src),
-        read_options=read_options,
-        parse_options=parse_options,
-    )
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(table, dst, compression=compression)
-    return table.num_rows
+    table = read_csv_pyarrow(src, encoding=encoding)
+    return write_parquet_pyarrow(table, dst, compression=compression)
 
 
 def convert_fastparquet(
@@ -92,16 +122,10 @@ def convert_fastparquet(
     import pandas as pd
 
     dst.parent.mkdir(parents=True, exist_ok=True)
-    read_kwargs = {
-        "filepath_or_buffer": src,
-        "encoding": encoding,
-        "engine": "python",
-        "low_memory": False,
-    }
 
     if chunksize is None:
         logger.info("Reading CSV with pandas (engine=python)...")
-        df = pd.read_csv(**read_kwargs)
+        df = _pandas_read_csv(src, encoding=encoding)
         logger.info("Writing parquet with fastparquet (compression=%s)...", compression)
         df.to_parquet(dst, engine="fastparquet", compression=compression, index=False)
         return len(df)
@@ -109,7 +133,7 @@ def convert_fastparquet(
     logger.info("Reading CSV in chunks of %d rows...", chunksize)
     total = 0
     first = True
-    for i, chunk in enumerate(pd.read_csv(chunksize=chunksize, **read_kwargs)):
+    for i, chunk in enumerate(_pandas_read_csv(src, encoding=encoding, chunksize=chunksize)):
         total += len(chunk)
         if first:
             logger.info("Writing parquet with fastparquet (compression=%s)...", compression)
@@ -144,7 +168,7 @@ def convert_pandas_pyarrow_write(
     import pandas as pd
 
     logger.info("Reading CSV with pandas (engine=python)...")
-    df = pd.read_csv(src, encoding=encoding, engine="python", low_memory=False)
+    df = _pandas_read_csv(src, encoding=encoding)
     dst.parent.mkdir(parents=True, exist_ok=True)
     logger.info("Writing parquet with pyarrow (compression=%s)...", compression)
     df.to_parquet(dst, engine="pyarrow", compression=compression, index=False)
@@ -165,7 +189,7 @@ def main(argv: list[str] | None = None) -> int:
         "-o",
         type=Path,
         required=True,
-        help="Destination .parquet path",
+        help="Destination .parquet file or directory (directory → {input_stem}.parquet)",
     )
     p.add_argument(
         "--engine",
@@ -203,10 +227,13 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     src = args.input.expanduser().resolve()
-    dst = args.output.expanduser().resolve()
     if not src.is_file():
         logger.error("Input not found: %s", src)
         return 1
+
+    dst = resolve_output_path(src, args.output)
+    if dst != args.output.expanduser().resolve():
+        logger.info("Resolved output path: %s", dst)
 
     engine = _resolve_engine(args.engine)
     t0 = time.perf_counter()
@@ -214,13 +241,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if engine == "pyarrow" and not args.pandas_read:
             try:
-                nrows = convert_pyarrow(
-                    src, dst, compression=args.compression, encoding=args.encoding
-                )
+                table = read_csv_pyarrow(src, encoding=args.encoding)
             except Exception as e:
                 logger.warning("PyArrow CSV read failed (%s); retrying via pandas", e)
                 nrows = convert_pandas_pyarrow_write(
                     src, dst, compression=args.compression, encoding=args.encoding
+                )
+            else:
+                nrows = write_parquet_pyarrow(
+                    table, dst, compression=args.compression
                 )
         elif engine == "pyarrow" and args.pandas_read:
             nrows = convert_pandas_pyarrow_write(
