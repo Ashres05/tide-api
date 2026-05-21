@@ -8,6 +8,7 @@ WITH mrelg_map AS (
         mrelg.title,
         mrelg.display_artist AS artist,
         i.level_2_distributor AS label_group,
+        i.level_1_distributor AS parent_group,
         COALESCE(mrelg.first_sale_date, mrelg.release_date) AS release_date,
         ROW_NUMBER() OVER (
             PARTITION BY mrelg.mrelg_id
@@ -20,7 +21,8 @@ WITH mrelg_map AS (
         JOIN luminate_prod.extract_s.vw_musical_release_group_ds mrelg ON mrelg.mrelg_id = mm.mrelg_id
         AND mrelg.compilation_type != 'Compilation'
         AND mrelg.release_type IN ('Album', 'Single', 'EP')
-        AND mrelg.display_artist NOT IN ('VARIOUS', 'VARIOUS ARTISTS')
+        AND mrelg.display_artist NOT IN ('VARIOUS', 'VARIOUS ARTISTS', 'Various Artists')
+        AND i.level_2_distributor IS NOT NULL
     WHERE
         i.is_current = TRUE
         {RELEASE_DATE_FILTER}
@@ -33,6 +35,7 @@ mrelg_metrics AS (
         m.title,
         m.artist,
         m.label_group,
+        m.parent_group,
         m.release_date,
         da.week_end_date AS week_ending_date,
         SUM(s.equivalent_quantity) AS album_equivalent
@@ -45,12 +48,13 @@ mrelg_metrics AS (
     GROUP BY
         ALL
     HAVING
-        album_equivalent >= 75000
+        album_equivalent >= 10000
 )
 SELECT
     mrelg_id,
     release_type,
     label_group AS label_name,
+    parent_group,
     title,
     artist,
     release_date

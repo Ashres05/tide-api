@@ -60,6 +60,15 @@ DELETE_MARKETSHARE_REVENUE_2025 = 'delete_marketshare_revenue_2025.sql'
 def ensure_streaming_roster_2026_table(conn: sqlite3.Connection) -> None:
     """Create STREAMING_ROSTER_2026 if missing (streaming revenue board roster)."""
     conn.execute(load_sql(CREATE_STREAMING_ROSTER_2026_TABLE))
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(STREAMING_ROSTER_2026)")
+    existing = {row[1] for row in cur.fetchall()}
+    if "PARENT_GROUP" not in existing:
+        try:
+            cur.execute("ALTER TABLE STREAMING_ROSTER_2026 ADD COLUMN PARENT_GROUP TEXT")
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                raise
 
 
 def ensure_expected_releases_fw_columns(conn: sqlite3.Connection) -> None:

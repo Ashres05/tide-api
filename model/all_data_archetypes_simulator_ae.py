@@ -779,6 +779,51 @@ def simulate_future_drop(
     target is on the same scale as peak_album_equiv_obs (e.g. sum of expected weekly AE peaks).
     """
 
+    plan = collaboration_simulation_plan(artist, artifacts)
+    resolved = list(plan.get("resolved_artists") or [])
+    if len(resolved) > 1:
+        _drop_kw = dict(
+            peak_volume=peak_volume,
+            peak_week=peak_week,
+            genre=genre,
+            artifacts=artifacts,
+            stream_floor=stream_floor,
+            peak_sim_log_radius=peak_sim_log_radius,
+            peak_sim_min_subset_releases=peak_sim_min_subset_releases,
+            peak_sim_spread_threshold_log_std=peak_sim_spread_threshold_log_std,
+            peak_sim_min_artist_releases=peak_sim_min_artist_releases,
+            peak_match_on=peak_match_on,
+            peak_match_target=peak_match_target,
+            scenario=scenario,
+            archetype_cluster_id=archetype_cluster_id,
+        )
+        if plan.get("use_aggregate"):
+            pred, summ = simulate_future_drop_average(
+                artists=plan["aggregate_artists"],
+                **_drop_kw,
+            )
+            return pred, _annotate_collaboration_summary(
+                summ, plan, "solo_decay_aggregate"
+            )
+        try:
+            pred, summ = simulate_future_drop(
+                artist=str(plan["simulation_artist"]),
+                **_drop_kw,
+            )
+            return pred, _annotate_collaboration_summary(
+                summ, plan, "primary_solo_decay"
+            )
+        except (ValueError, RuntimeError):
+            if not plan.get("try_aggregate_on_failure"):
+                raise
+            pred, summ = simulate_future_drop_average(
+                artists=plan["aggregate_artists"],
+                **_drop_kw,
+            )
+            return pred, _annotate_collaboration_summary(
+                summ, plan, "solo_decay_aggregate_fallback"
+            )
+
     # Resolve Canonical Artist Name
     artist_canon = artist
     if artifacts.artist_stats is not None:
@@ -1091,6 +1136,124 @@ def _parse_actuals_list(actuals_s: str) -> np.ndarray:
     return np.asarray(vals, dtype=float)
 
 
+def collaboration_display_artists(
+    artist: str,
+    artifacts: SimulatorArtifacts,
+    *,
+    max_artists: int = 3,
+) -> List[str]:
+    """
+    Map a Luminate DISPLAY_ARTIST string to trained DISPLAY_ARTIST names.
+
+    Collaboration credits are often comma-separated (e.g. ``A, B, C``). Returns
+    each segment that exists in ``artifacts.artist_stats``, in billing order.
+    """
+    artist_in = (artist or "").strip()
+    if not artist_in:
+        return []
+
+    available = artifacts.artist_stats["DISPLAY_ARTIST"].astype(str)
+    available_lower = available.str.lower()
+    avail_set = set(available_lower.tolist())
+
+    if artist_in.lower() in avail_set:
+        return [str(available[available_lower == artist_in.lower()].iloc[0])]
+
+    if "," not in artist_in:
+        return [artist_in]
+
+    parts = [p.strip() for p in re.split(r"\s*,\s*", artist_in) if p.strip()]
+    if len(parts) < 2:
+        return [artist_in]
+
+    resolved: List[str] = []
+    seen: set[str] = set()
+    for part in parts[: int(max_artists)]:
+        pl = part.lower()
+        if pl in avail_set:
+            canon = str(available[available_lower == pl].iloc[0])
+        else:
+            try:
+                canon = _resolve_artist_for_artifacts(part, artifacts)
+            except ValueError:
+                continue
+        key = canon.lower()
+        if key not in seen:
+            seen.add(key)
+            resolved.append(canon)
+
+    return resolved if resolved else [artist_in]
+
+
+def collaboration_simulation_plan(
+    artist: str,
+    artifacts: SimulatorArtifacts,
+    *,
+    max_artists: int = 3,
+) -> Dict[str, Any]:
+    """
+    How to run archetype decay for a collaboration credit string.
+
+    Default (``TIDE_COLLAB_FORECAST_MODE=primary``): use the **first resolved**
+    billing-order artist's solo catalog decay — not a joint history (these artists
+    may never have released together).
+
+    ``aggregate`` / ``average``: mean solo decay curves across all resolved names.
+
+    ``primary_then_aggregate``: solo primary first; if that fit fails, use aggregate.
+    """
+    raw = (artist or "").strip()
+    resolved = collaboration_display_artists(raw, artifacts, max_artists=max_artists)
+    env_mode = os.environ.get(
+        "TIDE_COLLAB_FORECAST_MODE", "primary_then_aggregate"
+    ).strip().lower()
+
+    if len(resolved) <= 1:
+        sim = resolved[0] if resolved else raw
+        mode = "exact" if raw and sim.lower() == raw.lower() else "single_resolved"
+        return {
+            "display_artist": raw,
+            "resolved_artists": resolved,
+            "simulation_artist": sim,
+            "aggregate_artists": [],
+            "env_mode": env_mode,
+            "use_aggregate": False,
+            "try_aggregate_on_failure": False,
+            "effective_mode": mode,
+        }
+
+    primary = resolved[0]
+    use_aggregate = env_mode in ("aggregate", "average", "mean")
+    try_fallback = env_mode in (
+        "primary_then_aggregate",
+        "fallback_aggregate",
+        "auto",
+    )
+    return {
+        "display_artist": raw,
+        "resolved_artists": resolved,
+        "simulation_artist": primary,
+        "aggregate_artists": resolved,
+        "env_mode": env_mode,
+        "use_aggregate": use_aggregate,
+        "try_aggregate_on_failure": try_fallback,
+        "effective_mode": "solo_decay_aggregate" if use_aggregate else "primary_solo_decay",
+    }
+
+
+def _annotate_collaboration_summary(
+    summary: Dict[str, Any],
+    plan: Dict[str, Any],
+    effective_mode: str,
+) -> Dict[str, Any]:
+    out = dict(summary)
+    out["collaboration_display_artist"] = plan.get("display_artist")
+    out["collaboration_resolved_artists"] = list(plan.get("resolved_artists") or [])
+    out["collaboration_simulation_mode"] = effective_mode
+    out["collaboration_primary_artist"] = plan.get("simulation_artist")
+    return out
+
+
 def _resolve_artist_for_artifacts(artist: str, artifacts: SimulatorArtifacts) -> str:
     """Case-insensitive remap of the user-provided artist to the canonical stored name."""
     artist_in = artist.strip()
@@ -1160,6 +1323,53 @@ def fit_backfill_forecast(
     k = int(len(actuals_weekly_streams))
     if k > end_week:
         raise ValueError("actuals length cannot exceed end_week.")
+
+    plan = collaboration_simulation_plan(artist, artifacts)
+    resolved = list(plan.get("resolved_artists") or [])
+    if len(resolved) > 1:
+        _backfill_kw = dict(
+            genre=genre,
+            actuals_weekly_streams=actuals_weekly_streams,
+            artifacts=artifacts,
+            end_week=end_week,
+            peak_week_search=peak_week_search,
+            fit_logspace=fit_logspace,
+            peak_week_margin=peak_week_margin,
+            stream_floor=stream_floor,
+            mixture_fit_weight=mixture_fit_weight,
+            scenario=scenario,
+            archetype_cluster_id=archetype_cluster_id,
+            scenario_multiplier=scenario_multiplier,
+        )
+        if plan.get("use_aggregate"):
+            pred, summ = fit_backfill_forecast_average(
+                artists=plan["aggregate_artists"],
+                **_backfill_kw,
+            )
+            return pred, _annotate_collaboration_summary(
+                summ, plan, "solo_decay_aggregate"
+            )
+        try:
+            pred, summ = fit_backfill_forecast(
+                artist=str(plan["simulation_artist"]),
+                **_backfill_kw,
+            )
+            return pred, _annotate_collaboration_summary(
+                summ, plan, "primary_solo_decay"
+            )
+        except (ValueError, RuntimeError):
+            if not plan.get("try_aggregate_on_failure"):
+                raise
+            pred, summ = fit_backfill_forecast_average(
+                artists=plan["aggregate_artists"],
+                **_backfill_kw,
+            )
+            return pred, _annotate_collaboration_summary(
+                summ, plan, "solo_decay_aggregate_fallback"
+            )
+
+    if len(resolved) == 1 and resolved[0].strip().lower() != (artist or "").strip().lower():
+        artist = resolved[0]
 
     # Artist matching: if the artist isn't in training artifacts, fall back to
     # averaging over up to 3 similar DISPLAY_ARTIST candidates.

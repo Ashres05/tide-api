@@ -1826,6 +1826,7 @@ def _streaming_roster_rows_from_df(df: pd.DataFrame) -> List[tuple]:
         title = str(d.get("title") or "").strip()
         artist = str(d.get("artist") or "").strip()
         label = str(d.get("label_name") or d.get("label_group") or "").strip()
+        parent_group = str(d.get("parent_group") or "").strip() or None
         rd = d.get("release_date")
         if rd is None or (isinstance(rd, float) and pd.isna(rd)):
             release_date = ""
@@ -1833,7 +1834,7 @@ def _streaming_roster_rows_from_df(df: pd.DataFrame) -> List[tuple]:
             release_date = rd.strftime("%Y-%m-%d")
         else:
             release_date = str(rd).strip()[:10]
-        out.append((mid, rtype or None, title, artist, label, release_date))
+        out.append((mid, rtype or None, title, artist, label, parent_group, release_date))
     return out
 
 
@@ -3785,7 +3786,7 @@ def _resolve_mrelg_metadata_from_streaming_roster(mrelg_id: str) -> Optional[Dic
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             cur.execute(
-                "SELECT MRELG_ID, TITLE, ARTIST, LABEL_NAME, RELEASE_DATE, PRODUCT_TYPE "
+                "SELECT MRELG_ID, TITLE, ARTIST, LABEL_NAME, PARENT_GROUP, RELEASE_DATE, PRODUCT_TYPE "
                 "FROM STREAMING_ROSTER_2026 WHERE MRELG_ID = ? LIMIT 1",
                 (mrelg_id.strip(),),
             )
@@ -3797,6 +3798,7 @@ def _resolve_mrelg_metadata_from_streaming_roster(mrelg_id: str) -> Optional[Dic
                 "title": row["TITLE"],
                 "artist": row["ARTIST"],
                 "label_name": row["LABEL_NAME"],
+                "parent_group": row["PARENT_GROUP"],
                 "release_date": row["RELEASE_DATE"],
                 "genre": None,
                 "product_type": row["PRODUCT_TYPE"],

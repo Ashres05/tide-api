@@ -62,6 +62,9 @@ def simulate_one_worldwide_streams(
         scenario toggle.
       - cluster — optional Archetype_Cluster id; sharpens scenario lookup to
         that specific cluster's percentile band when the user pins it.
+
+    Comma-separated ``artist`` credits are resolved inside ``fit_backfill_forecast``
+    / ``simulate_future_drop`` (primary solo decay by default; optional aggregate).
     """
     artist = str(release.get("artist") or release.get("name") or "").strip()
     if not artist:
