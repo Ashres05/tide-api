@@ -17,6 +17,7 @@ WHERE
     AND da.datename >= DATEADD(WEEK, -12, DATE_TRUNC('YEAR', CURRENT_DATE()))
     
     AND da.datename < DATEADD(DAY, -1, CURRENT_DATE())
+    {MIN_REPORT_DATE_FILTER}
 GROUP BY 
     da.datename
 ORDER BY 

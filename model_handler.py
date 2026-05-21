@@ -19,6 +19,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 from sqlite_handler import (
     DATABASE_NAME,
     ensure_expected_releases_fw_columns,
+    ensure_streaming_roster_2026_table,
     refresh_marketshare_search_summary,
     refresh_marketshare_search_summary_singles,
 )
@@ -71,8 +72,16 @@ _ARCHETYPES_BASE = Path(__file__).resolve().parent / "model" / "archetypes_artif
 ARCHETYPES_STREAMS_DIR = _ARCHETYPES_BASE / "streams"
 ARCHETYPES_SALES_DIR   = _ARCHETYPES_BASE / "sales"
 ARCHETYPES_SONGS_DIR   = _ARCHETYPES_BASE / "songs"
+ARCHETYPES_SINGLES_BASE = _ARCHETYPES_BASE / "singles"
+ARCHETYPES_SINGLES_STREAMS_DIR = ARCHETYPES_SINGLES_BASE / "streams"
+ARCHETYPES_SINGLES_SALES_DIR = ARCHETYPES_SINGLES_BASE / "sales"
+ARCHETYPES_SINGLES_SONGS_DIR = ARCHETYPES_SINGLES_BASE / "songs"
 ARCHETYPES_WORLDWIDE_STREAMS_DIR = _ARCHETYPES_BASE / "worldwide_streams"
 ARCHETYPES_WORLDWIDE_STREAMS_SINGLES_DIR = _ARCHETYPES_BASE / "worldwide_streams_singles"
+
+# Release calendar keys that route decay to ARCHETYPES_SINGLES_* (see release_is_single).
+RELEASE_PRODUCT_ALBUM = "album"
+RELEASE_PRODUCT_SINGLE = "single"
 
 # Forecast cache product discriminator (album vs single archetype bundles).
 _WORLDWIDE_STREAMING_PRODUCT_ALBUM = "album"
@@ -94,7 +103,11 @@ MARKETSHARE_ACTUALS_QUERY = "select_marketshare_actuals.sql"
 MARKETSHARE_WEEKLY_ACTUALS_QUERY = "select_marketshare_weekly_actuals.sql"
 MRELG_METADATA_QUERY = "query_mrelg_id.sql"
 RELEASE_BACKFILL_QUERY = "query_release_backfill.sql"
+STREAMING_ROSTER_YTD_QUERY = "query_streaming_roster_ytd.sql"
 GLOBAL_STREAMING_QUERY = "query_release_global_streaming.sql"
+CREATE_STREAMING_ROSTER_2026_TABLE = "create_streaming_roster_2026_table.sql"
+INSERT_STREAMING_ROSTER_2026 = "insert_streaming_roster_2026.sql"
+STREAMING_ROSTER_2026_LIST_QUERY = "streaming_roster_2026_list.sql"
 
 _RELEASE_FIELD_KEYS = frozenset(
     {
@@ -1381,8 +1394,41 @@ def _sanitize_forecast_engine_artifacts(engine: ForecastEngine) -> None:
         act["AE_Share"] = pd.to_numeric(act["AE_Share"], errors="coerce").fillna(0.0)
 
 
-def get_engine():
-    """Instantiates the engine once, and returns it for all future calls."""
+def _archetypes_singles_decay_dir(metric: str) -> Path:
+    """Resolve singles decay subdir (streams / sales / songs) with optional env override."""
+    override = os.environ.get("TIDE_SINGLES_DECAY_ARTIFACTS_DIR", "").strip()
+    if override:
+        return Path(override).expanduser().resolve() / metric
+    return ARCHETYPES_SINGLES_BASE / metric
+
+
+def _forecast_engine_singles_decay_paths() -> dict[str, Optional[Path]]:
+    """Paths passed into ForecastEngine when singles bundles exist on disk."""
+    streams = _archetypes_singles_decay_dir("streams")
+    songs = _archetypes_singles_decay_dir("songs")
+    sales = _archetypes_singles_decay_dir("sales")
+    out: dict[str, Optional[Path]] = {
+        "singles_streams_dir": streams if (streams / "archetype_params.json").is_file() else None,
+        "singles_songs_dir": songs if (songs / "archetype_params.json").is_file() else None,
+        "singles_sales_dir": sales if (sales / "archetype_params.json").is_file() else None,
+    }
+    if out["singles_streams_dir"] is None:
+        logger.info(
+            "Singles decay artifacts not found under %s (sync "
+            "s3://parquetgarage/model/archetypes_artifacts/singles/).",
+            ARCHETYPES_SINGLES_BASE,
+        )
+    return out
+
+
+def get_engine() -> ForecastEngine:
+    """
+    Lazily build the shared ForecastEngine (album + optional singles decay bundles).
+
+    Singles routing is per release via ``product_type`` / ``release_type`` on the
+    calendar row (see ``release_is_single``). EXPECTED_RELEASES will gain
+    ``PRODUCT_TYPE`` in a later migration; until then rows default to album decay.
+    """
     global GLOBAL_FORECAST_ENGINE
     if GLOBAL_FORECAST_ENGINE is None:
         GLOBAL_FORECAST_ENGINE = ForecastEngine(
@@ -1390,6 +1436,7 @@ def get_engine():
             streams_dir=ARCHETYPES_STREAMS_DIR,
             sales_dir=ARCHETYPES_SALES_DIR,
             songs_dir=ARCHETYPES_SONGS_DIR,
+            **_forecast_engine_singles_decay_paths(),
         )
         _sanitize_forecast_engine_artifacts(GLOBAL_FORECAST_ENGINE)
     return GLOBAL_FORECAST_ENGINE
@@ -1451,6 +1498,7 @@ def create_release(
     genre: str, 
     scenario: str, 
     fw_vol: float, 
+    product_type: str | None = None,
     fw_streams: float = 0.0,
     fw_songs: float = 0.0,
     fw_sales: float = 0.0,
@@ -1476,6 +1524,7 @@ def create_release(
         label_name,
         release_date,
         genre,
+        product_type,
         fw_vol,
         fw_streams,
         fw_songs,
@@ -1503,6 +1552,7 @@ def _create_backfilled_release(
     *,
     mrelg_id: str,
     label_name: str,
+    product_type: str | None = None,
     scenario: str = "Base",
     fw_vol: float = 100000.0,  # Default; irrelevant once known_vols are loaded.
     _sf: "Snowflake | None" = None,
@@ -1556,6 +1606,7 @@ def _create_backfilled_release(
         label_name=label_name,
         release_date=release_date,
         genre=genre,
+        product_type=product_type,
         scenario=scenario,
         fw_vol=fw_vol,
         fy_vol=0.0,
@@ -1565,6 +1616,32 @@ def _create_backfilled_release(
     )
     marketshare_cache_clear()
     return rid
+
+
+def _backfill_candidates_from_df(df: pd.DataFrame) -> List[Tuple[str, str, str]]:
+    """
+    Normalize Snowflake backfill rows to (mrelg_id, release_type, label_name).
+
+    Supports query_release_backfill.sql with or without release_type (legacy 2-col).
+    """
+    norm = {str(c).strip().lower(): c for c in df.columns}
+    for required in ("mrelg_id", "label_name"):
+        if required not in norm:
+            raise ValueError(
+                f"backfill query must return mrelg_id and label_name; got {list(df.columns)}"
+            )
+    has_type = "release_type" in norm
+    out: List[Tuple[str, str, str]] = []
+    for row in df.itertuples(index=False, name=None):
+        if has_type and len(row) >= 3:
+            mid, rtype, lbl = row[0], row[1], row[2]
+        elif len(row) >= 2:
+            mid, lbl = row[0], row[-1]
+            rtype = row[1] if has_type and len(row) == 3 else ""
+        else:
+            continue
+        out.append((str(mid or "").strip(), str(rtype or "").strip(), str(lbl or "").strip()))
+    return out
 
 
 def backfill_releases(
@@ -1578,9 +1655,10 @@ def backfill_releases(
         {"inserted": int, "skipped": int, "errors": [...]}
 
     Incremental mode (default when EXPECTED_RELEASES already has rows):
-      Only queries Snowflake for albums whose release_date falls within the last
-      TIDE_BACKFILL_LOOKBACK_DAYS (default 90 days). Albums older than that are
-      already in SQLite.  Set TIDE_BACKFILL_FULL=1 to force a complete scan.
+      Only queries Snowflake for releases whose release_date falls within the last
+      TIDE_BACKFILL_LOOKBACK_DAYS (default 90 days). Older rows are already in SQLite.
+      Set TIDE_BACKFILL_FULL=1 to force a complete scan. Candidates include albums
+      and singles (see query_release_backfill.sql); PRODUCT_TYPE is stored on insert.
 
     run_sqlite_refresh:
       When True (default) and new releases were inserted, update_sqlite_main() is
@@ -1608,7 +1686,7 @@ def backfill_releases(
             f"AND mrelg.release_date >= DATEADD(day, -{int(lookback_days)}, CURRENT_DATE())"
         )
         logger.info(
-            "backfill_releases: incremental — querying albums released in last %d days "
+            "backfill_releases: incremental — querying releases released in last %d days "
             "(TIDE_BACKFILL_FULL=1 for full scan)",
             lookback_days,
         )
@@ -1629,9 +1707,9 @@ def backfill_releases(
             return {"inserted": 0, "skipped": 0, "errors": []}
 
         pending = [
-            (mid, lbl)
-            for mid, lbl in df.itertuples(index=False, name=None)
-            if (mid or "").strip() not in existing_mrelg_ids
+            (mid, rtype, lbl)
+            for mid, rtype, lbl in _backfill_candidates_from_df(df)
+            if mid and mid not in existing_mrelg_ids
         ]
         skipped = len(df) - len(pending)
         logger.info(
@@ -1643,14 +1721,20 @@ def backfill_releases(
         inserted = 0
         errors: list[dict] = []
 
-        for mrelg_id, label_name in pending:
+        for mrelg_id, release_type, label_name in pending:
             try:
                 logger.info(
-                    "backfill_releases: inserting mrelg_id=%s label=%s",
+                    "backfill_releases: inserting mrelg_id=%s product_type=%s label=%s",
                     mrelg_id,
+                    release_type,
                     label_name,
                 )
-                _create_backfilled_release(mrelg_id=mrelg_id, label_name=label_name, _sf=sf)
+                _create_backfilled_release(
+                    mrelg_id=mrelg_id,
+                    label_name=label_name,
+                    product_type=release_type or None,
+                    _sf=sf,
+                )
                 inserted += 1
                 existing_mrelg_ids.add(mrelg_id)
             except Exception as e:
@@ -1696,6 +1780,179 @@ def backfill_releases(
         sync_db_to_s3()
 
     return {"inserted": inserted, "skipped": skipped, "errors": errors}
+
+
+def streaming_forecast_route(product_type: str | None) -> str:
+    """
+    Which worldwide-streaming API bundle to use for a roster PRODUCT_TYPE.
+
+    - ``singles`` -> global_streaming_singles_by_mrelg (Single only)
+    - ``album``   -> global_streaming_by_mrelg (Album, EP, and anything else)
+    """
+    pt = str(product_type or "").strip().lower()
+    if pt in ("single", "singles"):
+        return "singles"
+    return "album"
+
+
+def _streaming_roster_mrelg_ids() -> set[str]:
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        ensure_streaming_roster_2026_table(conn)
+        cur = conn.cursor()
+        cur.execute("SELECT MRELG_ID FROM STREAMING_ROSTER_2026")
+        return {
+            (row[0] or "").strip()
+            for row in cur.fetchall()
+            if row[0] and str(row[0]).strip()
+        }
+
+
+def _streaming_roster_rows_from_df(df: pd.DataFrame) -> List[tuple]:
+    """Snowflake roster rows -> tuples for INSERT_STREAMING_ROSTER_2026."""
+    norm = {str(c).strip().lower(): c for c in df.columns}
+    if "mrelg_id" not in norm:
+        raise ValueError(
+            f"streaming roster query must return mrelg_id; got {list(df.columns)}"
+        )
+
+    out: List[tuple] = []
+    cols = [str(c).strip().lower() for c in df.columns]
+    for row in df.itertuples(index=False, name=None):
+        d = dict(zip(cols, row))
+        mid = str(d.get("mrelg_id") or "").strip()
+        if not mid:
+            continue
+        rtype = str(d.get("release_type") or d.get("product_type") or "").strip()
+        title = str(d.get("title") or "").strip()
+        artist = str(d.get("artist") or "").strip()
+        label = str(d.get("label_name") or d.get("label_group") or "").strip()
+        rd = d.get("release_date")
+        if rd is None or (isinstance(rd, float) and pd.isna(rd)):
+            release_date = ""
+        elif hasattr(rd, "strftime"):
+            release_date = rd.strftime("%Y-%m-%d")
+        else:
+            release_date = str(rd).strip()[:10]
+        out.append((mid, rtype or None, title, artist, label, release_date))
+    return out
+
+
+def backfill_streaming_roster() -> dict:
+    """
+    Populate STREAMING_ROSTER_2026 from Snowflake (YTD streaming revenue board).
+
+    Returns {"inserted": int, "upserted": int, "skipped": int, "errors": [...]}.
+
+    Full scan (first run or TIDE_STREAMING_ROSTER_FULL=1):
+      release_date >= start of current calendar year.
+
+    Incremental (default when the table already has rows):
+      release_date in the last TIDE_STREAMING_ROSTER_LOOKBACK_DAYS days (default 30).
+
+    Does not run update_sqlite_main() or touch EXPECTED_RELEASES / marketshare tables.
+    """
+    import os as _os
+
+    sync_db_from_s3()
+
+    existing = _streaming_roster_mrelg_ids()
+    full_refresh = _os.environ.get("TIDE_STREAMING_ROSTER_FULL", "").strip().lower() in (
+        "1", "true", "yes"
+    )
+    lookback_days = int(_os.environ.get("TIDE_STREAMING_ROSTER_LOOKBACK_DAYS", "30"))
+
+    if existing and not full_refresh:
+        date_filter = (
+            f"AND mrelg.release_date >= DATEADD(day, -{int(lookback_days)}, CURRENT_DATE())"
+        )
+        logger.info(
+            "backfill_streaming_roster: incremental — release_date in last %d days "
+            "(TIDE_STREAMING_ROSTER_FULL=1 for full YTD scan)",
+            lookback_days,
+        )
+    else:
+        date_filter = (
+            "AND mrelg.release_date >= DATE_TRUNC('year', CURRENT_DATE())"
+        )
+        reason = (
+            "TIDE_STREAMING_ROSTER_FULL=1"
+            if full_refresh
+            else "STREAMING_ROSTER_2026 is empty"
+        )
+        logger.info("backfill_streaming_roster: full YTD Snowflake scan (%s)", reason)
+
+    query = load_sql(STREAMING_ROSTER_YTD_QUERY).replace(
+        "{RELEASE_DATE_FILTER}", date_filter
+    )
+    logger.info("backfill_streaming_roster: running %s...", STREAMING_ROSTER_YTD_QUERY)
+
+    with get_snowflake_connection() as sf:
+        df = sf.query(query)
+    logger.info("backfill_streaming_roster: Snowflake returned %d rows", len(df))
+
+    if df.empty:
+        return {"inserted": 0, "upserted": 0, "skipped": 0, "errors": []}
+
+    rows = _streaming_roster_rows_from_df(df)
+    new_rows = [r for r in rows if r[0] not in existing]
+    skipped = len(rows) - len(new_rows)
+
+    insert_sql = load_sql(INSERT_STREAMING_ROSTER_2026)
+    batch_size = 500
+    errors: list[dict] = []
+    upserted = 0
+
+    try:
+        with sqlite3.connect(DATABASE_NAME) as conn:
+            ensure_streaming_roster_2026_table(conn)
+            cur = conn.cursor()
+            for i in range(0, len(rows), batch_size):
+                chunk = rows[i : i + batch_size]
+                try:
+                    cur.executemany(insert_sql, chunk)
+                    upserted += len(chunk)
+                except sqlite3.Error as e:
+                    errors.append({"batch_start": i, "error": str(e)})
+            conn.commit()
+    except sqlite3.Error as e:
+        errors.append({"stage": "sqlite", "error": str(e)})
+
+    inserted = len(new_rows)
+    logger.info(
+        "backfill_streaming_roster: upserted=%d new_mrelg_ids=%d skipped_existing=%d",
+        upserted,
+        inserted,
+        skipped,
+    )
+
+    if upserted > 0 and not errors:
+        sync_db_to_s3()
+
+    return {
+        "inserted": inserted,
+        "upserted": upserted,
+        "skipped": skipped,
+        "errors": errors,
+    }
+
+
+def get_streaming_roster_2026() -> List[dict]:
+    """All rows in STREAMING_ROSTER_2026 for the streaming revenue board."""
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        ensure_streaming_roster_2026_table(conn)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(load_sql(STREAMING_ROSTER_2026_LIST_QUERY))
+        out: List[dict] = []
+        for row in cur.fetchall():
+            d = dict(row)
+            d["forecast_route"] = streaming_forecast_route(d.get("PRODUCT_TYPE"))
+            out.append(d)
+        return out
+
+
+def get_streaming_roster_2026_json() -> str:
+    return json.dumps(get_streaming_roster_2026(), default=str)
 
 
 def update_release(
@@ -2439,9 +2696,13 @@ def get_marketshare_forecasts(week_ending_date: str | None = None) -> pd.DataFra
 
 def get_release_forecasts(id: int, week_ending_date: str | None = None) -> pd.DataFrame:
     """
-    Takes in a release ID and returns the marketshare forecasts for that release as a pandas DataFrame.
-    The week ending date must be in the format YYYY-MM-DD if provided.
-    If no week ending date is provided, all weekly forecasts are returned.
+    Weekly marketshare injections for one EXPECTED_RELEASES row.
+
+    Decay routing: when the release map has ``product_type`` / ``release_type``
+    set to ``single`` (or ``singles``), ForecastEngine uses
+    ``archetypes_artifacts/singles/{streams,songs}``; otherwise album bundles.
+    Sales channel stays zero for singles. Until singles are backfilled into
+    EXPECTED_RELEASES, rows without those fields use album decay.
     """
     # Verify the week ending date (if provided) and ID.
     _verify_id(id)
@@ -2579,6 +2840,9 @@ def refresh_weekly(force_refresh_parquets: bool = False) -> dict:
     skip_backfill = os.environ.get("TIDE_WEEKLY_SKIP_BACKFILL", "").strip().lower() in (
         "1", "true", "yes", "on",
     )
+    skip_streaming_roster = os.environ.get(
+        "TIDE_WEEKLY_SKIP_STREAMING_ROSTER_BACKFILL", "1"
+    ).strip().lower() in ("1", "true", "yes", "on")
 
     # Pull only the weekly inputs (db + csvs + artifacts_75k). Skip the heavy
     # parquets/archetypes scopes — those are not needed for CSV-only training.
@@ -2661,6 +2925,35 @@ def refresh_weekly(force_refresh_parquets: bool = False) -> dict:
             set_step("reload_artifacts")
             reload_artifacts()
             raise
+
+    if skip_streaming_roster:
+        logger.info(
+            "refresh_weekly: skipping backfill_streaming_roster "
+            "(TIDE_WEEKLY_SKIP_STREAMING_ROSTER_BACKFILL=1). "
+            "Run POST /v1/revenue/backfill_streaming_roster for YTD or incremental roster."
+        )
+        summary["stages"]["backfill_streaming_roster"] = {
+            "ok": True,
+            "skipped": True,
+            "reason": "TIDE_WEEKLY_SKIP_STREAMING_ROSTER_BACKFILL=1",
+        }
+    else:
+        set_step("backfill_streaming_roster:start")
+        t0 = _now()
+        try:
+            streaming_result = backfill_streaming_roster()
+            summary["stages"]["backfill_streaming_roster"] = {
+                "ok": True,
+                "elapsed_sec": _elapsed(t0),
+                **streaming_result,
+            }
+        except Exception as e:
+            logger.exception("refresh_weekly: backfill_streaming_roster failed")
+            summary["stages"]["backfill_streaming_roster"] = {
+                "ok": False,
+                "error": str(e),
+                "elapsed_sec": _elapsed(t0),
+            }
 
     set_step("reload_artifacts")
     reload_artifacts()
@@ -2811,6 +3104,13 @@ def _sqlite_row_to_release_map(row: sqlite3.Row) -> dict:
         release_map["known_sales"] = component_vols["sales"]
     if component_vols["songs"]:
         release_map["known_songs"] = component_vols["songs"]
+
+    if "PRODUCT_TYPE" in row.keys() and row["PRODUCT_TYPE"]:
+        pt = str(row["PRODUCT_TYPE"]).strip()
+        release_map["product_type"] = pt
+        release_map["release_type"] = pt
+    elif "RELEASE_TYPE" in row.keys() and row["RELEASE_TYPE"]:
+        release_map["release_type"] = str(row["RELEASE_TYPE"]).strip()
 
     return _sanitize_release_for_simulation(release_map)
 
@@ -3126,6 +3426,8 @@ def _get_global_streaming_forecast_by_mrelg(
     )
     with _perf_phase(span, "metadata_lookup_local", endpoint=endpoint) as info:
         local_meta = _resolve_mrelg_metadata_local(mrelg_id, search_table=search_table)
+        if local_meta is None:
+            local_meta = _resolve_mrelg_metadata_from_streaming_roster(mrelg_id)
         info["hit"] = bool(local_meta)
 
     with get_snowflake_connection() as sf:
@@ -3184,8 +3486,7 @@ def get_daily_global_streams_by_mrelg(mrelg_id: str) -> pd.DataFrame:
     mrelg_id = mrelg_id.strip()
 
     # Need release_date to bound the Snowflake query when the cache is cold.
-    # Try local metadata first; fall back to Snowflake only if no cached row.
-    meta = _resolve_mrelg_metadata_local(mrelg_id)
+    meta = _resolve_mrelg_metadata_local(mrelg_id) or _resolve_mrelg_metadata_from_streaming_roster(mrelg_id)
     release_date: Optional[str] = None
     if meta:
         rd = meta.get("release_date")
@@ -3347,7 +3648,7 @@ def _build_global_streaming_forecast(
             with get_snowflake_connection() as _sf:
                 yield _sf
 
-    with _phase("snowflake_streams_query") as info:
+    with _phase("weekly_streams_cache") as info:
         with _sf_session() as session:
             try:
                 hist_df = _get_known_vols_global_streaming(mrelg_id, release_date, session)
@@ -3452,16 +3753,153 @@ def _build_global_streaming_forecast(
     return df
 
 
-def _get_known_vols_global_streaming(mrelg_id: str, release_date: str, _sf: Snowflake) -> pd.DataFrame:
-    sql = (
-        load_sql(GLOBAL_STREAMING_QUERY)
-        .replace("{MRELG_ID}", f"'{mrelg_id}'")
-        .replace("{RELEASE_DATE}", f"'{release_date}'")
+def _get_known_vols_global_streaming(
+    mrelg_id: str,
+    release_date: str,
+    _sf: Snowflake,
+    *,
+    refresh_if_stale: bool = True,
+) -> pd.DataFrame:
+    """Weekly worldwide streams for archetype fit — SQLite cache, incremental Snowflake."""
+    from sqlite_handler import get_weekly_global_streams_for_mrelg
+
+    df = get_weekly_global_streams_for_mrelg(
+        mrelg_id,
+        release_date=release_date,
+        refresh_if_stale=refresh_if_stale,
+        sf_conn=_sf,
     )
-    df = _sf.query(sql)
     if df.empty:
         raise ValueError(
             f"No global streaming data found for mrelg_id: {mrelg_id} "
             f"on/after release_date: {release_date}"
         )
     return df
+
+
+def _resolve_mrelg_metadata_from_streaming_roster(mrelg_id: str) -> Optional[Dict[str, Any]]:
+    """Metadata from STREAMING_ROSTER_2026 when search tables lack the row."""
+    try:
+        with sqlite3.connect(DATABASE_NAME) as conn:
+            ensure_streaming_roster_2026_table(conn)
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT MRELG_ID, TITLE, ARTIST, LABEL_NAME, RELEASE_DATE, PRODUCT_TYPE "
+                "FROM STREAMING_ROSTER_2026 WHERE MRELG_ID = ? LIMIT 1",
+                (mrelg_id.strip(),),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            return {
+                "mrelg_id": row["MRELG_ID"],
+                "title": row["TITLE"],
+                "artist": row["ARTIST"],
+                "label_name": row["LABEL_NAME"],
+                "release_date": row["RELEASE_DATE"],
+                "genre": None,
+                "product_type": row["PRODUCT_TYPE"],
+            }
+    except sqlite3.Error as e:
+        logger.warning("streaming roster metadata lookup failed for %s: %s", mrelg_id, e)
+        return None
+
+
+def prewarm_streaming_roster_caches(
+    *,
+    daily: bool = True,
+    weekly: bool = True,
+    only_stale: bool = True,
+    limit: int | None = None,
+) -> dict:
+    """
+    Batch-fill daily + weekly worldwide stream caches for STREAMING_ROSTER_2026.
+
+    Uses one Snowflake session and incremental pulls per MRELG. Intended after
+    roster backfill or on a nightly cron (30-day roster incremental + prewarm stale).
+
+    Env:
+      TIDE_PREWARM_STREAMING_ROSTER_LIMIT — cap rows processed (testing)
+    """
+    import os as _os
+
+    from sqlite_handler import (
+        _daily_streams_is_fresh,
+        _weekly_streams_is_fresh,
+        refresh_daily_global_streams_for_mrelg,
+        refresh_weekly_global_streams_for_mrelg,
+    )
+
+    if limit is None:
+        lim_env = _os.environ.get("TIDE_PREWARM_STREAMING_ROSTER_LIMIT", "").strip()
+        limit = int(lim_env) if lim_env.isdigit() else None
+
+    roster = get_streaming_roster_2026()
+    if limit is not None:
+        roster = roster[: int(limit)]
+
+    stats = {
+        "roster_rows": len(roster),
+        "daily_refreshed": 0,
+        "daily_skipped": 0,
+        "weekly_refreshed": 0,
+        "weekly_skipped": 0,
+        "errors": [],
+    }
+    if not roster:
+        return stats
+
+    with get_snowflake_connection() as sf:
+        for i, row in enumerate(roster):
+            mrelg_id = (row.get("MRELG_ID") or "").strip()
+            if not mrelg_id:
+                continue
+            rd = row.get("RELEASE_DATE")
+            release_date = str(rd).split(" ")[0][:10] if rd else ""
+            if not release_date:
+                stats["errors"].append({"mrelg_id": mrelg_id, "error": "missing RELEASE_DATE"})
+                continue
+
+            try:
+                with sqlite3.connect(DATABASE_NAME) as conn:
+                    cur = conn.cursor()
+                    if daily:
+                        if only_stale and _daily_streams_is_fresh(cur, mrelg_id):
+                            stats["daily_skipped"] += 1
+                        else:
+                            refresh_daily_global_streams_for_mrelg(
+                                mrelg_id, release_date, sf_conn=sf
+                            )
+                            stats["daily_refreshed"] += 1
+                    if weekly:
+                        if only_stale and _weekly_streams_is_fresh(cur, mrelg_id):
+                            stats["weekly_skipped"] += 1
+                        else:
+                            refresh_weekly_global_streams_for_mrelg(
+                                mrelg_id, release_date, sf_conn=sf
+                            )
+                            stats["weekly_refreshed"] += 1
+            except Exception as e:
+                stats["errors"].append({"mrelg_id": mrelg_id, "error": str(e)})
+                logger.exception(
+                    "prewarm_streaming_roster: failed mrelg_id=%s (%d/%d)",
+                    mrelg_id,
+                    i + 1,
+                    len(roster),
+                )
+
+            if (i + 1) % 100 == 0:
+                logger.info(
+                    "prewarm_streaming_roster: progress %d/%d daily_refreshed=%d weekly_refreshed=%d",
+                    i + 1,
+                    len(roster),
+                    stats["daily_refreshed"],
+                    stats["weekly_refreshed"],
+                )
+
+    if stats["daily_refreshed"] or stats["weekly_refreshed"]:
+        sync_db_to_s3()
+
+    logger.info("prewarm_streaming_roster_caches: %s", stats)
+    return stats

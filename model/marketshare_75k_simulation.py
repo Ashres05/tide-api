@@ -55,6 +55,61 @@ GLOBAL_PRODUCT_COEF = -0.61
 
 NUM_WEEKS = 78 # Releases limited to 18 months
 
+
+def release_is_single(release_dict: dict) -> bool:
+    """True when a release calendar row should use singles decay artifacts."""
+    pt = str(
+        release_dict.get("product_type")
+        or release_dict.get("release_type")
+        or ""
+    ).strip().lower()
+    return pt in ("single", "singles")
+
+
+def normalize_single_release_for_decay(release_dict: dict) -> dict:
+    """
+    Singles have no product-sales channel; keep sales at zero so the sales
+    decay curve does not contribute even when album-style splits exist on the row.
+    """
+    out = dict(release_dict)
+    out["fw_sales"] = 0.0
+    out["known_sales"] = []
+    return out
+
+
+def decay_artifacts_for_release(
+    release_dict: dict,
+    artifacts_streams: SimulatorArtifacts,
+    artifacts_sales: SimulatorArtifacts,
+    artifacts_songs: SimulatorArtifacts,
+    *,
+    artifacts_streams_singles: Optional[SimulatorArtifacts] = None,
+    artifacts_sales_singles: Optional[SimulatorArtifacts] = None,
+    artifacts_songs_singles: Optional[SimulatorArtifacts] = None,
+) -> Tuple[dict, SimulatorArtifacts, SimulatorArtifacts, SimulatorArtifacts]:
+    """Pick album vs singles decay bundles; normalize singles release inputs."""
+    if not release_is_single(release_dict):
+        return release_dict, artifacts_streams, artifacts_sales, artifacts_songs
+    if artifacts_streams_singles is None:
+        logger.warning(
+            "Release %s is single but singles streams artifacts are not loaded; "
+            "using album streams decay.",
+            release_dict.get("name") or release_dict.get("title"),
+        )
+        return normalize_single_release_for_decay(release_dict), (
+            artifacts_streams,
+            artifacts_sales,
+            artifacts_songs,
+        )
+    sales = artifacts_sales_singles or artifacts_sales
+    songs = artifacts_songs_singles or artifacts_songs
+    return (
+        normalize_single_release_for_decay(release_dict),
+        artifacts_streams_singles,
+        sales,
+        songs,
+    )
+
 # When release_dict supplies empirical_w2_over_w1, blend tail toward it; alpha = min(1, n_releases / K).
 W2_RETENTION_BLEND_K = 4.0 # 4 or more releases means we fully trust artist history and note archetype curve
 
@@ -165,7 +220,22 @@ def generate_archetype_decay_curve(
     artifacts_sales: SimulatorArtifacts,
     artifacts_songs: SimulatorArtifacts,
     num_weeks: int = NUM_WEEKS,
+    *,
+    artifacts_streams_singles: Optional[SimulatorArtifacts] = None,
+    artifacts_sales_singles: Optional[SimulatorArtifacts] = None,
+    artifacts_songs_singles: Optional[SimulatorArtifacts] = None,
 ) -> List[float]:
+    release_dict, artifacts_streams, artifacts_sales, artifacts_songs = (
+        decay_artifacts_for_release(
+            release_dict,
+            artifacts_streams,
+            artifacts_sales,
+            artifacts_songs,
+            artifacts_streams_singles=artifacts_streams_singles,
+            artifacts_sales_singles=artifacts_sales_singles,
+            artifacts_songs_singles=artifacts_songs_singles,
+        )
+    )
     artist = release_dict.get("name", release_dict.get("artist", "Unknown"))
     genre = release_dict.get("genre")
     scenario = release_dict.get("scenario") or "Base"
@@ -334,6 +404,10 @@ def run_archetype_scenario(
     artifacts_songs: SimulatorArtifacts,
     e_score: float = 0.8,
     volume_threshold: float = 75000,
+    *,
+    artifacts_streams_singles: Optional[SimulatorArtifacts] = None,
+    artifacts_sales_singles: Optional[SimulatorArtifacts] = None,
+    artifacts_songs_singles: Optional[SimulatorArtifacts] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     
     max_hist_date = actuals_2026["Week Ending Date"].max()
@@ -363,6 +437,9 @@ def run_archetype_scenario(
             artifacts_sales,
             artifacts_songs,
             NUM_WEEKS,
+            artifacts_streams_singles=artifacts_streams_singles,
+            artifacts_sales_singles=artifacts_sales_singles,
+            artifacts_songs_singles=artifacts_songs_singles,
         )
 
         temp_curve_rows = []
@@ -400,7 +477,10 @@ def run_archetype_scenario(
             artifacts_streams, 
             artifacts_sales, 
             artifacts_songs, 
-            NUM_WEEKS
+            NUM_WEEKS,
+            artifacts_streams_singles=artifacts_streams_singles,
+            artifacts_sales_singles=artifacts_sales_singles,
+            artifacts_songs_singles=artifacts_songs_singles,
         )
         
         drop_dt = pd.to_datetime(release.get("date"))

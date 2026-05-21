@@ -36,6 +36,7 @@ FROM (
         AND da.week_end_date >= DATEADD(WEEK, -12, DATE_TRUNC('YEAR', CURRENT_DATE()))
         
         AND da.week_end_date < DATEADD(DAY, -2, CURRENT_DATE())
+        {MIN_WEEK_ENDING_DATE_FILTER}
     GROUP BY da.week_end_date
 )
 WHERE NOT (

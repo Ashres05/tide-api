@@ -11,7 +11,7 @@ Scopes:
   - "csvs"                 model/data/*.csv (Current_Data, alist_75k, bigreleaseflag)
   - "parquets"             model/data/*.parquet (heavy; archetype/training inputs)
   - "artifacts_75k"        model/artifacts_75k/** (LGBM/Prophet/spike/df_full/sidecars)
-  - "archetypes_artifacts" model/archetypes_artifacts/** (decay artifacts; forecast serving)
+  - "archetypes_artifacts" model/archetypes_artifacts/** (album decay + singles/ subdir; forecast serving)
 
 Convenience entry points:
   - sync_serving_inputs_from_s3()   -> startup: db + csvs + artifacts_75k + archetypes

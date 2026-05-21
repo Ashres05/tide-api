@@ -212,6 +212,53 @@ def backfill_releases(_: None = Depends(require_api_key)) -> JobAcceptedResponse
     return _dispatch("backfill_releases", model_handler.backfill_releases)
 
 
+@app.post(
+    "/v1/revenue/backfill_streaming_roster",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=JobAcceptedResponse,
+)
+def backfill_streaming_roster(_: None = Depends(require_api_key)) -> JobAcceptedResponse:
+    """
+    Populate STREAMING_ROSTER_2026 from Snowflake (Album / Single / EP, no 75k gate).
+
+    First run: full calendar-year scan. Later runs: last 30 days by default
+    (TIDE_STREAMING_ROSTER_LOOKBACK_DAYS). Force full YTD with TIDE_STREAMING_ROSTER_FULL=1
+    on the API worker process.
+    """
+    return _dispatch(
+        "backfill_streaming_roster",
+        model_handler.backfill_streaming_roster,
+    )
+
+
+@app.post(
+    "/v1/revenue/prewarm_streaming_roster",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=JobAcceptedResponse,
+)
+def prewarm_streaming_roster(_: None = Depends(require_api_key)) -> JobAcceptedResponse:
+    """
+    Batch-fill SQLite caches for STREAMING_ROSTER_2026 (daily + weekly worldwide
+    streams). Incremental Snowflake per MRELG. Run after roster backfill or nightly.
+    """
+    return _dispatch(
+        "prewarm_streaming_roster",
+        model_handler.prewarm_streaming_roster_caches,
+    )
+
+
+@app.get("/v1/revenue/streaming_roster")
+def list_streaming_roster():
+    """List STREAMING_ROSTER_2026 (streaming revenue board)."""
+    try:
+        return Response(
+            content=model_handler.get_streaming_roster_2026_json(),
+            media_type="application/json",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 # ---------------------------------------------------------------------------
 # Job status endpoints
 # ---------------------------------------------------------------------------

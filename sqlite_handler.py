@@ -25,7 +25,9 @@ CREATE_MARKETSHARE_SEARCH_SUMMARY_SINGLES_TABLE = (
     'create_marketshare_search_summary_table_singles.sql'
 )
 CREATE_DAILY_GLOBAL_STREAMS_TABLE = 'create_daily_global_streams_table.sql'
+CREATE_WEEKLY_GLOBAL_STREAMS_TABLE = 'create_weekly_global_streams_table.sql'
 CREATE_MARKETSHARE_REVENUE_2025_TABLE = 'create_marketshare_revenue_2025_table.sql'
+CREATE_STREAMING_ROSTER_2026_TABLE = 'create_streaming_roster_2026_table.sql'
 
 # Select queries
 WEEKLY_MARKETSHARE_QUERY = 'query_weekly_marketshare_query.sql'
@@ -36,6 +38,8 @@ MARKETSHARE_SEARCH_SUMMARY_QUERY = 'query_marketshare_search_summary.sql'
 MARKETSHARE_SEARCH_SUMMARY_SINGLES_QUERY = 'query_marketshare_search_summary_singles.sql'
 DAILY_GLOBAL_STREAMING_SF_QUERY = 'query_daily_global_streaming.sql'
 DAILY_GLOBAL_STREAMS_SQLITE_QUERY = 'query_daily_global_streams_sqlite.sql'
+WEEKLY_GLOBAL_STREAMING_SF_QUERY = 'query_release_global_streaming.sql'
+WEEKLY_GLOBAL_STREAMS_SQLITE_QUERY = 'query_weekly_global_streams_sqlite.sql'
 MARKETSHARE_REVENUE_2025_BY_MRELG_QUERY = 'query_marketshare_revenue_2025_by_mrelg.sql'
 
 # Insert queries
@@ -45,12 +49,18 @@ INSERT_MARKETSHARE_RELEASE_METRICS = 'insert_marketshare_release_metrics.sql'
 INSERT_MARKETSHARE_SEARCH_SUMMARY = 'insert_marketshare_search_summary.sql'
 INSERT_MARKETSHARE_SEARCH_SUMMARY_SINGLES = 'insert_marketshare_search_summary_singles.sql'
 INSERT_DAILY_GLOBAL_STREAMS = 'insert_daily_global_streams.sql'
+INSERT_WEEKLY_GLOBAL_STREAMS = 'insert_weekly_global_streams.sql'
 INSERT_MARKETSHARE_REVENUE_2025 = 'insert_marketshare_revenue_2025.sql'
 
 # Delete queries
 DELETE_MARKETSHARE_SEARCH_SUMMARY = 'delete_marketshare_search_summary.sql'
 DELETE_MARKETSHARE_SEARCH_SUMMARY_SINGLES = 'delete_marketshare_search_summary_singles.sql'
 DELETE_MARKETSHARE_REVENUE_2025 = 'delete_marketshare_revenue_2025.sql'
+
+def ensure_streaming_roster_2026_table(conn: sqlite3.Connection) -> None:
+    """Create STREAMING_ROSTER_2026 if missing (streaming revenue board roster)."""
+    conn.execute(load_sql(CREATE_STREAMING_ROSTER_2026_TABLE))
+
 
 def ensure_expected_releases_fw_columns(conn: sqlite3.Connection) -> None:
     """
@@ -70,6 +80,7 @@ def ensure_expected_releases_fw_columns(conn: sqlite3.Connection) -> None:
         ("FW_STREAMS", "REAL NOT NULL DEFAULT 0"),
         ("FW_SONGS", "REAL NOT NULL DEFAULT 0"),
         ("FW_SALES", "REAL NOT NULL DEFAULT 0"),
+        ("PRODUCT_TYPE", "TEXT"),
     ):
         cur.execute("PRAGMA table_info(EXPECTED_RELEASES)")
         existing = {row[1] for row in cur.fetchall()}
@@ -619,20 +630,52 @@ def update_sqlite_main() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Daily worldwide streams (Live Revenue board only)
+# Worldwide streams caches (Live Revenue / streaming roster)
 #
-# Cached per-MRELG on demand from Snowflake. Intentionally NOT wired into
-# update_sqlite_main so the weekly refresh cron path stays free of an extra
-# per-release Snowflake roundtrip, and so a regression here cannot impact
-# MARKETSHARE_RELEASE_METRICS / the simulator. Read endpoint refreshes lazily
-# when the cached series is empty or older than DAILY_STREAMS_STALE_DAYS.
+# Per-MRELG SQLite caches filled from Snowflake. Incremental pulls only
+# request dates/weeks after the latest cached point (with overlap). Batch
+# prewarm walks STREAMING_ROSTER_2026 via model_handler.prewarm_streaming_roster_caches.
 # ---------------------------------------------------------------------------
 
 DAILY_STREAMS_STALE_DAYS = 2
+WEEKLY_STREAMS_STALE_DAYS = 14
+DAILY_STREAMS_INCREMENTAL_OVERLAP_DAYS = 3
+WEEKLY_STREAMS_INCREMENTAL_OVERLAP_WEEKS = 2
+STREAMING_ROSTER_TABLE = "STREAMING_ROSTER_2026"
 
 
 def _ensure_daily_global_streams_table(cursor: sqlite3.Cursor) -> None:
     cursor.execute(load_sql(CREATE_DAILY_GLOBAL_STREAMS_TABLE))
+
+
+def _ensure_weekly_global_streams_table(cursor: sqlite3.Cursor) -> None:
+    cursor.execute(load_sql(CREATE_WEEKLY_GLOBAL_STREAMS_TABLE))
+
+
+def _snowflake_date_literal(iso_date: str) -> str:
+    return _snowflake_str(str(iso_date).split(" ")[0][:10])
+
+
+def _incremental_daily_filter(max_report_date: str | None) -> str:
+    if not max_report_date:
+        return ""
+    max_dt = pd.to_datetime(max_report_date, errors="coerce")
+    if pd.isna(max_dt):
+        return ""
+    overlap = int(os.environ.get("TIDE_DAILY_STREAMS_OVERLAP_DAYS", str(DAILY_STREAMS_INCREMENTAL_OVERLAP_DAYS)))
+    floor = (max_dt - pd.Timedelta(days=overlap)).strftime("%Y-%m-%d")
+    return f"\n    AND da.datename > {_snowflake_date_literal(floor)}"
+
+
+def _incremental_weekly_filter(max_week_ending_date: str | None) -> str:
+    if not max_week_ending_date:
+        return ""
+    max_dt = pd.to_datetime(max_week_ending_date, errors="coerce")
+    if pd.isna(max_dt):
+        return ""
+    overlap = int(os.environ.get("TIDE_WEEKLY_STREAMS_OVERLAP_WEEKS", str(WEEKLY_STREAMS_INCREMENTAL_OVERLAP_WEEKS)))
+    floor = (max_dt - pd.Timedelta(weeks=overlap)).strftime("%Y-%m-%d")
+    return f"\n        AND da.week_end_date > {_snowflake_date_literal(floor)}"
 
 
 def _max_daily_streams_report_date(cursor: sqlite3.Cursor, mrelg_id: str) -> str | None:
@@ -651,6 +694,7 @@ def _daily_streams_is_fresh(cursor: sqlite3.Cursor, mrelg_id: str) -> bool:
     recent day (DATEADD(DAY, -1, CURRENT_DATE())) so we expect max_report_date
     to be roughly today-2.
     """
+    _ensure_daily_global_streams_table(cursor)
     max_report = _max_daily_streams_report_date(cursor, mrelg_id)
     if not max_report:
         return False
@@ -661,23 +705,51 @@ def _daily_streams_is_fresh(cursor: sqlite3.Cursor, mrelg_id: str) -> bool:
     return (today - max_dt).days <= DAILY_STREAMS_STALE_DAYS
 
 
+def _weekly_streams_is_fresh(cursor: sqlite3.Cursor, mrelg_id: str) -> bool:
+    _ensure_weekly_global_streams_table(cursor)
+    cursor.execute(
+        "SELECT MAX(WEEK_ENDING_DATE) FROM MARKETSHARE_WEEKLY_GLOBAL_STREAMS WHERE MRELG_ID = ?",
+        (mrelg_id,),
+    )
+    row = cursor.fetchone()
+    max_week = (row[0] if row else None) or None
+    if not max_week:
+        return False
+    max_dt = pd.to_datetime(max_week, errors="coerce")
+    if pd.isna(max_dt):
+        return False
+    today = pd.Timestamp.utcnow().normalize().tz_localize(None)
+    return (today - max_dt).days <= WEEKLY_STREAMS_STALE_DAYS
+
+
 def refresh_daily_global_streams_for_mrelg(
     mrelg_id: str,
     release_date: str,
     sf_conn=None,
+    *,
+    force_full: bool = False,
 ) -> int:
     """
-    Pull daily worldwide stream counts for a single MRELG release group from
-    Snowflake (since release_date) and upsert into MARKETSHARE_DAILY_GLOBAL_STREAMS.
-    Returns the number of rows written. Reuses an existing Snowflake connection
-    when one is provided so callers can batch refreshes without re-auth churn.
+    Pull daily worldwide stream counts for a single MRELG from Snowflake and
+    upsert into MARKETSHARE_DAILY_GLOBAL_STREAMS.
+
+    When the cache already has rows and force_full is False, only pulls dates
+    after the latest cached report_date (minus overlap). Returns rows written.
     """
     if not mrelg_id:
         return 0
+    max_cached = None
+    if not force_full:
+        with sqlite3.connect(DATABASE_NAME) as conn:
+            cur = conn.cursor()
+            _ensure_daily_global_streams_table(cur)
+            max_cached = _max_daily_streams_report_date(cur, mrelg_id)
+
     sql = (
         load_sql(DAILY_GLOBAL_STREAMING_SF_QUERY)
         .replace("{RELEASE_DATE}", _snowflake_str(release_date))
         .replace("{MRELG_ID}", _snowflake_str(mrelg_id))
+        .replace("{MIN_REPORT_DATE_FILTER}", _incremental_daily_filter(max_cached))
     )
 
     import contextlib
@@ -758,6 +830,126 @@ def get_daily_global_streams_for_mrelg(
             params=(mrelg_id,),
         )
     return df
+
+
+def refresh_weekly_global_streams_for_mrelg(
+    mrelg_id: str,
+    release_date: str,
+    sf_conn=None,
+    *,
+    force_full: bool = False,
+) -> int:
+    """
+    Pull weekly worldwide streams (global_streaming input) into SQLite.
+
+    Incremental when cache exists: only weeks after max(WEEK_ENDING_DATE) minus
+    overlap. Cold cache or force_full runs the full window query.
+    """
+    if not mrelg_id:
+        return 0
+
+    max_cached = None
+    if not force_full:
+        with sqlite3.connect(DATABASE_NAME) as conn:
+            cur = conn.cursor()
+            _ensure_weekly_global_streams_table(cur)
+            cur.execute(
+                "SELECT MAX(WEEK_ENDING_DATE) FROM MARKETSHARE_WEEKLY_GLOBAL_STREAMS WHERE MRELG_ID = ?",
+                (mrelg_id,),
+            )
+            row = cur.fetchone()
+            max_cached = (row[0] if row else None) or None
+
+    sql = (
+        load_sql(WEEKLY_GLOBAL_STREAMING_SF_QUERY)
+        .replace("{MRELG_ID}", _snowflake_str(mrelg_id))
+        .replace("{RELEASE_DATE}", _snowflake_str(release_date))
+        .replace("{MIN_WEEK_ENDING_DATE_FILTER}", _incremental_weekly_filter(max_cached))
+    )
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def _maybe_conn():
+        if sf_conn is not None:
+            yield sf_conn
+        else:
+            with get_snowflake_connection() as fresh:
+                yield fresh
+
+    with _maybe_conn() as sf:
+        df = sf.query(sql)
+
+    if df is None or df.empty:
+        return 0
+    df = df.rename(columns=str.lower)
+    if "week_ending_date" not in df.columns or "global_streams" not in df.columns:
+        logger.warning(
+            "refresh_weekly_global_streams_for_mrelg: unexpected columns %s for mrelg=%s",
+            list(df.columns),
+            mrelg_id,
+        )
+        return 0
+
+    rows = []
+    for wk, val in zip(df["week_ending_date"], df["global_streams"]):
+        wk_str = wk.strftime("%Y-%m-%d") if hasattr(wk, "strftime") else str(wk).split(" ")[0][:10]
+        rows.append((mrelg_id, wk_str, float(val)))
+
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        cur = conn.cursor()
+        _ensure_weekly_global_streams_table(cur)
+        cur.executemany(load_sql(INSERT_WEEKLY_GLOBAL_STREAMS), rows)
+        conn.commit()
+    logger.info(
+        "refresh_weekly_global_streams_for_mrelg: wrote %d rows for mrelg=%s (incremental=%s)",
+        len(rows),
+        mrelg_id,
+        bool(max_cached),
+    )
+    return len(rows)
+
+
+def get_weekly_global_streams_for_mrelg(
+    mrelg_id: str,
+    release_date: str | None = None,
+    *,
+    refresh_if_stale: bool = True,
+    sf_conn=None,
+) -> pd.DataFrame:
+    """
+    Read cached weekly worldwide streams for global_streaming forecasts.
+    Refreshes from Snowflake when empty or stale (see WEEKLY_STREAMS_STALE_DAYS).
+    """
+    if not mrelg_id:
+        return pd.DataFrame(columns=["week_ending_date", "global_streams"])
+
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        cur = conn.cursor()
+        _ensure_weekly_global_streams_table(cur)
+        fresh = _weekly_streams_is_fresh(cur, mrelg_id)
+
+    if refresh_if_stale and not fresh and release_date:
+        try:
+            refresh_weekly_global_streams_for_mrelg(
+                mrelg_id, release_date, sf_conn=sf_conn
+            )
+        except Exception as e:
+            logger.exception(
+                "get_weekly_global_streams_for_mrelg: refresh failed for mrelg=%s: %s",
+                mrelg_id,
+                e,
+            )
+
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        df = pd.read_sql_query(
+            load_sql(WEEKLY_GLOBAL_STREAMS_SQLITE_QUERY),
+            conn,
+            params=(mrelg_id,),
+        )
+    if df.empty:
+        return df
+    return df.rename(columns=str.lower)
 
 
 # ---------------------------------------------------------------------------
