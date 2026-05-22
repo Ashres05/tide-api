@@ -28,13 +28,15 @@ DATA_DIR = Path(__file__).resolve().parent / "model" / "data"
 CURRENT_DATA_QUERY = "query_model_current_data.sql"
 A_LIST_75K_QUERY = "query_model_a_list_75k.sql"
 BIG_RELEASE_FLAG_75K_QUERY = "query_model_big_release_flag.sql"
+YTD_FISCAL_REVENUE_BY_LABEL_QUERY = "query_ytd_fiscal_revenue_by_label.sql"
 
 MODEL_PARQUET_METRICS_QUERY = "query_model_parquet_metrics.sql"
 MODEL_PARQUET_METRICS_STREAMING_QUERY = "query_model_parquet_metrics_streaming.sql"
 
 # Phase 2 design notes
 # --------------------
-# The three CSV queries (Current_Data, alist_75k, bigreleaseflag_75k) now accept
+# The weekly CSV queries (Current_Data, alist_75k, bigreleaseflag_75k,
+# ytd_fiscal_revenue_by_label) accept
 # a {MIN_WEEK_END_DATE} placeholder and emit only weeks >= that anchor (with an
 # upper guard so the in-progress week is never persisted). The Python layer
 # appends the result onto the existing CSV and de-dupes on a row-level primary
@@ -115,12 +117,18 @@ def _refresh_data_directory() -> None:
         DATA_DIR / "bigreleaseflag_75k.csv",
         week_col="WEEK_END_DATE",
     )
+    ytd_fiscal_min_week = _get_min_week_end_date(
+        DATA_DIR / "ytd_fiscal_revenue_by_label.csv",
+        week_col="week_end_date",
+    )
     logger.info(
         "train_model.py: Refreshing CSV directory "
-        "(Current_Data min=%s, alist_75k min=%s, bigreleaseflag_75k min=%s)",
+        "(Current_Data min=%s, alist_75k min=%s, bigreleaseflag_75k min=%s, "
+        "ytd_fiscal_revenue min=%s)",
         current_min_week,
         alist_min_week,
         big_release_min_week,
+        ytd_fiscal_min_week,
     )
 
     with get_snowflake_connection() as sf:
@@ -128,6 +136,11 @@ def _refresh_data_directory() -> None:
             ("Current_Data.csv", _update_current_data, current_min_week),
             ("alist_75k.csv", _update_a_list_75k, alist_min_week),
             ("bigreleaseflag_75k.csv", _update_big_release_flag_75k, big_release_min_week),
+            (
+                "ytd_fiscal_revenue_by_label.csv",
+                _update_ytd_fiscal_revenue_by_label,
+                ytd_fiscal_min_week,
+            ),
         ):
             _set_step(f"refresh_data:csv:{name}")
             _run_stage(name, lambda sf=sf, updater=updater: updater(sf, min_week))
@@ -269,4 +282,29 @@ def _update_big_release_flag_75k(sf: Snowflake, min_week: str) -> int:
         df,
         dedupe_subset=["WEEK_END_DATE"],
         sort_by=["WEEK_END_DATE"],
+    )
+
+
+def _update_ytd_fiscal_revenue_by_label(sf: Snowflake, min_week: str) -> int:
+    """
+    Weekly proxy revenue by distributor label (worldwide on-demand streams * 0.004).
+    One row per (week_end_date, level_1, level_2, level_3).
+    """
+    df = _run_incremental_query(sf, YTD_FISCAL_REVENUE_BY_LABEL_QUERY, min_week)
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    return _append_and_write_csv(
+        DATA_DIR / "ytd_fiscal_revenue_by_label.csv",
+        df,
+        dedupe_subset=[
+            "week_end_date",
+            "level_1_distributor",
+            "level_2_distributor",
+            "level_3_distributor",
+        ],
+        sort_by=[
+            "week_end_date",
+            "level_1_distributor",
+            "level_2_distributor",
+            "level_3_distributor",
+        ],
     )

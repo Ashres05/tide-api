@@ -1956,6 +1956,42 @@ def get_streaming_roster_2026_json() -> str:
     return json.dumps(get_streaming_roster_2026(), default=str)
 
 
+def get_ytd_fiscal_revenue_by_label(
+    *,
+    week_end_date: str | None = None,
+    level_1_distributor: str | None = None,
+    level_2_distributor: str | None = None,
+    level_3_distributor: str | None = None,
+) -> list[dict[str, Any]]:
+    """Weekly proxy revenue by distributor label from ytd_fiscal_revenue_by_label.csv."""
+    import ytd_fiscal_revenue_from_csv
+
+    return ytd_fiscal_revenue_from_csv.query_ytd_fiscal_revenue(
+        week_end_date=week_end_date,
+        level_1_distributor=level_1_distributor,
+        level_2_distributor=level_2_distributor,
+        level_3_distributor=level_3_distributor,
+    )
+
+
+def get_ytd_fiscal_revenue_by_label_json(
+    *,
+    week_end_date: str | None = None,
+    level_1_distributor: str | None = None,
+    level_2_distributor: str | None = None,
+    level_3_distributor: str | None = None,
+) -> str:
+    return json.dumps(
+        get_ytd_fiscal_revenue_by_label(
+            week_end_date=week_end_date,
+            level_1_distributor=level_1_distributor,
+            level_2_distributor=level_2_distributor,
+            level_3_distributor=level_3_distributor,
+        ),
+        default=str,
+    )
+
+
 def update_release(
     *,
     id: int,
@@ -2986,6 +3022,9 @@ def reload_artifacts() -> None:
     forecast_cache_clear()
     marketshare_cache_clear()
     marketshare_from_csv.clear_cache()
+    import ytd_fiscal_revenue_from_csv
+
+    ytd_fiscal_revenue_from_csv.clear_cache()
     album_art.clear_cache()
 
 

@@ -259,6 +259,37 @@ def list_streaming_roster():
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@app.get("/v1/revenue/ytd_fiscal_revenue")
+def ytd_fiscal_revenue(
+    week_end_date: str | None = None,
+    level_1_distributor: str | None = None,
+    level_2_distributor: str | None = None,
+    level_3_distributor: str | None = None,
+):
+    """
+    Weekly proxy fiscal revenue by distributor label (from
+    model/data/ytd_fiscal_revenue_by_label.csv, synced to S3 on refresh_weekly).
+
+    Optional filters: week_end_date (YYYY-MM-DD), level_1/2/3_distributor.
+    """
+    try:
+        if week_end_date is not None:
+            model_handler._validate_date(week_end_date)
+        payload = model_handler.get_ytd_fiscal_revenue_by_label_json(
+            week_end_date=week_end_date,
+            level_1_distributor=level_1_distributor,
+            level_2_distributor=level_2_distributor,
+            level_3_distributor=level_3_distributor,
+        )
+        return Response(content=payload, media_type="application/json")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 # ---------------------------------------------------------------------------
 # Job status endpoints
 # ---------------------------------------------------------------------------

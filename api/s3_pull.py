@@ -8,7 +8,7 @@ Design pattern:
 
 Scopes:
   - "db"                   marketshare_data.db
-  - "csvs"                 model/data/*.csv (Current_Data, alist_75k, bigreleaseflag)
+  - "csvs"                 model/data/*.csv (Current_Data, alist_75k, bigreleaseflag, ytd_fiscal_revenue_by_label)
   - "parquets"             model/data/*.parquet (heavy; archetype/training inputs)
   - "artifacts_75k"        model/artifacts_75k/** (LGBM/Prophet/spike/df_full/sidecars)
   - "archetypes_artifacts" model/archetypes_artifacts/** (album decay + singles/ subdir; forecast serving)
