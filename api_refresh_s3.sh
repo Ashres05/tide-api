@@ -6,7 +6,7 @@
 set -euo pipefail
 API_URL="${API_URL:-http://127.0.0.1:8000}"
 POLL_SEC="${POLL_SEC:-30}"
-MAX_WAIT="${MAX_WAIT:-3600}"
+MAX_WAIT="${MAX_WAIT:-4800}"
 HDR=()
 [[ -n "${API_KEY:-}" ]] && HDR=(-H "X-API-Key: ${API_KEY}")
 ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }

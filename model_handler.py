@@ -1795,6 +1795,19 @@ def streaming_forecast_route(product_type: str | None) -> str:
     return "album"
 
 
+def _max_streaming_roster_release_date() -> str | None:
+    """Latest RELEASE_DATE in STREAMING_ROSTER_2026, or None if empty/null."""
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        ensure_streaming_roster_2026_table(conn)
+        cur = conn.cursor()
+        cur.execute("SELECT MAX(RELEASE_DATE) FROM STREAMING_ROSTER_2026")
+        row = cur.fetchone()
+        val = (row[0] if row else None) or None
+        if val:
+            return str(val).split(" ")[0][:10]
+        return None
+
+
 def _streaming_roster_mrelg_ids() -> set[str]:
     with sqlite3.connect(DATABASE_NAME) as conn:
         ensure_streaming_roster_2026_table(conn)
@@ -1848,7 +1861,8 @@ def backfill_streaming_roster() -> dict:
       release_date >= start of current calendar year.
 
     Incremental (default when the table already has rows):
-      release_date in the last TIDE_STREAMING_ROSTER_LOOKBACK_DAYS days (default 30).
+      release_date >= (max RELEASE_DATE in roster) minus TIDE_STREAMING_ROSTER_OVERLAP_DAYS
+      (default 7). Only queries Snowflake for releases newer than what we already have.
 
     Does not run update_sqlite_main() or touch EXPECTED_RELEASES / marketshare tables.
     """
@@ -1860,17 +1874,27 @@ def backfill_streaming_roster() -> dict:
     full_refresh = _os.environ.get("TIDE_STREAMING_ROSTER_FULL", "").strip().lower() in (
         "1", "true", "yes"
     )
-    lookback_days = int(_os.environ.get("TIDE_STREAMING_ROSTER_LOOKBACK_DAYS", "30"))
+    overlap_days = int(_os.environ.get("TIDE_STREAMING_ROSTER_OVERLAP_DAYS", "7"))
 
     if existing and not full_refresh:
-        date_filter = (
-            f"AND mrelg.release_date >= DATEADD(day, -{int(lookback_days)}, CURRENT_DATE())"
-        )
-        logger.info(
-            "backfill_streaming_roster: incremental — release_date in last %d days "
-            "(TIDE_STREAMING_ROSTER_FULL=1 for full YTD scan)",
-            lookback_days,
-        )
+        max_release_date = _max_streaming_roster_release_date()
+        if max_release_date:
+            date_filter = (
+                f"AND mrelg.release_date >= DATEADD(day, -{overlap_days + 1}, '{max_release_date}'::DATE)"
+            )
+            logger.info(
+                "backfill_streaming_roster: incremental — release_date >= %s minus %d+1 day overlap "
+                "(TIDE_STREAMING_ROSTER_FULL=1 for full YTD scan)",
+                max_release_date,
+                overlap_days,
+            )
+        else:
+            date_filter = (
+                "AND mrelg.release_date >= DATE_TRUNC('year', CURRENT_DATE())"
+            )
+            logger.info(
+                "backfill_streaming_roster: no RELEASE_DATE in roster, falling back to YTD scan"
+            )
     else:
         date_filter = (
             "AND mrelg.release_date >= DATE_TRUNC('year', CURRENT_DATE())"

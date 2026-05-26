@@ -35,8 +35,7 @@ MODEL_PARQUET_METRICS_STREAMING_QUERY = "query_model_parquet_metrics_streaming.s
 
 # Phase 2 design notes
 # --------------------
-# The weekly CSV queries (Current_Data, alist_75k, bigreleaseflag_75k,
-# ytd_fiscal_revenue_by_label) accept
+# The weekly CSV queries (Current_Data, alist_75k, bigreleaseflag_75k) accept
 # a {MIN_WEEK_END_DATE} placeholder and emit only weeks >= that anchor (with an
 # upper guard so the in-progress week is never persisted). The Python layer
 # appends the result onto the existing CSV and de-dupes on a row-level primary
@@ -98,11 +97,9 @@ def update_parquet_metrics(sf: Snowflake) -> None:
 
 def _refresh_data_directory() -> None:
     """
-    Incrementally refresh the three weekly CSVs. Sequential (not ThreadPooled)
-    because `snowflake.connector` cursors serialize work on a single socket —
-    the old pool gave us contention without actual parallelism. A future pass
-    can give each query its own connection if we ever observe Snowflake-side
-    queuing as the bottleneck.
+    Incrementally refresh the three weekly CSVs (Current_Data, alist_75k,
+    bigreleaseflag_75k). Sequential because snowflake.connector cursors
+    serialize work on a single socket.
     """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     current_min_week = _get_min_week_end_date(
@@ -117,18 +114,12 @@ def _refresh_data_directory() -> None:
         DATA_DIR / "bigreleaseflag_75k.csv",
         week_col="WEEK_END_DATE",
     )
-    ytd_fiscal_min_week = _get_min_week_end_date(
-        DATA_DIR / "ytd_fiscal_revenue_by_label.csv",
-        week_col="week_end_date",
-    )
     logger.info(
         "train_model.py: Refreshing CSV directory "
-        "(Current_Data min=%s, alist_75k min=%s, bigreleaseflag_75k min=%s, "
-        "ytd_fiscal_revenue min=%s)",
+        "(Current_Data min=%s, alist_75k min=%s, bigreleaseflag_75k min=%s)",
         current_min_week,
         alist_min_week,
         big_release_min_week,
-        ytd_fiscal_min_week,
     )
 
     with get_snowflake_connection() as sf:
@@ -136,11 +127,6 @@ def _refresh_data_directory() -> None:
             ("Current_Data.csv", _update_current_data, current_min_week),
             ("alist_75k.csv", _update_a_list_75k, alist_min_week),
             ("bigreleaseflag_75k.csv", _update_big_release_flag_75k, big_release_min_week),
-            (
-                "ytd_fiscal_revenue_by_label.csv",
-                _update_ytd_fiscal_revenue_by_label,
-                ytd_fiscal_min_week,
-            ),
         ):
             _set_step(f"refresh_data:csv:{name}")
             _run_stage(name, lambda sf=sf, updater=updater: updater(sf, min_week))
