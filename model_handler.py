@@ -2016,6 +2016,126 @@ def get_ytd_fiscal_revenue_by_label_json(
     )
 
 
+def get_quarterly_share_and_qtd(
+    *,
+    fiscal_year: int | None = None,
+) -> list[dict[str, Any]]:
+    """Fiscal-quarter AMG share / QTD from quarterly_share_and_qtd.csv."""
+    import quarterly_share_from_csv
+
+    return quarterly_share_from_csv.query_quarterly_share_and_qtd(fiscal_year=fiscal_year)
+
+
+def get_quarterly_share_and_qtd_json(
+    *,
+    fiscal_year: int | None = None,
+) -> str:
+    return json.dumps(
+        get_quarterly_share_and_qtd(fiscal_year=fiscal_year),
+        default=str,
+    )
+
+
+def get_quarterly_share_level3(
+    *,
+    fiscal_year: int | None = None,
+    profit_center_label: str | None = None,
+) -> list[dict[str, Any]]:
+    """Fiscal-quarter level-3 label share from quarterly_share_level3.csv."""
+    import quarterly_share_level3_from_csv
+
+    return quarterly_share_level3_from_csv.query_quarterly_share_level3(
+        fiscal_year=fiscal_year,
+        profit_center_label=profit_center_label,
+    )
+
+
+def get_quarterly_share_level3_json(
+    *,
+    fiscal_year: int | None = None,
+    profit_center_label: str | None = None,
+) -> str:
+    return json.dumps(
+        get_quarterly_share_level3(
+            fiscal_year=fiscal_year,
+            profit_center_label=profit_center_label,
+        ),
+        default=str,
+    )
+
+
+def get_releases_by_q_amg_labels(
+    *,
+    level_3_distributor: str | None = None,
+    profit_center_label: str | None = None,
+    first_sale_date_from: str | None = None,
+    first_sale_date_to: str | None = None,
+    baseline_fiscal_year: int | None = None,
+    baseline_fiscal_quarter: str | None = None,
+    comparison_fiscal_year: int | None = None,
+    comparison_fiscal_quarter: str | None = None,
+) -> Any:
+    """
+    AMG level-3 release catalog from releases_by_q_amg_labels.csv.
+
+    When baseline + comparison fiscal params are all set, returns
+    ``{baseline, comparison, baseline_window, comparison_window}``.
+    Otherwise returns a flat list of row dicts.
+    """
+    import releases_by_q_amg_labels_from_csv as rel_csv
+
+    has_baseline = baseline_fiscal_year is not None and baseline_fiscal_quarter
+    has_comparison = comparison_fiscal_year is not None and comparison_fiscal_quarter
+    has_label = bool(level_3_distributor or profit_center_label)
+    if has_baseline or has_comparison:
+        if not (has_baseline and has_comparison and has_label):
+            raise ValueError(
+                "baseline_fiscal_year, baseline_fiscal_quarter, comparison_fiscal_year, "
+                "comparison_fiscal_quarter, and level_3_distributor or profit_center_label "
+                "are required together."
+            )
+        return rel_csv.query_releases_by_q_amg_labels_comparison(
+            level_3_distributor=level_3_distributor,
+            profit_center_label=profit_center_label,
+            baseline_fiscal_year=int(baseline_fiscal_year),
+            baseline_fiscal_quarter=str(baseline_fiscal_quarter).strip(),
+            comparison_fiscal_year=int(comparison_fiscal_year),
+            comparison_fiscal_quarter=str(comparison_fiscal_quarter).strip(),
+        )
+    return rel_csv.query_releases_by_q_amg_labels(
+        level_3_distributor=level_3_distributor,
+        profit_center_label=profit_center_label,
+        first_sale_date_from=first_sale_date_from,
+        first_sale_date_to=first_sale_date_to,
+    )
+
+
+def get_releases_by_q_amg_labels_json(
+    *,
+    level_3_distributor: str | None = None,
+    profit_center_label: str | None = None,
+    first_sale_date_from: str | None = None,
+    first_sale_date_to: str | None = None,
+    baseline_fiscal_year: int | None = None,
+    baseline_fiscal_quarter: str | None = None,
+    comparison_fiscal_year: int | None = None,
+    comparison_fiscal_quarter: str | None = None,
+) -> str:
+    return json.dumps(
+        get_releases_by_q_amg_labels(
+            level_3_distributor=level_3_distributor,
+            profit_center_label=profit_center_label,
+            first_sale_date_from=first_sale_date_from,
+            first_sale_date_to=first_sale_date_to,
+            baseline_fiscal_year=baseline_fiscal_year,
+            baseline_fiscal_quarter=baseline_fiscal_quarter,
+            comparison_fiscal_year=comparison_fiscal_year,
+            comparison_fiscal_quarter=comparison_fiscal_quarter,
+        ),
+        default=str,
+    )
+
+
 def update_release(
     *,
     id: int,
@@ -2944,12 +3064,23 @@ def refresh_weekly(force_refresh_parquets: bool = False) -> dict:
             "reason": "weekly path is CSV-only by design",
         }
 
-    # Stage 2: CSV-only training.
+    # Stage 2: CSV-only training. Quarterly-share CSVs (bi_sandbox) are
+    # best-effort inside refresh_data; core CSVs + train still run when they fail.
     set_step("refresh_data:start")
     t0 = _now()
     try:
-        refresh_data(csv_only=True)
-        summary["stages"]["refresh_data"] = {"ok": True, "elapsed_sec": _elapsed(t0)}
+        optional_csv_errors = refresh_data(csv_only=True)
+        refresh_data_summary: Dict[str, Any] = {
+            "ok": True,
+            "elapsed_sec": _elapsed(t0),
+        }
+        if optional_csv_errors:
+            refresh_data_summary["optional_csv_errors"] = optional_csv_errors
+            logger.warning(
+                "refresh_weekly: refresh_data completed with %d optional BI_SANDBOX CSV failure(s)",
+                len(optional_csv_errors),
+            )
+        summary["stages"]["refresh_data"] = refresh_data_summary
     except Exception as e:
         logger.exception("refresh_weekly: refresh_data failed")
         summary["stages"]["refresh_data"] = {
@@ -3049,6 +3180,13 @@ def reload_artifacts() -> None:
     import ytd_fiscal_revenue_from_csv
 
     ytd_fiscal_revenue_from_csv.clear_cache()
+    import quarterly_share_from_csv
+    import quarterly_share_level3_from_csv
+    import releases_by_q_amg_labels_from_csv
+
+    quarterly_share_from_csv.clear_cache()
+    quarterly_share_level3_from_csv.clear_cache()
+    releases_by_q_amg_labels_from_csv.clear_cache()
     album_art.clear_cache()
 
 

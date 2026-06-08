@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# WEEKLY (Mon 02:00 PT): hit /v1/data/refresh_weekly and poll until done.
+# WEEKLY (Mon 14:00 UTC): hit /v1/data/refresh_weekly and poll until done.
 # Endpoint pulls weekly inputs from S3, runs CSV-only refresh+train, runs
 # release backfill, and pushes outputs back to S3. Heavy parquets are skipped
 # by default — call /v1/data/refresh_model when those need rebuilding.
+# Quarterly-share CSVs (bi_sandbox) are best-effort: if Snowflake denies that
+# database, core CSVs, training, backfill, and S3 sync still complete.
 set -euo pipefail
 API_URL="${API_URL:-http://127.0.0.1:8000}"
 POLL_SEC="${POLL_SEC:-30}"
@@ -27,7 +29,15 @@ d=json.load(sys.stdin); s=d.get("steps") or []
 print(d.get("status",""), s[-1] if s else "")')"
   [[ "$STEP" != "$LAST_STEP" && -n "$STEP" ]] && { log "step: $STEP"; LAST_STEP="$STEP"; }
   case "$STATUS" in
-    succeeded|completed) log "DONE in $(( $(date +%s) - START ))s"; exit 0 ;;
+    succeeded|completed)
+      log "DONE in $(( $(date +%s) - START ))s"
+      printf '%s' "$JOB_JSON" | python3 -c 'import sys,json
+d=json.load(sys.stdin)
+errs=(d.get("result") or {}).get("stages",{}).get("refresh_data",{}).get("optional_csv_errors") or []
+for e in errs:
+    print("WARN optional_csv_skipped:", e.get("csv"), ":", (e.get("error") or "")[:200])' || true
+      exit 0
+      ;;
     failed) log "FAILED: $JOB_JSON"; exit 3 ;;
     running|pending|queued) sleep "$POLL_SEC" ;;
     *) log "unknown status=$STATUS"; sleep "$POLL_SEC" ;;

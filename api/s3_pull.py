@@ -8,7 +8,7 @@ Design pattern:
 
 Scopes:
   - "db"                   marketshare_data.db
-  - "csvs"                 model/data/*.csv (Current_Data, alist_75k, bigreleaseflag, ytd_fiscal_revenue_by_label)
+  - "csvs"                 model/data/*.csv (Current_Data, alist_75k, bigreleaseflag, ytd_fiscal_revenue_by_label, quarterly_share_and_qtd, quarterly_share_level3, releases_by_q_amg_labels). Excludes static 2025_revenue_catalog.csv (manual S3 upload only).
   - "parquets"             model/data/*.parquet (heavy; archetype/training inputs)
   - "artifacts_75k"        model/artifacts_75k/** (LGBM/Prophet/spike/df_full/sidecars)
   - "archetypes_artifacts" model/archetypes_artifacts/** (album decay + singles/ subdir; forecast serving)
@@ -59,6 +59,13 @@ ALL_SCOPES: tuple[str, ...] = (
 _MODEL_DATA_REL = Path("model/data")
 _ARTIFACTS_75K_REL = Path("model/artifacts_75k")
 _ARCHETYPES_REL = Path("model/archetypes_artifacts")
+
+# Static catalog — never pull/push via automated csv scope (refresh_weekly, startup sync).
+_CSV_SYNC_EXCLUDE: frozenset[str] = frozenset({"2025_revenue_catalog.csv"})
+
+
+def _csv_sync_excluded(path: Path | str) -> bool:
+    return Path(path).name in _CSV_SYNC_EXCLUDE
 
 
 def _repo_root() -> Path:
@@ -249,6 +256,13 @@ def sync_artifacts_from_s3_if_configured(
                 ext = Path(rel).suffix.lower()
                 if ext not in suffix_filter:
                     continue
+            basename = Path(rel).name if rel else Path(key).name
+            if suffix_filter == {".csv"} and _csv_sync_excluded(basename):
+                logger.info(
+                    "S3 pull: skip excluded csv s3://%s/%s (static; not synced by cron)",
+                    bucket, key,
+                )
+                continue
             dest = (root / local_rel / rel) if rel else (root / local_rel / Path(key).name)
             download_key(key, dest, expected_size=obj.get("Size"))
             n += 1
@@ -338,6 +352,12 @@ def sync_artifacts_to_s3_if_configured(
             if not fp.is_file():
                 continue
             if suffix_filter is not None and fp.suffix.lower() not in suffix_filter:
+                continue
+            if suffix_filter == {".csv"} and _csv_sync_excluded(fp):
+                logger.info(
+                    "S3 push: skip excluded csv %s (static; not synced by cron)",
+                    fp,
+                )
                 continue
             rel = fp.relative_to(local_dir).as_posix()
             key = f"{full_prefix}{rel}".replace("//", "/")

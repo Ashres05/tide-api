@@ -247,6 +247,94 @@ def prewarm_streaming_roster(_: None = Depends(require_api_key)) -> JobAcceptedR
     )
 
 
+@app.get("/v1/revenue/quarterly_share_and_qtd")
+def quarterly_share_and_qtd(fiscal_year: int | None = None):
+    """
+    Fiscal-quarter AMG market share and QTD growth (from
+    model/data/quarterly_share_and_qtd.csv on S3).
+
+    Optional filter: ``fiscal_year`` (e.g. 2026).
+    """
+    try:
+        payload = model_handler.get_quarterly_share_and_qtd_json(fiscal_year=fiscal_year)
+        return Response(content=payload, media_type="application/json")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/v1/revenue/quarterly_share_level3")
+def quarterly_share_level3(
+    fiscal_year: int | None = None,
+    profit_center_label: str | None = None,
+):
+    """
+    Fiscal-quarter level-3 profit-center share metrics (from
+    model/data/quarterly_share_level3.csv on S3).
+
+    Optional filters: ``fiscal_year``, ``profit_center_label`` (e.g. ``Atlantic``).
+    """
+    try:
+        payload = model_handler.get_quarterly_share_level3_json(
+            fiscal_year=fiscal_year,
+            profit_center_label=profit_center_label,
+        )
+        return Response(content=payload, media_type="application/json")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/v1/revenue/releases_by_q_amg_labels")
+def releases_by_q_amg_labels(
+    level_3_distributor: str | None = None,
+    profit_center_label: str | None = None,
+    first_sale_date_from: str | None = None,
+    first_sale_date_to: str | None = None,
+    baseline_fiscal_year: int | None = None,
+    baseline_fiscal_quarter: str | None = None,
+    comparison_fiscal_year: int | None = None,
+    comparison_fiscal_quarter: str | None = None,
+):
+    """
+    US non-compilation releases for AMG level-3 labels (from
+    model/data/releases_by_q_amg_labels.csv on S3).
+
+    Flat list: optional ``level_3_distributor`` or ``profit_center_label`` (from
+    level3 share UI, e.g. ``Atlantic``), ``first_sale_date_from`` / ``to``.
+
+    Comparison mode: pass label + baseline and comparison ``fiscal_year`` /
+    ``fiscal_quarter`` (exact strings from ``quarterly_share_level3``).
+    """
+    try:
+        for d in (first_sale_date_from, first_sale_date_to):
+            if d is not None:
+                model_handler._validate_date(d)
+        payload = model_handler.get_releases_by_q_amg_labels_json(
+            level_3_distributor=level_3_distributor,
+            profit_center_label=profit_center_label,
+            first_sale_date_from=first_sale_date_from,
+            first_sale_date_to=first_sale_date_to,
+            baseline_fiscal_year=baseline_fiscal_year,
+            baseline_fiscal_quarter=baseline_fiscal_quarter,
+            comparison_fiscal_year=comparison_fiscal_year,
+            comparison_fiscal_quarter=comparison_fiscal_quarter,
+        )
+        return Response(content=payload, media_type="application/json")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 @app.get("/v1/revenue/streaming_roster")
 def list_streaming_roster():
     """List STREAMING_ROSTER_2026 (streaming revenue board)."""

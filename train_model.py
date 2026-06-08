@@ -29,6 +29,10 @@ CURRENT_DATA_QUERY = "query_model_current_data.sql"
 A_LIST_75K_QUERY = "query_model_a_list_75k.sql"
 BIG_RELEASE_FLAG_75K_QUERY = "query_model_big_release_flag.sql"
 YTD_FISCAL_REVENUE_BY_LABEL_QUERY = "query_ytd_fiscal_revenue_by_label.sql"
+RELEASES_BY_Q_AMG_LABELS_QUERY = "query_releases_by_q_amg_labels.sql"
+QUARTERLY_SHARE_AND_QTD_QUERY = "query_quarterly_share_and_qtd.sql"
+QUARTERLY_SHARE_AND_QTD_MAX_P_DAY_QUERY = "query_quarterly_share_and_qtd_max_p_day.sql"
+QUARTERLY_SHARE_LEVEL3_QUERY = "query_quarterly_share_level3.sql"
 
 MODEL_PARQUET_METRICS_QUERY = "query_model_parquet_metrics.sql"
 MODEL_PARQUET_METRICS_STREAMING_QUERY = "query_model_parquet_metrics_streaming.sql"
@@ -55,8 +59,16 @@ MODEL_PARQUET_METRICS_STREAMING_QUERY = "query_model_parquet_metrics_streaming.s
 # Cold-start anchor when alist_75k.csv does not yet exist.
 _COLD_START_MIN_WEEK = "2018-01-01"
 
+# Quarterly-share CSVs read bi_sandbox. When that database is unavailable the
+# weekly cron should still refresh core model CSVs, train artifacts, backfill,
+# and push to S3.
+_BI_SANDBOX_CSV_STAGES = (
+    "quarterly_share_and_qtd.csv",
+    "quarterly_share_level3.csv",
+)
 
-def refresh_data(*, csv_only: bool = False) -> None:
+
+def refresh_data(*, csv_only: bool = False) -> list[dict[str, str]]:
     """
     Incrementally refresh the three weekly CSVs from Snowflake, then train artifacts.
 
@@ -67,9 +79,10 @@ def refresh_data(*, csv_only: bool = False) -> None:
     reads and archetype retrains. Used by ``refresh_weekly`` to avoid OOM.
     """
     _set_step("refresh_data:pull_csvs")
-    _refresh_data_directory()
+    optional_csv_errors = _refresh_data_directory()
     _set_step("refresh_data:train_artifacts")
     train_model(csv_only=csv_only)
+    return optional_csv_errors
 
 
 def update_parquet_metrics(sf: Snowflake) -> None:
@@ -95,12 +108,16 @@ def update_parquet_metrics(sf: Snowflake) -> None:
         df_streaming.to_parquet(DATA_DIR / "worldwide_streams_compressed.parquet", index=False)
 
 
-def _refresh_data_directory() -> None:
+def _refresh_data_directory() -> list[dict[str, str]]:
     """
-    Incrementally refresh the three weekly CSVs (Current_Data, alist_75k,
-    bigreleaseflag_75k). Sequential because snowflake.connector cursors
-    serialize work on a single socket.
+    Incrementally refresh weekly CSVs from Snowflake. Sequential because
+    snowflake.connector cursors serialize work on a single socket.
+
+    Core model CSVs (Current_Data, alist_75k, bigreleaseflag_75k) and
+    releases_by_q_amg_labels are required — failures abort refresh_data.
+    Quarterly-share CSVs depend on bi_sandbox and are best-effort.
     """
+    optional_errors: list[dict[str, str]] = []
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     current_min_week = _get_min_week_end_date(
         DATA_DIR / "Current_Data.csv",
@@ -129,7 +146,24 @@ def _refresh_data_directory() -> None:
             ("bigreleaseflag_75k.csv", _update_big_release_flag_75k, big_release_min_week),
         ):
             _set_step(f"refresh_data:csv:{name}")
-            _run_stage(name, lambda sf=sf, updater=updater: updater(sf, min_week))
+            _run_stage(
+                name,
+                lambda sf=sf, updater=updater, min_week=min_week: updater(sf, min_week),
+            )
+        bi_sandbox_updaters = {
+            "quarterly_share_and_qtd.csv": _update_quarterly_share_and_qtd,
+            "quarterly_share_level3.csv": _update_quarterly_share_level3,
+        }
+        for name in _BI_SANDBOX_CSV_STAGES:
+            _set_step(f"refresh_data:csv:{name}")
+            updater = bi_sandbox_updaters[name]
+            _run_stage_optional(name, lambda sf=sf, updater=updater: updater(sf), optional_errors)
+        _set_step("refresh_data:csv:releases_by_q_amg_labels.csv")
+        _run_stage(
+            "releases_by_q_amg_labels.csv",
+            lambda sf=sf: _update_releases_by_q_amg_labels(sf),
+        )
+    return optional_errors
 
 
 def _run_stage(name: str, fn: Callable[[], int]) -> None:
@@ -137,6 +171,23 @@ def _run_stage(name: str, fn: Callable[[], int]) -> None:
     added = fn()
     elapsed = time.perf_counter() - t0
     logger.info("train_model.py: %s +%d rows (%.1fs)", name, added, elapsed)
+
+
+def _run_stage_optional(
+    name: str,
+    fn: Callable[[], int],
+    errors: list[dict[str, str]],
+) -> None:
+    """Run a bi_sandbox CSV stage; record and continue when Snowflake denies access."""
+    try:
+        _run_stage(name, fn)
+    except Exception as e:
+        logger.exception(
+            "train_model.py: optional BI_SANDBOX stage %s failed; continuing weekly refresh",
+            name,
+        )
+        _set_step(f"refresh_data:csv:{name}:skipped")
+        errors.append({"csv": name, "error": str(e)})
 
 
 def _get_min_week_end_date(path: Path, *, week_col: str) -> str:
@@ -196,6 +247,16 @@ def _normalize_date_columns(df: pd.DataFrame) -> pd.DataFrame:
 def _run_incremental_query(sf: Snowflake, query_name: str, min_week: str) -> pd.DataFrame:
     """Render {MIN_WEEK_END_DATE} into a SQL template and execute."""
     sql = load_sql(query_name).replace("{MIN_WEEK_END_DATE}", min_week)
+    df = sf.query(sql)
+    df = _normalize_date_columns(df)
+    return df
+
+
+def _run_incremental_first_sale_query(
+    sf: Snowflake, query_name: str, min_first_sale_date: str
+) -> pd.DataFrame:
+    """Render {MIN_FIRST_SALE_DATE} into a SQL template and execute."""
+    sql = load_sql(query_name).replace("{MIN_FIRST_SALE_DATE}", min_first_sale_date)
     df = sf.query(sql)
     df = _normalize_date_columns(df)
     return df
@@ -294,3 +355,114 @@ def _update_ytd_fiscal_revenue_by_label(sf: Snowflake, min_week: str) -> int:
             "level_3_distributor",
         ],
     )
+
+
+def _snowflake_max_p_day_for_quarterly_share(sf: Snowflake) -> datetime.date | None:
+    import quarterly_share_from_csv
+
+    df = sf.query(load_sql(QUARTERLY_SHARE_AND_QTD_MAX_P_DAY_QUERY))
+    if df.empty:
+        return None
+    col = "max_p_day" if "max_p_day" in df.columns else df.columns[0]
+    return quarterly_share_from_csv.coerce_snowflake_max_p_day(df.iloc[0][col])
+
+
+def _update_quarterly_share_and_qtd(sf: Snowflake) -> int:
+    """Rewrite quarterly_share_and_qtd.csv when Snowflake max(p_day) advances."""
+    import quarterly_share_from_csv
+
+    csv_path = DATA_DIR / "quarterly_share_and_qtd.csv"
+    local_max = quarterly_share_from_csv.max_p_day_from_csv(csv_path)
+    snowflake_max = _snowflake_max_p_day_for_quarterly_share(sf)
+    if snowflake_max is None:
+        logger.warning("quarterly_share_and_qtd: Snowflake max(p_day) unavailable; skipping")
+        return 0
+    if snowflake_max <= local_max:
+        logger.info(
+            "quarterly_share_and_qtd: up to date (snowflake max=%s local max=%s)",
+            snowflake_max,
+            local_max,
+        )
+        return 0
+    logger.info(
+        "quarterly_share_and_qtd: refreshing (snowflake max=%s > local max=%s)",
+        snowflake_max,
+        local_max,
+    )
+    df = sf.query(load_sql(QUARTERLY_SHARE_AND_QTD_QUERY))
+    df = _normalize_date_columns(df)
+    if "p_day" in df.columns:
+        df = df.drop(columns=["p_day"])
+    df.columns = [str(c).strip().upper() for c in df.columns]
+    out = quarterly_share_from_csv.normalize_quarterly_share_dataframe(df)
+    before = 0
+    if csv_path.exists():
+        try:
+            before = len(pd.read_csv(csv_path))
+        except Exception:
+            before = 0
+    out.to_csv(csv_path, index=False)
+    quarterly_share_from_csv.clear_cache()
+    return len(out) - before
+
+
+def _update_quarterly_share_level3(sf: Snowflake) -> int:
+    """Rewrite quarterly_share_level3.csv when Snowflake max(p_day) advances."""
+    import quarterly_share_level3_from_csv as lvl3_csv
+
+    csv_path = DATA_DIR / "quarterly_share_level3.csv"
+    local_max = lvl3_csv.max_p_day_from_level3_csv(csv_path)
+    snowflake_max = _snowflake_max_p_day_for_quarterly_share(sf)
+    if snowflake_max is None:
+        logger.warning("quarterly_share_level3: Snowflake max(p_day) unavailable; skipping")
+        return 0
+    if snowflake_max <= local_max:
+        logger.info(
+            "quarterly_share_level3: up to date (snowflake max=%s local max=%s)",
+            snowflake_max,
+            local_max,
+        )
+        return 0
+    logger.info(
+        "quarterly_share_level3: refreshing (snowflake max=%s > local max=%s)",
+        snowflake_max,
+        local_max,
+    )
+    df = sf.query(load_sql(QUARTERLY_SHARE_LEVEL3_QUERY))
+    df = _normalize_date_columns(df)
+    if "p_day" in df.columns:
+        df = df.drop(columns=["p_day"])
+    df.columns = [str(c).strip().upper() for c in df.columns]
+    out = lvl3_csv.normalize_quarterly_share_level3_dataframe(df)
+    before = 0
+    if csv_path.exists():
+        try:
+            before = len(pd.read_csv(csv_path))
+        except Exception:
+            before = 0
+    out.to_csv(csv_path, index=False)
+    lvl3_csv.clear_cache()
+    return len(out) - before
+
+
+def _update_releases_by_q_amg_labels(sf: Snowflake) -> int:
+    """
+    Append releases with ``first_sale_date`` greater than the CSV max (cold start
+    anchor 2023-08-31 so the first pull includes 2023-09-01+). Pushed to S3 with
+    other model/data CSVs on refresh_weekly.
+    """
+    import releases_by_q_amg_labels_from_csv as rel_csv
+
+    csv_path = DATA_DIR / "releases_by_q_amg_labels.csv"
+    min_fsd = rel_csv.max_first_sale_date_from_csv(csv_path)
+    df = _run_incremental_first_sale_query(sf, RELEASES_BY_Q_AMG_LABELS_QUERY, min_fsd)
+    df.columns = [str(c).strip().upper() for c in df.columns]
+    added = _append_and_write_csv(
+        csv_path,
+        rel_csv.normalize_releases_dataframe(df),
+        dedupe_subset=["MRELG_ID"],
+        sort_by=["DISPLAY_ARTIST", "TITLE", "FIRST_SALE_DATE"],
+    )
+    if added:
+        rel_csv.clear_cache()
+    return added
