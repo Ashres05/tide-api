@@ -3798,6 +3798,126 @@ def _resolve_mrelg_metadata_snowflake(mrelg_id: str, sf: Snowflake) -> Dict[str,
     }
 
 
+def _is_archetype_artist_missing_error(err: BaseException) -> bool:
+    msg = str(err).lower()
+    return "unknown artist" in msg or "not present in training artifacts" in msg
+
+
+def _stream_only_retention_rate(known: List[float]) -> float:
+    """Median week-over-week retention from recent positive history."""
+    if len(known) < 2:
+        return 0.98
+    ratios: List[float] = []
+    start = max(1, len(known) - 8)
+    for i in range(start, len(known)):
+        prev = known[i - 1]
+        cur = known[i]
+        if prev > 0 and cur > 0:
+            ratios.append(cur / prev)
+    if not ratios:
+        return 0.98
+    ratios.sort()
+    r = float(ratios[len(ratios) // 2])
+    return max(0.92, min(0.995, r))
+
+
+def _stream_only_floor(known: List[float]) -> float:
+    pos = [float(v) for v in known if v > 0]
+    if not pos:
+        return 0.0
+    return min(pos) * 0.25
+
+
+def _scenario_stream_only_multiplier(scenario: str) -> float:
+    label = _normalize_scenario_label(scenario)
+    return {"Bear": 0.9, "Bull": 1.1}.get(label, 1.0)
+
+
+def _extrapolate_stream_only_weekly(
+    known: List[float],
+    *,
+    horizon_weeks: int,
+    scenario: str = "Base",
+) -> List[float]:
+    """
+    Extend observed weekly streams with a simple decay curve — no archetype fit.
+    Used when the artist is absent from training artifacts but SQLite weekly
+    cache has real stream history.
+    """
+    if not known:
+        return []
+    series = [float(x) for x in known]
+    n_known = len(series)
+    if n_known >= horizon_weeks:
+        return series[:horizon_weeks]
+
+    retention = _stream_only_retention_rate(series)
+    floor = _stream_only_floor(series)
+    while len(series) < horizon_weeks:
+        prev = series[-1]
+        above = max(0.0, prev - floor)
+        nxt = floor + above * retention
+        series.append(max(floor, nxt))
+
+    mult = _scenario_stream_only_multiplier(scenario)
+    if mult != 1.0:
+        for i in range(n_known, len(series)):
+            series[i] = floor + (series[i] - floor) * mult
+    return series
+
+
+def _weekly_streams_to_global_forecast_df(
+    mrelg_id: str,
+    release_date: str,
+    artist: str,
+    title: str,
+    weekly_streams: List[float],
+    hist_df: pd.DataFrame,
+    n_known: int,
+) -> pd.DataFrame:
+    """Build the standard global-streaming response frame from weekly levels."""
+    cum = 0.0
+    rows: List[Dict[str, Any]] = []
+    for week, value in enumerate(weekly_streams, start=1):
+        cum += value
+        rows.append(
+            {
+                "week": week,
+                "pred_worldwide_streams": value,
+                "cumulative_worldwide_streams": cum,
+            }
+        )
+    df = pd.DataFrame(rows)
+
+    if not hist_df.empty:
+        date_col = next(c for c in hist_df.columns if "date" in c.lower())
+        hist_dates = pd.to_datetime(hist_df[date_col]).reset_index(drop=True)
+        last_known_date = hist_dates.iloc[-1]
+
+        def _week_to_date(week: int) -> str:
+            idx = week - 1
+            if idx < len(hist_dates):
+                return hist_dates.iloc[idx].strftime("%Y-%m-%d")
+            return (last_known_date + pd.Timedelta(weeks=(week - n_known))).strftime("%Y-%m-%d")
+    else:
+        rel_dt = pd.to_datetime(release_date)
+
+        def _week_to_date(week: int) -> str:  # type: ignore[misc]
+            return (rel_dt + pd.Timedelta(weeks=week)).strftime("%Y-%m-%d")
+
+    df["week_ending_date"] = df["week"].apply(_week_to_date)
+    df["data_type"] = df["week"].apply(lambda w: "Actual" if w <= n_known else "Forecast")
+
+    df.insert(0, "mrelg_id", mrelg_id)
+    df.insert(1, "artist", artist or "")
+    df.insert(2, "title", title or "")
+    week_pos = df.columns.get_loc("week")
+    for col in ("data_type", "week_ending_date"):
+        df.insert(week_pos + 1, col, df.pop(col))
+
+    return df
+
+
 def _build_global_streaming_forecast(
     mrelg_id: str,
     release_date: str,
@@ -3816,6 +3936,10 @@ def _build_global_streaming_forecast(
     global streaming forecast endpoints. Pulls observed weekly streams from
     Snowflake, runs the worldwide-streams archetype simulation, and returns
     the actual-plus-forecast frame.
+
+    When the artist is missing from archetype training artifacts but observed
+    weekly streams exist in the SQLite cache, falls back to a stream-only decay
+    extrapolation (no archetype fit) instead of erroring.
 
     ``singles=True`` loads archetypes from ``worldwide_streams_singles`` instead
     of ``worldwide_streams``; simulation code is unchanged.
@@ -3918,41 +4042,49 @@ def _build_global_streaming_forecast(
         "scenario": _normalize_scenario_label(scenario),
     }
 
-    with _phase("simulation") as info:
-        result = simulate_one_worldwide_streams(release_dict, artifacts, end_week=horizon_weeks)
-        info["weeks"] = horizon_weeks
-        info["known"] = len(known)
-
     n_known = len(known)
-    df = pd.DataFrame(result["weekly"])  # week, pred_worldwide_streams, cumulative_worldwide_streams
+    with _phase("simulation") as info:
+        try:
+            result = simulate_one_worldwide_streams(release_dict, artifacts, end_week=horizon_weeks)
+        except ValueError as err:
+            if _is_archetype_artist_missing_error(err) and any(x > 0 for x in known):
+                logger.info(
+                    "global_streaming: artist %r not in training artifacts; "
+                    "stream-only fallback for mrelg_id=%s (%d observed weeks)",
+                    artist,
+                    mrelg_id,
+                    n_known,
+                )
+                weekly = _extrapolate_stream_only_weekly(
+                    known,
+                    horizon_weeks=horizon_weeks,
+                    scenario=scenario,
+                )
+                return _weekly_streams_to_global_forecast_df(
+                    mrelg_id,
+                    release_date,
+                    artist,
+                    title,
+                    weekly,
+                    hist_df,
+                    n_known,
+                )
+            raise
+        info["weeks"] = horizon_weeks
+        info["known"] = n_known
 
-    if not hist_df.empty:
-        date_col = next(c for c in hist_df.columns if "date" in c.lower())
-        hist_dates = pd.to_datetime(hist_df[date_col]).reset_index(drop=True)
-        last_known_date = hist_dates.iloc[-1]
-
-        def _week_to_date(week: int) -> str:
-            idx = week - 1
-            if idx < len(hist_dates):
-                return hist_dates.iloc[idx].strftime("%Y-%m-%d")
-            return (last_known_date + pd.Timedelta(weeks=(week - n_known))).strftime("%Y-%m-%d")
-    else:
-        rel_dt = pd.to_datetime(release_date)
-
-        def _week_to_date(week: int) -> str:  # type: ignore[misc]
-            return (rel_dt + pd.Timedelta(weeks=week)).strftime("%Y-%m-%d")
-
-    df["week_ending_date"] = df["week"].apply(_week_to_date)
-    df["data_type"] = df["week"].apply(lambda w: "Actual" if w <= n_known else "Forecast")
-
-    df.insert(0, "mrelg_id", mrelg_id)
-    df.insert(1, "artist", artist or "")
-    df.insert(2, "title", title or "")
-    week_pos = df.columns.get_loc("week")
-    for col in ("data_type", "week_ending_date"):
-        df.insert(week_pos + 1, col, df.pop(col))
-
-    return df
+    weekly_streams = [
+        float(row["pred_worldwide_streams"]) for row in result["weekly"]
+    ]
+    return _weekly_streams_to_global_forecast_df(
+        mrelg_id,
+        release_date,
+        artist,
+        title,
+        weekly_streams,
+        hist_df,
+        n_known,
+    )
 
 
 def _get_known_vols_global_streaming(
