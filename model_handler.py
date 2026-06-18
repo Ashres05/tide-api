@@ -3279,7 +3279,7 @@ def _sqlite_row_to_release_map(row: sqlite3.Row) -> dict:
 
     release_map: dict = {
         "mrelg_id": mrelg_id or None,
-        "name": artist or title or "Unknown",
+        "name": title or artist or "Unknown",
         "artist": artist or "",
         "title": title or "",
         "label": row["LABEL_NAME"],

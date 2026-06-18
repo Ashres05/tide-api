@@ -171,6 +171,29 @@ def get_inferred_cluster(release_dict: dict) -> int:
     return int(np.argmax(joint_prob))
 
 
+def decay_artist_name(release_dict: dict) -> str:
+    """Artist for archetype decay lookup; ``name`` is the release/album label."""
+    artist = release_dict.get("artist")
+    if artist is not None and str(artist).strip():
+        return str(artist).strip()
+    return str(release_dict.get("name") or "Unknown")
+
+
+def release_peak_w1_vol(release_dict: dict) -> float:
+    """Peak W1 AE for injection gating (known actuals, components, or fw_vol)."""
+    known_vols = release_dict.get("known_vols") or []
+    if known_vols:
+        return float(max(known_vols))
+    comp = (
+        float(release_dict.get("fw_streams", 0.0))
+        + float(release_dict.get("fw_sales", 0.0))
+        + float(release_dict.get("fw_songs", 0.0))
+    )
+    if comp > 0:
+        return comp
+    return float(release_dict.get("fw_vol", 0.0))
+
+
 def _adjust_tail_weights_for_empirical_w2(
     tw: np.ndarray,
     total_tail_vol: float,
@@ -236,7 +259,7 @@ def generate_archetype_decay_curve(
             artifacts_songs_singles=artifacts_songs_singles,
         )
     )
-    artist = release_dict.get("name", release_dict.get("artist", "Unknown"))
+    artist = decay_artist_name(release_dict)
     genre = release_dict.get("genre")
     scenario = release_dict.get("scenario") or "Base"
     cluster_raw = release_dict.get("cluster")
@@ -426,8 +449,8 @@ def run_archetype_scenario(
     df_tracker = pd.DataFrame({"Week Ending Date": tracker_dates})
 
     def inject_volume(label_col: str, release_dict: dict, drop_date: Any, release_name: str) -> Optional[pd.DataFrame]:
-        fw_vol = max(release_dict["known_vols"]) if release_dict.get("known_vols") else release_dict.get("fw_vol", 0)
-        if pd.isna(drop_date) or not drop_date or fw_vol == 0:
+        fw_vol = release_peak_w1_vol(release_dict)
+        if pd.isna(drop_date) or not drop_date or fw_vol <= 0:
             return None
             
         req_date = pd.to_datetime(drop_date)

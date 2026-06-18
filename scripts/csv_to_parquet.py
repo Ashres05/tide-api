@@ -5,9 +5,13 @@ Convert a CSV to Snappy-compressed Parquet (PyArrow or fastparquet).
 Handles multi-line quoted fields (e.g. JSON in GENRES) via PyArrow
 ``newlines_in_values`` or pandas ``engine='python'``.
 
+Large / wide fields: defaults raise PyArrow ``block_size`` (64 MiB) and Python
+``csv.field_size_limit`` (50M). For very large files use ``--chunksize``.
+
   python scripts/csv_to_parquet.py \\
-    --input /Users/ronannayak/Downloads/current_singles_streams.csv \\
-    --output model/data/current_singles_streams.parquet
+    --input /path/to/big.csv \\
+    --output model/data/big.parquet \\
+    --chunksize 500000
 
 Requires one of: pyarrow (recommended for read+write), fastparquet (+ pandas for CSV read).
 """
@@ -15,12 +19,31 @@ Requires one of: pyarrow (recommended for read+write), fastparquet (+ pandas for
 from __future__ import annotations
 
 import argparse
+import csv
 import logging
 import sys
 import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# PyArrow CSV default block_size is 1 MiB — too small for wide / multiline fields.
+DEFAULT_BLOCK_SIZE = 64 * 1024 * 1024
+# Python csv module default field limit is 128 KiB.
+DEFAULT_CSV_FIELD_LIMIT = 50_000_000
+
+
+def _raise_csv_field_limit(limit: int | None = None) -> int:
+    """Raise stdlib csv.field_size_limit for wide columns (e.g. embedded JSON)."""
+    target = int(limit) if limit is not None and limit > 0 else DEFAULT_CSV_FIELD_LIMIT
+    cap = sys.maxsize
+    while cap > 0:
+        try:
+            csv.field_size_limit(min(target, cap))
+            return min(target, cap)
+        except OverflowError:
+            cap = int(cap / 10)
+    raise RuntimeError("Could not raise csv.field_size_limit")
 
 
 def _have_pyarrow() -> bool:
@@ -41,10 +64,18 @@ def _have_fastparquet() -> bool:
         return False
 
 
-def _pandas_read_csv(src: Path, *, encoding: str, chunksize: int | None = None):
+def _pandas_read_csv(
+    src: Path,
+    *,
+    encoding: str,
+    chunksize: int | None = None,
+    field_limit: int | None = None,
+):
     """pandas engine=python does not support low_memory."""
     import pandas as pd
 
+    applied = _raise_csv_field_limit(field_limit)
+    logger.debug("csv.field_size_limit=%d", applied)
     kwargs = {"filepath_or_buffer": src, "encoding": encoding, "engine": "python"}
     if chunksize is not None:
         return pd.read_csv(chunksize=chunksize, **kwargs)
@@ -79,12 +110,20 @@ def _resolve_engine(requested: str) -> str:
     return requested
 
 
-def read_csv_pyarrow(src: Path, *, encoding: str):
+def read_csv_pyarrow(
+    src: Path,
+    *,
+    encoding: str,
+    block_size: int = DEFAULT_BLOCK_SIZE,
+):
     import pyarrow.csv as pacsv
 
-    read_options = pacsv.ReadOptions(encoding=encoding)
+    read_options = pacsv.ReadOptions(encoding=encoding, block_size=int(block_size))
     parse_options = pacsv.ParseOptions(newlines_in_values=True)
-    logger.info("Reading CSV with PyArrow (newlines_in_values=True)...")
+    logger.info(
+        "Reading CSV with PyArrow (newlines_in_values=True, block_size=%d)...",
+        int(block_size),
+    )
     return pacsv.read_csv(
         str(src),
         read_options=read_options,
@@ -106,8 +145,9 @@ def convert_pyarrow(
     *,
     compression: str,
     encoding: str,
+    block_size: int,
 ) -> int:
-    table = read_csv_pyarrow(src, encoding=encoding)
+    table = read_csv_pyarrow(src, encoding=encoding, block_size=block_size)
     return write_parquet_pyarrow(table, dst, compression=compression)
 
 
@@ -118,6 +158,7 @@ def convert_fastparquet(
     compression: str,
     encoding: str,
     chunksize: int | None,
+    field_limit: int | None,
 ) -> int:
     import pandas as pd
 
@@ -125,7 +166,7 @@ def convert_fastparquet(
 
     if chunksize is None:
         logger.info("Reading CSV with pandas (engine=python)...")
-        df = _pandas_read_csv(src, encoding=encoding)
+        df = _pandas_read_csv(src, encoding=encoding, field_limit=field_limit)
         logger.info("Writing parquet with fastparquet (compression=%s)...", compression)
         df.to_parquet(dst, engine="fastparquet", compression=compression, index=False)
         return len(df)
@@ -133,7 +174,9 @@ def convert_fastparquet(
     logger.info("Reading CSV in chunks of %d rows...", chunksize)
     total = 0
     first = True
-    for i, chunk in enumerate(_pandas_read_csv(src, encoding=encoding, chunksize=chunksize)):
+    for i, chunk in enumerate(
+        _pandas_read_csv(src, encoding=encoding, chunksize=chunksize, field_limit=field_limit)
+    ):
         total += len(chunk)
         if first:
             logger.info("Writing parquet with fastparquet (compression=%s)...", compression)
@@ -163,13 +206,38 @@ def convert_pandas_pyarrow_write(
     *,
     compression: str,
     encoding: str,
+    chunksize: int | None = None,
+    field_limit: int | None = None,
 ) -> int:
     """Fallback when pyarrow.csv fails but pyarrow.parquet is available."""
-    import pandas as pd
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    if chunksize is not None:
+        logger.info("Reading CSV in pandas chunks of %d rows...", chunksize)
+        writer = None
+        total = 0
+        for i, chunk in enumerate(
+            _pandas_read_csv(
+                src, encoding=encoding, chunksize=chunksize, field_limit=field_limit
+            )
+        ):
+            table = pa.Table.from_pandas(chunk, preserve_index=False)
+            if writer is None:
+                logger.info("Writing parquet with pyarrow (compression=%s)...", compression)
+                writer = pq.ParquetWriter(dst, table.schema, compression=compression)
+            writer.write_table(table)
+            total += len(chunk)
+            if (i + 1) % 10 == 0:
+                logger.info("  ... %d chunks, %d rows so far", i + 1, total)
+        if writer is not None:
+            writer.close()
+        return total
 
     logger.info("Reading CSV with pandas (engine=python)...")
-    df = _pandas_read_csv(src, encoding=encoding)
-    dst.parent.mkdir(parents=True, exist_ok=True)
+    df = _pandas_read_csv(src, encoding=encoding, field_limit=field_limit)
     logger.info("Writing parquet with pyarrow (compression=%s)...", compression)
     df.to_parquet(dst, engine="pyarrow", compression=compression, index=False)
     return len(df)
@@ -211,7 +279,19 @@ def main(argv: list[str] | None = None) -> int:
         "--chunksize",
         type=int,
         default=None,
-        help="Row chunk size for fastparquet append mode (optional; high RAM if unset)",
+        help="Row chunk size for pandas read + append/chunked parquet write (large files)",
+    )
+    p.add_argument(
+        "--block-size",
+        type=int,
+        default=DEFAULT_BLOCK_SIZE,
+        help=f"PyArrow CSV read block size in bytes (default: {DEFAULT_BLOCK_SIZE})",
+    )
+    p.add_argument(
+        "--csv-field-limit",
+        type=int,
+        default=DEFAULT_CSV_FIELD_LIMIT,
+        help=f"Python csv.field_size_limit for pandas fallback (default: {DEFAULT_CSV_FIELD_LIMIT})",
     )
     p.add_argument(
         "--pandas-read",
@@ -241,11 +321,18 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if engine == "pyarrow" and not args.pandas_read:
             try:
-                table = read_csv_pyarrow(src, encoding=args.encoding)
+                table = read_csv_pyarrow(
+                    src, encoding=args.encoding, block_size=args.block_size
+                )
             except Exception as e:
                 logger.warning("PyArrow CSV read failed (%s); retrying via pandas", e)
                 nrows = convert_pandas_pyarrow_write(
-                    src, dst, compression=args.compression, encoding=args.encoding
+                    src,
+                    dst,
+                    compression=args.compression,
+                    encoding=args.encoding,
+                    chunksize=args.chunksize,
+                    field_limit=args.csv_field_limit,
                 )
             else:
                 nrows = write_parquet_pyarrow(
@@ -253,7 +340,12 @@ def main(argv: list[str] | None = None) -> int:
                 )
         elif engine == "pyarrow" and args.pandas_read:
             nrows = convert_pandas_pyarrow_write(
-                src, dst, compression=args.compression, encoding=args.encoding
+                src,
+                dst,
+                compression=args.compression,
+                encoding=args.encoding,
+                chunksize=args.chunksize,
+                field_limit=args.csv_field_limit,
             )
         else:
             nrows = convert_fastparquet(
@@ -262,6 +354,7 @@ def main(argv: list[str] | None = None) -> int:
                 compression=args.compression,
                 encoding=args.encoding,
                 chunksize=args.chunksize,
+                field_limit=args.csv_field_limit,
             )
     except Exception:
         logger.exception("Conversion failed")
