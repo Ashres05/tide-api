@@ -26,14 +26,28 @@ while :; do
   JOB_JSON=$(curl -sS "${HDR[@]}" "$API_URL/v1/jobs/$JOB_ID")
   read -r STATUS STEP <<<"$(printf '%s' "$JOB_JSON" | python3 -c 'import sys,json
 d=json.load(sys.stdin); s=d.get("steps") or []
-print(d.get("status",""), s[-1] if s else "")')"
+last=s[-1] if s else {}
+step=last.get("step","") if isinstance(last,dict) else str(last)
+print(d.get("status",""), step)')"
   [[ "$STEP" != "$LAST_STEP" && -n "$STEP" ]] && { log "step: $STEP"; LAST_STEP="$STEP"; }
   case "$STATUS" in
     succeeded|completed)
       log "DONE in $(( $(date +%s) - START ))s"
       printf '%s' "$JOB_JSON" | python3 -c 'import sys,json
 d=json.load(sys.stdin)
-errs=(d.get("result") or {}).get("stages",{}).get("refresh_data",{}).get("optional_csv_errors") or []
+rd=(d.get("result") or {}).get("stages",{}).get("refresh_data",{}) or {}
+for st in rd.get("csv_stages") or []:
+    name=st.get("csv","?")
+    added=st.get("rows_added",0)
+    max_wk=st.get("max_week")
+    anchor=st.get("anchor_week")
+    extra=[]
+    if anchor: extra.append(f"anchor={anchor}")
+    if max_wk: extra.append(f"max_week={max_wk}")
+    if st.get("skipped"): extra.append("skipped")
+    suffix=(", " + ", ".join(extra)) if extra else ""
+    print(f"CSV_REFRESH {name}: +{added} rows{suffix}")
+errs=rd.get("optional_csv_errors") or []
 for e in errs:
     print("WARN optional_csv_skipped:", e.get("csv"), ":", (e.get("error") or "")[:200])' || true
       exit 0

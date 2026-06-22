@@ -50,7 +50,11 @@ app = FastAPI(title="Tide Marketshare API", version="1.1.0", lifespan=lifespan)
 
 class ReleaseCreateBody(BaseModel):
     mrelg_id: str | None = None
-    name: str
+    title: str | None = None
+    name: str | None = Field(
+        default=None,
+        description="Deprecated on write: use title. Accepted as alias when title is omitted.",
+    )
     artist: str
     label_name: str
     release_date: str
@@ -420,7 +424,9 @@ def list_releases():
 @app.post("/v1/releases", status_code=status.HTTP_201_CREATED)
 def create_release(body: ReleaseCreateBody):
     try:
-        rid = model_handler.create_release(**body.model_dump())
+        rid = model_handler.create_release(
+            **model_handler.normalize_release_write_kwargs(body.model_dump())
+        )
         return {"release_id": int(rid)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -444,7 +450,10 @@ def get_release(release_id: int):
 @app.put("/v1/releases/{release_id}")
 def update_release(release_id: int, body: ReleaseUpdateBody):
     try:
-        model_handler.update_release(id=int(release_id), **body.model_dump())
+        model_handler.update_release(
+            id=int(release_id),
+            **model_handler.normalize_release_write_kwargs(body.model_dump()),
+        )
         return {"ok": True}
     except ValueError as e:
         msg = str(e)
@@ -469,6 +478,15 @@ def delete_release(release_id: int):
 
 @app.get("/v1/releases/{release_id}/weekly")
 def weekly_release(release_id: int, week_ending_date: str | None = None):
+    """
+    Weekly US album-equivalent forecast for one marketshare release.
+
+    Returns one row per week with ``data_type`` (``Actual`` when the week is
+    backed by Snowflake metrics in ``MARKETSHARE_RELEASE_METRICS``, else
+    ``Forecast``), ``streaming_equivalent``, ``product_sales``,
+    ``song_sale_equivalent``, and ``total`` (sum of the three). Use ``total``
+    for the plotted curve; component columns support finer-grained forecasting.
+    """
     try:
         payload = model_handler.df_to_json(
             model_handler.get_release_forecasts(release_id, week_ending_date)

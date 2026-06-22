@@ -1,7 +1,7 @@
 from model.train_marketshare_artifacts import train_artifacts_main as train_model
 from snowflake_conn import Snowflake, get_snowflake_connection, load_sql
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 import datetime
 import logging
 import time
@@ -68,7 +68,7 @@ _BI_SANDBOX_CSV_STAGES = (
 )
 
 
-def refresh_data(*, csv_only: bool = False) -> list[dict[str, str]]:
+def refresh_data(*, csv_only: bool = False) -> dict[str, Any]:
     """
     Incrementally refresh the three weekly CSVs from Snowflake, then train artifacts.
 
@@ -77,12 +77,15 @@ def refresh_data(*, csv_only: bool = False) -> list[dict[str, str]]:
 
     ``csv_only=True``: CSV pull + LGBM/Prophet/spike/df_full only; skips parquet
     reads and archetype retrains. Used by ``refresh_weekly`` to avoid OOM.
+
+    Returns ``{"csv_stages": [...], "optional_csv_errors": [...]}`` for cron
+    logging and ``GET /v1/jobs/{id}`` diagnostics.
     """
     _set_step("refresh_data:pull_csvs")
-    optional_csv_errors = _refresh_data_directory()
+    csv_stages, optional_csv_errors = _refresh_data_directory()
     _set_step("refresh_data:train_artifacts")
     train_model(csv_only=csv_only)
-    return optional_csv_errors
+    return {"csv_stages": csv_stages, "optional_csv_errors": optional_csv_errors}
 
 
 def update_parquet_metrics(sf: Snowflake) -> None:
@@ -108,7 +111,7 @@ def update_parquet_metrics(sf: Snowflake) -> None:
         df_streaming.to_parquet(DATA_DIR / "worldwide_streams_compressed.parquet", index=False)
 
 
-def _refresh_data_directory() -> list[dict[str, str]]:
+def _refresh_data_directory() -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     """
     Incrementally refresh weekly CSVs from Snowflake. Sequential because
     snowflake.connector cursors serialize work on a single socket.
@@ -118,6 +121,7 @@ def _refresh_data_directory() -> list[dict[str, str]]:
     Quarterly-share CSVs depend on bi_sandbox and are best-effort.
     """
     optional_errors: list[dict[str, str]] = []
+    csv_stages: list[dict[str, Any]] = []
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     current_min_week = _get_min_week_end_date(
         DATA_DIR / "Current_Data.csv",
@@ -140,47 +144,94 @@ def _refresh_data_directory() -> list[dict[str, str]]:
     )
 
     with get_snowflake_connection() as sf:
-        for name, updater, min_week in (
-            ("Current_Data.csv", _update_current_data, current_min_week),
-            ("alist_75k.csv", _update_a_list_75k, alist_min_week),
-            ("bigreleaseflag_75k.csv", _update_big_release_flag_75k, big_release_min_week),
+        for name, updater, min_week, week_col in (
+            ("Current_Data.csv", _update_current_data, current_min_week, "WEEK_ENDING_DATE"),
+            ("alist_75k.csv", _update_a_list_75k, alist_min_week, "WEEK_END_DATE"),
+            ("bigreleaseflag_75k.csv", _update_big_release_flag_75k, big_release_min_week, "WEEK_END_DATE"),
         ):
-            _set_step(f"refresh_data:csv:{name}")
-            _run_stage(
-                name,
-                lambda sf=sf, updater=updater, min_week=min_week: updater(sf, min_week),
+            csv_stages.append(
+                _run_stage(
+                    name,
+                    lambda sf=sf, updater=updater, min_week=min_week: updater(sf, min_week),
+                    csv_path=DATA_DIR / name,
+                    week_col=week_col,
+                    anchor_week=min_week,
+                )
             )
         bi_sandbox_updaters = {
             "quarterly_share_and_qtd.csv": _update_quarterly_share_and_qtd,
             "quarterly_share_level3.csv": _update_quarterly_share_level3,
         }
         for name in _BI_SANDBOX_CSV_STAGES:
-            _set_step(f"refresh_data:csv:{name}")
             updater = bi_sandbox_updaters[name]
-            _run_stage_optional(name, lambda sf=sf, updater=updater: updater(sf), optional_errors)
-        _set_step("refresh_data:csv:releases_by_q_amg_labels.csv")
-        _run_stage(
-            "releases_by_q_amg_labels.csv",
-            lambda sf=sf: _update_releases_by_q_amg_labels(sf),
+            csv_stages.append(
+                _run_stage_optional(
+                    name,
+                    lambda sf=sf, updater=updater: updater(sf),
+                    optional_errors,
+                )
+            )
+        csv_stages.append(
+            _run_stage(
+                "releases_by_q_amg_labels.csv",
+                lambda sf=sf: _update_releases_by_q_amg_labels(sf),
+                csv_path=DATA_DIR / "releases_by_q_amg_labels.csv",
+            )
         )
-    return optional_errors
+    return csv_stages, optional_errors
 
 
-def _run_stage(name: str, fn: Callable[[], int]) -> None:
+def _csv_max_week(path: Path, week_col: str | None) -> str | None:
+    """Latest week in a persisted CSV, for cron/job logging."""
+    if not week_col or not path.exists():
+        return None
+    try:
+        return _get_min_week_end_date(path, week_col=week_col)
+    except Exception:
+        return None
+
+
+def _run_stage(
+    name: str,
+    fn: Callable[[], int],
+    *,
+    csv_path: Path | None = None,
+    week_col: str | None = None,
+    anchor_week: str | None = None,
+) -> dict[str, Any]:
     t0 = time.perf_counter()
     added = fn()
     elapsed = time.perf_counter() - t0
-    logger.info("train_model.py: %s +%d rows (%.1fs)", name, added, elapsed)
+    max_week = _csv_max_week(csv_path, week_col) if csv_path else None
+    stage = {
+        "csv": name,
+        "rows_added": int(added),
+        "max_week": max_week,
+        "anchor_week": anchor_week,
+        "elapsed_sec": round(elapsed, 2),
+    }
+    step_msg = f"refresh_data:csv:{name}:+{added}_rows"
+    if max_week:
+        step_msg += f",max_week={max_week}"
+    _set_step(step_msg)
+    logger.info(
+        "train_model.py: %s +%d rows (%.1fs)%s",
+        name,
+        added,
+        elapsed,
+        f", max_week={max_week}" if max_week else "",
+    )
+    return stage
 
 
 def _run_stage_optional(
     name: str,
     fn: Callable[[], int],
     errors: list[dict[str, str]],
-) -> None:
+) -> dict[str, Any]:
     """Run a bi_sandbox CSV stage; record and continue when Snowflake denies access."""
     try:
-        _run_stage(name, fn)
+        return _run_stage(name, fn)
     except Exception as e:
         logger.exception(
             "train_model.py: optional BI_SANDBOX stage %s failed; continuing weekly refresh",
@@ -188,6 +239,7 @@ def _run_stage_optional(
         )
         _set_step(f"refresh_data:csv:{name}:skipped")
         errors.append({"csv": name, "error": str(e)})
+        return {"csv": name, "rows_added": 0, "max_week": None, "skipped": True, "error": str(e)}
 
 
 def _get_min_week_end_date(path: Path, *, week_col: str) -> str:

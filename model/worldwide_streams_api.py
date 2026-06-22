@@ -66,9 +66,9 @@ def simulate_one_worldwide_streams(
     Comma-separated ``artist`` credits are resolved inside ``fit_backfill_forecast``
     / ``simulate_future_drop`` (primary solo decay by default; optional aggregate).
     """
-    artist = str(release.get("artist") or release.get("name") or "").strip()
+    artist = str(release.get("artist") or "").strip()
     if not artist:
-        raise ValueError("artist (or name) is required for worldwide_streams simulation.")
+        raise ValueError("artist is required for worldwide_streams simulation.")
 
     genre = release.get("genre")
     if genre is not None:
@@ -191,7 +191,7 @@ def simulate_one_worldwide_streams(
     return {
         "input": {
             "artist": artist,
-            "name": release.get("name"),
+            "name": release.get("title") or release.get("name"),
             "genre": genre,
             "date": release.get("date"),
             "fw_worldwide_streams": fw,

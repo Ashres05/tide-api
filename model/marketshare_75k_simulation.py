@@ -171,12 +171,23 @@ def get_inferred_cluster(release_dict: dict) -> int:
     return int(np.argmax(joint_prob))
 
 
+def release_album_title(release_dict: dict) -> str:
+    """Canonical album / release-group label for injection keys and reports."""
+    title = release_dict.get("title")
+    if title is not None and str(title).strip():
+        return str(title).strip()
+    legacy = release_dict.get("name")
+    if legacy is not None and str(legacy).strip():
+        return str(legacy).strip()
+    return "Unknown"
+
+
 def decay_artist_name(release_dict: dict) -> str:
-    """Artist for archetype decay lookup; ``name`` is the release/album label."""
+    """Artist for archetype decay lookup; never fall back to album title (``name``/``title``)."""
     artist = release_dict.get("artist")
     if artist is not None and str(artist).strip():
         return str(artist).strip()
-    return str(release_dict.get("name") or "Unknown")
+    return "Unknown"
 
 
 def release_peak_w1_vol(release_dict: dict) -> float:
@@ -248,6 +259,37 @@ def generate_archetype_decay_curve(
     artifacts_sales_singles: Optional[SimulatorArtifacts] = None,
     artifacts_songs_singles: Optional[SimulatorArtifacts] = None,
 ) -> List[float]:
+    """Weekly total album-equivalent decay (sum of streams + product + song channels)."""
+    curves = generate_archetype_decay_component_curves(
+        release_dict,
+        artifacts_streams,
+        artifacts_sales,
+        artifacts_songs,
+        num_weeks=num_weeks,
+        artifacts_streams_singles=artifacts_streams_singles,
+        artifacts_sales_singles=artifacts_sales_singles,
+        artifacts_songs_singles=artifacts_songs_singles,
+    )
+    return curves["total"]
+
+
+def generate_archetype_decay_component_curves(
+    release_dict: dict,
+    artifacts_streams: SimulatorArtifacts,
+    artifacts_sales: SimulatorArtifacts,
+    artifacts_songs: SimulatorArtifacts,
+    num_weeks: int = NUM_WEEKS,
+    *,
+    artifacts_streams_singles: Optional[SimulatorArtifacts] = None,
+    artifacts_sales_singles: Optional[SimulatorArtifacts] = None,
+    artifacts_songs_singles: Optional[SimulatorArtifacts] = None,
+) -> Dict[str, List[float]]:
+    """
+    Weekly archetype decay per US album-equivalent channel plus total.
+
+    Returns keys: ``streaming_equivalent``, ``product_sales``,
+    ``song_sale_equivalent``, ``total`` (each length ``num_weeks``).
+    """
     release_dict, artifacts_streams, artifacts_sales, artifacts_songs = (
         decay_artifacts_for_release(
             release_dict,
@@ -396,26 +438,121 @@ def generate_archetype_decay_curve(
     curve_streams = _get_curve(known_streams, fw_streams, artifacts_streams, force_floor=stream_floor_override)
     curve_sales = _get_curve(known_sales, fw_sales, artifacts_sales, force_floor=0.0)
     curve_songs = _get_curve(known_songs, fw_songs, artifacts_songs, force_floor=0.0)
-    
-    # 4. Stack them up
-    combined = [curve_streams[i] + curve_sales[i] + curve_songs[i] for i in range(num_weeks)]
 
-    # 5. Boundary-aligned splice: use exact actuals for weeks 1..K, then
-    #    rescale the model forecast from week K+1 onward so that its level at
-    #    the boundary matches the last observed actual, preventing a jump.
+    # 4–5. Boundary-aligned splice on total; keep components consistent so they sum to total.
+    combined = [curve_streams[i] + curve_sales[i] + curve_songs[i] for i in range(num_weeks)]
     if known_vols:
-        K = min(len(known_vols), len(combined))
-        if K > 0 and K < len(combined):
+        K = min(len(known_vols), num_weeks)
+        if K > 0 and K < num_weeks:
             last_actual = float(known_vols[K - 1])
             model_at_boundary = combined[K - 1]
             if abs(model_at_boundary) > 1e-12:
                 scale = last_actual / model_at_boundary
-                for i in range(K, len(combined)):
-                    combined[i] = combined[i] * scale
+                for i in range(K, num_weeks):
+                    curve_streams[i] *= scale
+                    curve_sales[i] *= scale
+                    curve_songs[i] *= scale
         for i in range(K):
-            combined[i] = float(known_vols[i])
+            if (
+                known_streams
+                and known_sales
+                and known_songs
+                and i < len(known_streams)
+                and i < len(known_sales)
+                and i < len(known_songs)
+            ):
+                curve_streams[i] = float(known_streams[i])
+                curve_sales[i] = float(known_sales[i])
+                curve_songs[i] = float(known_songs[i])
+            else:
+                target = float(known_vols[i])
+                model_tot = curve_streams[i] + curve_sales[i] + curve_songs[i]
+                if model_tot > 1e-12:
+                    curve_streams[i] = target * curve_streams[i] / model_tot
+                    curve_sales[i] = target * curve_sales[i] / model_tot
+                    curve_songs[i] = target * curve_songs[i] / model_tot
+                else:
+                    curve_streams[i] = target
+                    curve_sales[i] = 0.0
+                    curve_songs[i] = 0.0
 
-    return combined
+    total = [
+        float(curve_streams[i] + curve_sales[i] + curve_songs[i])
+        for i in range(num_weeks)
+    ]
+    return {
+        "streaming_equivalent": [float(x) for x in curve_streams],
+        "product_sales": [float(x) for x in curve_sales],
+        "song_sale_equivalent": [float(x) for x in curve_songs],
+        "total": total,
+    }
+
+
+def build_release_weekly_component_forecast_df(
+    release_dict: dict,
+    tracker_dates: Any,
+    artifacts_streams: SimulatorArtifacts,
+    artifacts_sales: SimulatorArtifacts,
+    artifacts_songs: SimulatorArtifacts,
+    *,
+    artifacts_streams_singles: Optional[SimulatorArtifacts] = None,
+    artifacts_sales_singles: Optional[SimulatorArtifacts] = None,
+    artifacts_songs_singles: Optional[SimulatorArtifacts] = None,
+) -> pd.DataFrame:
+    """
+    Map per-release component decay curves onto 2026 week-ending dates.
+
+    Returns a long frame with ``Week Ending Date``, ``streaming_equivalent``,
+    ``product_sales``, ``song_sale_equivalent``, and ``total``.
+    """
+    empty_cols = [
+        "Week Ending Date",
+        "streaming_equivalent",
+        "product_sales",
+        "song_sale_equivalent",
+        "total",
+    ]
+    if release_peak_w1_vol(release_dict) <= 0:
+        return pd.DataFrame(columns=empty_cols)
+
+    drop_raw = release_dict.get("date")
+    if drop_raw is None or (isinstance(drop_raw, float) and pd.isna(drop_raw)):
+        return pd.DataFrame(columns=empty_cols)
+    drop_date = pd.to_datetime(drop_raw)
+
+    curves = generate_archetype_decay_component_curves(
+        release_dict,
+        artifacts_streams,
+        artifacts_sales,
+        artifacts_songs,
+        NUM_WEEKS,
+        artifacts_streams_singles=artifacts_streams_singles,
+        artifacts_sales_singles=artifacts_sales_singles,
+        artifacts_songs_singles=artifacts_songs_singles,
+    )
+
+    rows: List[Dict[str, Any]] = []
+    for current_date in tracker_dates:
+        current_dt = pd.to_datetime(current_date)
+        days_since = (current_dt - drop_date).days
+        if days_since < 0 or days_since >= NUM_WEEKS * 7:
+            continue
+        week_idx = days_since // 7
+        if week_idx >= len(curves["total"]):
+            continue
+        rows.append(
+            {
+                "Week Ending Date": current_dt.strftime("%Y-%m-%d"),
+                "streaming_equivalent": float(curves["streaming_equivalent"][week_idx]),
+                "product_sales": float(curves["product_sales"][week_idx]),
+                "song_sale_equivalent": float(curves["song_sale_equivalent"][week_idx]),
+                "total": float(curves["total"][week_idx]),
+            }
+        )
+    if not rows:
+        return pd.DataFrame(columns=empty_cols)
+    return pd.DataFrame(rows)
+
 
 def run_archetype_scenario(
     release_calendar: List[dict],
@@ -491,7 +628,7 @@ def run_archetype_scenario(
         lbl = release.get("label", "")
         target_col = "Injected_AMG" if lbl == "Atlantic Music Group" else "Injected_Int" if lbl == "Interscope/Geffen/A&M" else "Injected_Oth"
         
-        release_name = release.get("name", f"Release_{i+1}")
+        release_name = release_album_title(release)
         logger.info(f"Injecting: {release_name} | {lbl} | {release.get('genre', 'Unknown Genre')}")
 
         artist_curve = inject_volume(target_col, release, release.get("date"), release_name)
@@ -579,7 +716,7 @@ def auto_enrich_w2_retention(
         if out.get("empirical_w2_over_w1") is not None:
             enriched.append(out)
             continue
-        target = out.get("artist", out.get("name", "Unknown"))
+        target = out.get("artist") or "Unknown"
         matches = difflib.get_close_matches(str(target), known, n=1, cutoff=match_threshold)
         if matches:
             best = matches[0]
@@ -613,7 +750,7 @@ def auto_enrich_calendar(
         if "avg_historical_w1_product_ratio" in enriched_release:
             enriched.append(enriched_release)
             continue
-        target_artist = enriched_release.get("artist", enriched_release.get("name", "Unknown"))
+        target_artist = enriched_release.get("artist") or "Unknown"
         matches = difflib.get_close_matches(str(target_artist), known_artists, n=1, cutoff=match_threshold)
         if matches:
             best = matches[0]

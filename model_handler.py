@@ -112,7 +112,7 @@ STREAMING_ROSTER_2026_LIST_QUERY = "streaming_roster_2026_list.sql"
 _RELEASE_FIELD_KEYS = frozenset(
     {
         "mrelg_id",
-        "name",
+        "title",
         "artist",
         "label_name",
         "release_date",
@@ -131,7 +131,7 @@ _RELEASE_FIELD_KEYS = frozenset(
 )
 
 _REQUIRED_NONEMPTY_STR = (
-    "name",
+    "title",
     "artist",
     "label_name",
     "release_date",
@@ -1491,7 +1491,7 @@ def get_worldwide_singles_artifacts():
 def create_release(
     *,
     mrelg_id: str | None = None,
-    name: str, 
+    title: str,
     artist: str, 
     label_name: str, 
     release_date: str, 
@@ -1512,6 +1512,9 @@ def create_release(
     """
     Creates a new release in the database.
     Returns the release ID.
+
+    ``title`` is the canonical album / release-group display name (persisted as TITLE).
+    Deprecated write alias ``name`` is normalized via ``normalize_release_write_kwargs``.
     """
     if known_vols is None:
         known_vols = []
@@ -1519,8 +1522,8 @@ def create_release(
 
     params = (
         mrelg_id,
-        name,
-        artist,
+        title.strip(),
+        artist.strip(),
         label_name,
         release_date,
         genre,
@@ -1576,7 +1579,7 @@ def _create_backfilled_release(
     with _maybe_conn() as sf:
         mrelg_metadata = _verify_mrelg_id(mrelg_id, sf)
 
-    name = mrelg_metadata["TITLE"].iloc[0]
+    title = mrelg_metadata["TITLE"].iloc[0]
     artist = mrelg_metadata["DISPLAY_ARTIST"].iloc[0]
     release_date = _validate_date(mrelg_metadata["RELEASE_DATE"].iloc[0])
     genre = mrelg_metadata["GENRE"].iloc[0]
@@ -1591,7 +1594,7 @@ def _create_backfilled_release(
     if genre not in DISTRIBUTIONS["Genre"]:
         genre = "Pop"
 
-    metadata_cols = [name, artist, release_date, genre]
+    metadata_cols = [title, artist, release_date, genre]
 
     for col in metadata_cols:
         if col is None:
@@ -1601,7 +1604,7 @@ def _create_backfilled_release(
 
     rid = create_release(
         mrelg_id=mrelg_id,
-        name=name,
+        title=title,
         artist=artist,
         label_name=label_name,
         release_date=release_date,
@@ -2140,7 +2143,7 @@ def update_release(
     *,
     id: int,
     mrelg_id: str,
-    name: str,
+    title: str,
     artist: str, 
     label_name: str, 
     release_date: str, 
@@ -2166,8 +2169,8 @@ def update_release(
 
     params = (
         mrelg_id,
-        name,
-        artist,
+        title.strip(),
+        artist.strip(),
         label_name,
         release_date,
         genre,
@@ -2877,34 +2880,87 @@ def get_marketshare_forecasts(week_ending_date: str | None = None) -> pd.DataFra
 
 def get_release_forecasts(id: int, week_ending_date: str | None = None) -> pd.DataFrame:
     """
-    Weekly marketshare injections for one EXPECTED_RELEASES row.
+    Weekly marketshare component forecasts for one EXPECTED_RELEASES row.
 
-    Decay routing: when the release map has ``product_type`` / ``release_type``
-    set to ``single`` (or ``singles``), ForecastEngine uses
-    ``archetypes_artifacts/singles/{streams,songs}``; otherwise album bundles.
-    Sales channel stays zero for singles. Until singles are backfilled into
-    EXPECTED_RELEASES, rows without those fields use album decay.
+    Returns one row per 2026 week-ending date with ``data_type`` (``Actual`` /
+    ``Forecast``), US album-equivalent volumes: ``streaming_equivalent``,
+    ``product_sales``, ``song_sale_equivalent``, and ``total`` (sum of the three
+    channels). Actual weeks match ``known_week_dates`` from
+    ``MARKETSHARE_RELEASE_METRICS``.
     """
-    # Verify the week ending date (if provided) and ID.
+    from model.marketshare_75k_simulation import (
+        build_release_weekly_component_forecast_df,
+        release_peak_w1_vol,
+    )
+
     _verify_id(id)
     if week_ending_date is not None:
         _validate_date(week_ending_date)
 
-    # Get the release and verify the parquet file.
     release = get_release(id)
+    if release_peak_w1_vol(release) <= 0:
+        return pd.DataFrame(
+            columns=[
+                "Week Ending Date",
+                "data_type",
+                "streaming_equivalent",
+                "product_sales",
+                "song_sale_equivalent",
+                "total",
+            ]
+        )
+
     df_full = ARTIFACTS_DIR / "df_full.parquet"
     _verify_parquet_file(df_full)
 
-    # Simulate the release and return the forecasts for the week ending date.
-    forecasts = get_engine().simulate([release])
-    weekly_injections = pd.DataFrame(forecasts["weekly_injections"])
-    if weekly_injections.empty:
-        return weekly_injections
+    engine = get_engine()
+    if engine.df_full is None or engine.df_full.empty:
+        raise ValueError("Forecast engine df_full is not loaded.")
+
+    tracker_dates = (
+        engine.df_full[engine.df_full["Week Ending Date"].dt.year == 2026]["Week Ending Date"]
+        .sort_values()
+        .unique()
+    )
+
+    weekly = build_release_weekly_component_forecast_df(
+        release,
+        tracker_dates,
+        engine.artifacts_streams,
+        engine.artifacts_sales,
+        engine.artifacts_songs,
+        artifacts_streams_singles=engine.artifacts_streams_singles,
+        artifacts_sales_singles=engine.artifacts_sales_singles,
+        artifacts_songs_singles=engine.artifacts_songs_singles,
+    )
+    if weekly.empty:
+        return weekly
+
+    known_dates = {
+        str(d).split(" ")[0]
+        for d in (release.get("known_week_dates") or [])
+        if d
+    }
+    weekly = weekly.copy()
+    weekly["data_type"] = weekly["Week Ending Date"].astype(str).apply(
+        lambda d: "Actual" if d in known_dates else "Forecast"
+    )
+    # Stable column order for JSON consumers.
+    weekly = weekly[
+        [
+            "Week Ending Date",
+            "data_type",
+            "streaming_equivalent",
+            "product_sales",
+            "song_sale_equivalent",
+            "total",
+        ]
+    ]
+
     if week_ending_date is None:
-        return weekly_injections
-    else:
-        mask = weekly_injections["Week Ending Date"].astype(str) == week_ending_date
-        return weekly_injections.loc[mask]
+        return weekly
+    mask = weekly["Week Ending Date"].astype(str) == week_ending_date.strip()
+    return weekly.loc[mask]
 
 
 def train_model() -> None:
@@ -3069,10 +3125,13 @@ def refresh_weekly(force_refresh_parquets: bool = False) -> dict:
     set_step("refresh_data:start")
     t0 = _now()
     try:
-        optional_csv_errors = refresh_data(csv_only=True)
+        refresh_result = refresh_data(csv_only=True)
+        optional_csv_errors = refresh_result.get("optional_csv_errors") or []
+        csv_stages = refresh_result.get("csv_stages") or []
         refresh_data_summary: Dict[str, Any] = {
             "ok": True,
             "elapsed_sec": _elapsed(t0),
+            "csv_stages": csv_stages,
         }
         if optional_csv_errors:
             refresh_data_summary["optional_csv_errors"] = optional_csv_errors
@@ -3231,6 +3290,52 @@ def _get_all_release_rows() -> List[sqlite3.Row]:
         return cur.fetchall()
 
 
+def normalize_release_write_kwargs(data: dict) -> dict:
+    """
+    Canonicalize release create/update payloads.
+
+    - ``title`` is the album / release-group name (persisted as EXPECTED_RELEASES.TITLE).
+    - ``artist`` maps only to artist.
+    - Deprecated ``name`` on write is accepted as an alias for ``title`` when title is omitted.
+    - ``name`` is never persisted and is not forwarded to create/update (simulation derives
+      ``name = title`` on read for weekly injection column keys).
+    """
+    out = {k: data[k] for k in _RELEASE_FIELD_KEYS if k in data}
+    for optional in (
+        "known_vols",
+        "fw_vol",
+        "fw_streams",
+        "fw_songs",
+        "fw_sales",
+        "fy_vol",
+        "avg_historical_w1_product_ratio",
+        "product_ratio_coefficient",
+        "cluster",
+        "mrelg_id",
+    ):
+        if optional in data:
+            out[optional] = data[optional]
+
+    title = str(out.get("title") or "").strip()
+    legacy_name = str(data.get("name") or "").strip()
+    if not title and legacy_name:
+        title = legacy_name
+    if not title:
+        raise ValueError("title is required.")
+    out["title"] = title
+    return out
+
+
+def _finalize_release_read_map(release_map: dict) -> dict:
+    """Expose title + artist explicitly; ``name`` is a deprecated alias of ``title``."""
+    title = (release_map.get("title") or release_map.get("name") or "").strip() or "Unknown"
+    artist = (release_map.get("artist") or "").strip()
+    release_map["title"] = title
+    release_map["artist"] = artist
+    release_map["name"] = title
+    return release_map
+
+
 def _sqlite_row_to_release_map(row: sqlite3.Row) -> dict:
     """Map EXPECTED_RELEASES columns to keys expected by run_archetype_scenario."""
     title = (row["TITLE"] or "").strip() or None
@@ -3279,9 +3384,8 @@ def _sqlite_row_to_release_map(row: sqlite3.Row) -> dict:
 
     release_map: dict = {
         "mrelg_id": mrelg_id or None,
-        "name": title or artist or "Unknown",
-        "artist": artist or "",
         "title": title or "",
+        "artist": artist or "",
         "label": row["LABEL_NAME"],
         "date": date_str,
         "genre": row["GENRE"],
@@ -3314,7 +3418,7 @@ def _sqlite_row_to_release_map(row: sqlite3.Row) -> dict:
     elif "RELEASE_TYPE" in row.keys() and row["RELEASE_TYPE"]:
         release_map["release_type"] = str(row["RELEASE_TYPE"]).strip()
 
-    return _sanitize_release_for_simulation(release_map)
+    return _sanitize_release_for_simulation(_finalize_release_read_map(release_map))
 
 
 def _is_real_number(value: object) -> bool:
@@ -3501,8 +3605,8 @@ def get_global_streaming_forecast(id: int, scenario: str = "Base") -> pd.DataFra
     df = _build_global_streaming_forecast(
         mrelg_id=mrelg_id,
         release_date=release_date,
-        artist=release.get("artist") or release.get("name") or "",
-        title=release.get("title") or release.get("name") or "",
+        artist=(release.get("artist") or "").strip(),
+        title=(release.get("title") or release.get("name") or "").strip(),
         genre=release.get("genre"),
         fw_streams_peak=fw_peak,
         scenario=scenario,
