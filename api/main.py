@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 try:
     import model_handler
+    import riaa_handler
     from api.jobs import (
         JobAlreadyRunningError,
         get_manager,
@@ -745,5 +746,31 @@ def global_streaming_release(release_id: int):
         return Response(content=payload, media_type="application/json")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ---------------------------------------------------------------------------
+# RIAA endpoints
+# ---------------------------------------------------------------------------
+@app.get("/v1/riaa/eligible_certifications")
+def eligible_certifications():
+    """
+    Returns a list of eligible certifications from the RIAA.
+    """
+    try:
+        payload = riaa_handler.get_eligible_certifications()
+        return Response(content=payload, media_type="application/json")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v1/riaa/official_certifications")
+def official_certifications():
+    """
+    Returns a list of official certifications from the RIAA.
+    """
+    try:
+        payload = riaa_handler.get_official_certifications()
+        return Response(content=payload, media_type="application/json")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
