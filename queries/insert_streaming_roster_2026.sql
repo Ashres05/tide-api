@@ -1,11 +1,12 @@
 INSERT INTO STREAMING_ROSTER_2026 (
-    MRELG_ID, PRODUCT_TYPE, TITLE, ARTIST, LABEL_NAME, PARENT_GROUP, RELEASE_DATE
-) VALUES (?, ?, ?, ?, ?, ?, ?)
+    MRELG_ID, PRODUCT_TYPE, TITLE, ARTIST, LUMINATE_ARTIST_ID, LABEL_NAME, PARENT_GROUP, RELEASE_DATE
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(MRELG_ID) DO UPDATE SET
-    PRODUCT_TYPE = excluded.PRODUCT_TYPE,
-    TITLE        = excluded.TITLE,
-    ARTIST       = excluded.ARTIST,
-    LABEL_NAME   = excluded.LABEL_NAME,
-    PARENT_GROUP = excluded.PARENT_GROUP,
-    RELEASE_DATE = excluded.RELEASE_DATE
+    PRODUCT_TYPE         = excluded.PRODUCT_TYPE,
+    TITLE                = excluded.TITLE,
+    ARTIST               = excluded.ARTIST,
+    LUMINATE_ARTIST_ID   = excluded.LUMINATE_ARTIST_ID,
+    LABEL_NAME           = excluded.LABEL_NAME,
+    PARENT_GROUP         = excluded.PARENT_GROUP,
+    RELEASE_DATE         = excluded.RELEASE_DATE
 ;

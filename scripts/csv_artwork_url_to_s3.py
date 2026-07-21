@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Read a CSV with MRELG_ID and ARTWORK_URL, download each image, upload to S3 as
-``album_art/{MRELG_ID}.jpg`` (default bucket ``parquetgarage``).
+Read a CSV with an ID and image URL, download each image, and upload it to S3.
+Defaults preserve the album-art contract:
+``album_art/{MRELG_ID}.jpg`` in bucket ``parquetgarage``.
 
 Skips rows with missing ID/URL. Optionally skips keys that already exist (default).
 
@@ -53,13 +54,28 @@ def _http_get_bytes(url: str, *, timeout: float = 60.0) -> tuple[bytes, Optional
 
 def main(argv: Optional[list[str]] = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
-    p = argparse.ArgumentParser(description="Upload ARTWORK_URL images to S3 as MRELG_ID.jpg")
+    p = argparse.ArgumentParser(description="Upload image URLs from a CSV to S3")
     p.add_argument("--csv", type=Path, default=Path(DEFAULT_CSV), help="Input CSV path")
     p.add_argument("--bucket", default=DEFAULT_BUCKET, help="S3 bucket")
     p.add_argument(
         "--prefix",
         default=DEFAULT_PREFIX,
         help="Key prefix (trailing slash recommended), e.g. album_art/",
+    )
+    p.add_argument(
+        "--id-column",
+        default="MRELG_ID",
+        help="CSV identifier column used as the S3 filename (default: MRELG_ID)",
+    )
+    p.add_argument(
+        "--url-column",
+        default="ARTWORK_URL",
+        help="CSV image URL column (default: ARTWORK_URL)",
+    )
+    p.add_argument(
+        "--extension",
+        default="jpg",
+        help="S3 filename extension without a leading dot (default: jpg)",
     )
     p.add_argument("--dry-run", action="store_true", help="Log actions only; no HTTP/S3 writes")
     p.add_argument("--limit", type=int, default=None, metavar="N", help="Process at most N rows")
@@ -101,11 +117,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     norm = _norm_cols(df)
-    mcol = norm.get("MRELG_ID") or norm.get("MRELG")
-    ucol = norm.get("ARTWORK_URL") or norm.get("ARTWORK") or norm.get("IMAGE_URL")
+    requested_id = args.id_column.strip().upper().replace(" ", "_")
+    requested_url = args.url_column.strip().upper().replace(" ", "_")
+    mcol = norm.get(requested_id)
+    ucol = norm.get(requested_url)
+    if requested_id == "MRELG_ID":
+        mcol = mcol or norm.get("MRELG")
+    if requested_url == "ARTWORK_URL":
+        ucol = ucol or norm.get("ARTWORK") or norm.get("IMAGE_URL")
     if not mcol or not ucol:
         raise SystemExit(
-            f"Need MRELG_ID (or MRELG) and ARTWORK_URL columns. Got: {list(df.columns)}"
+            f"Need {args.id_column} and {args.url_column} columns. Got: {list(df.columns)}"
         )
 
     work = df[[mcol, ucol]].copy()
@@ -114,6 +136,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     work = work[(work["_m"] != "") & (work["_u"] != "")]
     work = work.drop_duplicates(subset=["_m"], keep="first")
 
+    extension = args.extension.strip().lstrip(".") or "jpg"
     processed = uploaded = skipped_existing = dry_run = failed = 0
     for _, row in work.iterrows():
         if args.limit is not None and processed >= args.limit:
@@ -121,7 +144,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         processed += 1
         mid = row["_m"]
         url = row["_u"]
-        key = f"{prefix}{mid}.jpg"
+        key = f"{prefix}{mid}.{extension}"
 
         if skip_existing:
             try:

@@ -1,12 +1,16 @@
--- YTD streaming revenue roster (Album, Single, EP) with US week AE >= 75k.
+-- YTD streaming revenue roster (Album, Single, EP) with US week AE >= 10k.
 -- Used by backfill_streaming_roster() -> STREAMING_ROSTER_2026.
 -- Per-MRELG weekly worldwide streams use query_release_global_streaming.sql instead.
+--
+-- LUMINATE_ARTIST_ID is the first Main Artist from VW_MUSICAL_RELEASE_GROUP_DS.ARTISTS
+-- (same ID as CURRENT_DEV.DATA.ARTIST_METADATA.LUMINATE_ARTIST_ID / artist_art/{id}.jpeg).
 WITH mrelg_map AS (
     SELECT
         mrelg.mrelg_id,
         mrelg.release_type,
         mrelg.title,
         mrelg.display_artist AS artist,
+        mrelg.artists,
         i.level_2_distributor AS label_group,
         i.level_1_distributor AS parent_group,
         COALESCE(mrelg.first_sale_date, mrelg.release_date) AS release_date,
@@ -28,12 +32,26 @@ WITH mrelg_map AS (
         {RELEASE_DATE_FILTER}
         QUALIFY rn = 1
 ),
+mrelg_main_artist AS (
+    SELECT
+        m.mrelg_id,
+        f.value:ARTIST_ID::STRING AS luminate_artist_id
+    FROM mrelg_map m,
+         LATERAL FLATTEN(input => m.artists) f
+    WHERE LOWER(COALESCE(f.value:ROLE::STRING, '')) = 'main artist'
+      AND f.value:ARTIST_ID IS NOT NULL
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY m.mrelg_id
+        ORDER BY f.index
+    ) = 1
+),
 mrelg_metrics AS (
     SELECT
         m.mrelg_id,
         m.release_type,
         m.title,
         m.artist,
+        a.luminate_artist_id,
         m.label_group,
         m.parent_group,
         m.release_date,
@@ -41,6 +59,7 @@ mrelg_metrics AS (
         SUM(s.equivalent_quantity) AS album_equivalent
     FROM
         mrelg_map m
+        LEFT JOIN mrelg_main_artist a ON a.mrelg_id = m.mrelg_id
         JOIN luminate_prod.extract_s.vw_daily_fact_mrelg_summary_ds s ON s.mrelg_id = m.mrelg_id
         AND s.country_code = 'US'
         AND s.report_date >= DATEADD(MONTH, -19, CURRENT_DATE())
@@ -57,6 +76,7 @@ SELECT
     parent_group,
     title,
     artist,
+    luminate_artist_id,
     release_date
 FROM
     mrelg_metrics

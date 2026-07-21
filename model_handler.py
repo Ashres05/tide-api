@@ -26,6 +26,7 @@ from sqlite_handler import (
 from search_text import normalize_search_text
 import marketshare_from_csv
 import album_art
+import artist_art
 from model.marketshare_75k_simulation import DISTRIBUTIONS, NUM_WEEKS
 from model.train_catalog_decay import (
     BASELINE52_EPS,
@@ -104,6 +105,7 @@ MARKETSHARE_WEEKLY_ACTUALS_QUERY = "select_marketshare_weekly_actuals.sql"
 MRELG_METADATA_QUERY = "query_mrelg_id.sql"
 RELEASE_BACKFILL_QUERY = "query_release_backfill.sql"
 STREAMING_ROSTER_YTD_QUERY = "query_streaming_roster_ytd.sql"
+ROSTER_MAIN_ARTIST_IDS_QUERY = "query_roster_main_artist_ids.sql"
 GLOBAL_STREAMING_QUERY = "query_release_global_streaming.sql"
 CREATE_STREAMING_ROSTER_2026_TABLE = "create_streaming_roster_2026_table.sql"
 INSERT_STREAMING_ROSTER_2026 = "insert_streaming_roster_2026.sql"
@@ -1841,6 +1843,11 @@ def _streaming_roster_rows_from_df(df: pd.DataFrame) -> List[tuple]:
         rtype = str(d.get("release_type") or d.get("product_type") or "").strip()
         title = str(d.get("title") or "").strip()
         artist = str(d.get("artist") or "").strip()
+        artist_id_raw = d.get("luminate_artist_id")
+        if artist_id_raw is None or (isinstance(artist_id_raw, float) and pd.isna(artist_id_raw)):
+            luminate_artist_id = None
+        else:
+            luminate_artist_id = str(artist_id_raw).strip() or None
         label = str(d.get("label_name") or d.get("label_group") or "").strip()
         parent_group = str(d.get("parent_group") or "").strip() or None
         rd = d.get("release_date")
@@ -1850,8 +1857,112 @@ def _streaming_roster_rows_from_df(df: pd.DataFrame) -> List[tuple]:
             release_date = rd.strftime("%Y-%m-%d")
         else:
             release_date = str(rd).strip()[:10]
-        out.append((mid, rtype or None, title, artist, label, parent_group, release_date))
+        out.append(
+            (
+                mid,
+                rtype or None,
+                title,
+                artist,
+                luminate_artist_id,
+                label,
+                parent_group,
+                release_date,
+            )
+        )
     return out
+
+
+def _streaming_roster_mrelgs_missing_artist_id() -> list[str]:
+    """Roster MRELG IDs with no LUMINATE_ARTIST_ID yet."""
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        ensure_streaming_roster_2026_table(conn)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT MRELG_ID FROM STREAMING_ROSTER_2026
+            WHERE MRELG_ID IS NOT NULL
+              AND TRIM(MRELG_ID) != ''
+              AND (LUMINATE_ARTIST_ID IS NULL OR TRIM(LUMINATE_ARTIST_ID) = '')
+            """
+        )
+        return [str(row[0]).strip() for row in cur.fetchall() if row[0]]
+
+
+def _fill_missing_roster_artist_ids(*, batch_size: int = 500) -> dict:
+    """
+    For roster rows missing LUMINATE_ARTIST_ID, resolve main artist from Snowflake
+    (MRELG.ARTISTS) and UPDATE in place. Does not insert new roster rows.
+    """
+    missing = _streaming_roster_mrelgs_missing_artist_id()
+    stats = {"missing_before": len(missing), "updated": 0, "errors": []}
+    if not missing:
+        return stats
+
+    sql_template = load_sql(ROSTER_MAIN_ARTIST_IDS_QUERY)
+    updates: list[tuple[str, str]] = []
+
+    try:
+        with get_snowflake_connection() as sf:
+            for i in range(0, len(missing), batch_size):
+                batch = missing[i : i + batch_size]
+                id_list = ", ".join(
+                    f"'{mid.replace(chr(39), chr(39) * 2)}'" for mid in batch
+                )
+                sql = sql_template.replace("{MRELG_ID_LIST}", id_list)
+                df = sf.query(sql)
+                if df is None or df.empty:
+                    continue
+                norm = {str(c).strip().lower(): c for c in df.columns}
+                mid_col = norm.get("mrelg_id")
+                aid_col = norm.get("luminate_artist_id")
+                if not mid_col or not aid_col:
+                    stats["errors"].append(
+                        {"batch_start": i, "error": f"unexpected columns {list(df.columns)}"}
+                    )
+                    continue
+                for mid, aid in zip(df[mid_col], df[aid_col]):
+                    mid_s = str(mid or "").strip()
+                    aid_s = str(aid or "").strip()
+                    if mid_s and aid_s:
+                        updates.append((aid_s, mid_s))
+    except Exception as e:
+        logger.exception("fill_missing_roster_artist_ids: Snowflake failed")
+        stats["errors"].append({"stage": "snowflake", "error": str(e)})
+        return stats
+
+    if not updates:
+        logger.info(
+            "fill_missing_roster_artist_ids: %d missing, 0 resolved from Snowflake",
+            len(missing),
+        )
+        return stats
+
+    try:
+        with sqlite3.connect(DATABASE_NAME) as conn:
+            ensure_streaming_roster_2026_table(conn)
+            cur = conn.cursor()
+            cur.executemany(
+                """
+                UPDATE STREAMING_ROSTER_2026
+                SET LUMINATE_ARTIST_ID = ?
+                WHERE MRELG_ID = ?
+                  AND (LUMINATE_ARTIST_ID IS NULL OR TRIM(LUMINATE_ARTIST_ID) = '')
+                """,
+                updates,
+            )
+            stats["updated"] = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else len(updates)
+            conn.commit()
+    except sqlite3.Error as e:
+        stats["errors"].append({"stage": "sqlite", "error": str(e)})
+        return stats
+
+    logger.info(
+        "fill_missing_roster_artist_ids: missing_before=%d resolved=%d sqlite_updated≈%s",
+        len(missing),
+        len(updates),
+        stats["updated"],
+    )
+    return stats
 
 
 def backfill_streaming_roster() -> dict:
@@ -1953,13 +2064,18 @@ def backfill_streaming_roster() -> dict:
         skipped,
     )
 
-    if upserted > 0 and not errors:
+    artist_id_fill = _fill_missing_roster_artist_ids()
+    if artist_id_fill.get("errors"):
+        errors.extend(artist_id_fill["errors"])
+
+    if (upserted > 0 or artist_id_fill.get("updated", 0) > 0) and not errors:
         sync_db_to_s3()
 
     return {
         "inserted": inserted,
         "upserted": upserted,
         "skipped": skipped,
+        "artist_ids_filled": artist_id_fill,
         "errors": errors,
     }
 
@@ -3247,6 +3363,7 @@ def reload_artifacts() -> None:
     quarterly_share_level3_from_csv.clear_cache()
     releases_by_q_amg_labels_from_csv.clear_cache()
     album_art.clear_cache()
+    artist_art.clear_cache()
 
 
 def df_to_json(

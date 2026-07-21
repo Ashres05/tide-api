@@ -342,7 +342,12 @@ def releases_by_q_amg_labels(
 
 @app.get("/v1/revenue/streaming_roster")
 def list_streaming_roster():
-    """List STREAMING_ROSTER_2026 (streaming revenue board)."""
+    """
+    List STREAMING_ROSTER_2026 (streaming revenue board).
+
+    Each row includes ``LUMINATE_ARTIST_ID`` (main artist) when available —
+    use with ``GET /v1/artist_art/{LUMINATE_ARTIST_ID}``.
+    """
     try:
         return Response(
             content=model_handler.get_streaming_roster_2026_json(),
@@ -513,6 +518,31 @@ def album_art(mrelg_id: str):
     result = _album_art.fetch_bytes(mrelg_id)
     if result is None:
         raise HTTPException(status_code=404, detail="album art not found")
+    body, content_type = result
+    return Response(
+        content=body,
+        media_type=content_type,
+        headers={
+            "Cache-Control": "public, max-age=86400, immutable",
+        },
+    )
+
+
+@app.get("/v1/artist_art/{luminate_artist_id}")
+def artist_art(luminate_artist_id: str):
+    """
+    Stream the artist profile image for a Luminate artist id from
+    ``s3://<bucket>/artist_art/{LUMINATE_ARTIST_ID}.jpeg``.
+
+    Pair with ``LUMINATE_ARTIST_ID`` from ``GET /v1/revenue/streaming_roster``.
+    Returns 404 when no image has been uploaded — frontend should use a
+    placeholder on load error. Cached at the edge for one day.
+    """
+    import artist_art as _artist_art
+
+    result = _artist_art.fetch_bytes(luminate_artist_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="artist art not found")
     body, content_type = result
     return Response(
         content=body,
