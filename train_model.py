@@ -30,9 +30,11 @@ A_LIST_75K_QUERY = "query_model_a_list_75k.sql"
 BIG_RELEASE_FLAG_75K_QUERY = "query_model_big_release_flag.sql"
 YTD_FISCAL_REVENUE_BY_LABEL_QUERY = "query_ytd_fiscal_revenue_by_label.sql"
 RELEASES_BY_Q_AMG_LABELS_QUERY = "query_releases_by_q_amg_labels.sql"
-QUARTERLY_SHARE_AND_QTD_QUERY = "query_quarterly_share_and_qtd.sql"
+# monthly, not quarterly now but name left for ease
+QUARTERLY_SHARE_AND_QTD_QUERY = "query_monthly_share_and_qtd.sql"
 QUARTERLY_SHARE_AND_QTD_MAX_P_DAY_QUERY = "query_quarterly_share_and_qtd_max_p_day.sql"
-QUARTERLY_SHARE_LEVEL3_QUERY = "query_quarterly_share_level3.sql"
+# monthly, not quarterly now but name left for ease
+QUARTERLY_SHARE_LEVEL3_QUERY = "query_monthly_share_level3.sql"
 
 MODEL_PARQUET_METRICS_QUERY = "query_model_parquet_metrics.sql"
 MODEL_PARQUET_METRICS_STREAMING_QUERY = "query_model_parquet_metrics_streaming.sql"
@@ -63,8 +65,8 @@ _COLD_START_MIN_WEEK = "2018-01-01"
 # weekly cron should still refresh core model CSVs, train artifacts, backfill,
 # and push to S3.
 _BI_SANDBOX_CSV_STAGES = (
-    "quarterly_share_and_qtd.csv",
-    "quarterly_share_level3.csv",
+    "monthly_share_and_qtd.csv",
+    "monthly_share_labels.csv",
 )
 
 
@@ -159,8 +161,8 @@ def _refresh_data_directory() -> tuple[list[dict[str, Any]], list[dict[str, str]
                 )
             )
         bi_sandbox_updaters = {
-            "quarterly_share_and_qtd.csv": _update_quarterly_share_and_qtd,
-            "quarterly_share_level3.csv": _update_quarterly_share_level3,
+            "monthly_share_and_qtd.csv": _update_quarterly_share_and_qtd,
+            "monthly_share_labels.csv": _update_quarterly_share_level3,
         }
         for name in _BI_SANDBOX_CSV_STAGES:
             updater = bi_sandbox_updaters[name]
@@ -420,24 +422,24 @@ def _snowflake_max_p_day_for_quarterly_share(sf: Snowflake) -> datetime.date | N
 
 
 def _update_quarterly_share_and_qtd(sf: Snowflake) -> int:
-    """Rewrite quarterly_share_and_qtd.csv when Snowflake max(p_day) advances."""
+    """Rewrite monthly_share_and_qtd.csv when Snowflake max(p_day) advances."""
     import quarterly_share_from_csv
 
-    csv_path = DATA_DIR / "quarterly_share_and_qtd.csv"
+    csv_path = DATA_DIR / "monthly_share_and_qtd.csv"
     local_max = quarterly_share_from_csv.max_p_day_from_csv(csv_path)
     snowflake_max = _snowflake_max_p_day_for_quarterly_share(sf)
     if snowflake_max is None:
-        logger.warning("quarterly_share_and_qtd: Snowflake max(p_day) unavailable; skipping")
+        logger.warning("monthly_share_and_qtd: Snowflake max(p_day) unavailable; skipping")
         return 0
     if snowflake_max <= local_max:
         logger.info(
-            "quarterly_share_and_qtd: up to date (snowflake max=%s local max=%s)",
+            "monthly_share_and_qtd: up to date (snowflake max=%s local max=%s)",
             snowflake_max,
             local_max,
         )
         return 0
     logger.info(
-        "quarterly_share_and_qtd: refreshing (snowflake max=%s > local max=%s)",
+        "monthly_share_and_qtd: refreshing (snowflake max=%s > local max=%s)",
         snowflake_max,
         local_max,
     )
@@ -459,24 +461,24 @@ def _update_quarterly_share_and_qtd(sf: Snowflake) -> int:
 
 
 def _update_quarterly_share_level3(sf: Snowflake) -> int:
-    """Rewrite quarterly_share_level3.csv when Snowflake max(p_day) advances."""
+    """Rewrite monthly_share_labels.csv when Snowflake max(p_day) advances."""
     import quarterly_share_level3_from_csv as lvl3_csv
 
-    csv_path = DATA_DIR / "quarterly_share_level3.csv"
+    csv_path = DATA_DIR / "monthly_share_labels.csv"
     local_max = lvl3_csv.max_p_day_from_level3_csv(csv_path)
     snowflake_max = _snowflake_max_p_day_for_quarterly_share(sf)
     if snowflake_max is None:
-        logger.warning("quarterly_share_level3: Snowflake max(p_day) unavailable; skipping")
+        logger.warning("monthly_share_labels: Snowflake max(p_day) unavailable; skipping")
         return 0
     if snowflake_max <= local_max:
         logger.info(
-            "quarterly_share_level3: up to date (snowflake max=%s local max=%s)",
+            "monthly_share_labels: up to date (snowflake max=%s local max=%s)",
             snowflake_max,
             local_max,
         )
         return 0
     logger.info(
-        "quarterly_share_level3: refreshing (snowflake max=%s > local max=%s)",
+        "monthly_share_labels: refreshing (snowflake max=%s > local max=%s)",
         snowflake_max,
         local_max,
     )

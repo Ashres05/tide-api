@@ -1,8 +1,8 @@
 """
-Read fiscal-quarter level-3 profit-center share metrics from CSV.
+Read fiscal-month level-3 profit-center share metrics from CSV.
 
 Source file (canonical S3 path):
-  s3://parquetgarage/model/data/quarterly_share_level3.csv
+  s3://parquetgarage/model/data/monthly_share_labels.csv
 
 Refreshed from Snowflake when ``train_model._update_quarterly_share_level3()``
 detects ``max(P_DAY)`` in the source is newer than the local CSV anchor.
@@ -24,12 +24,12 @@ from quarterly_share_from_csv import _COLD_START_P_DAY, parse_p_day_from_row
 logger = logging.getLogger(__name__)
 
 DEFAULT_CSV_PATH = (
-    Path(__file__).resolve().parent / "model" / "data" / "quarterly_share_level3.csv"
+    Path(__file__).resolve().parent / "model" / "data" / "monthly_share_labels.csv"
 )
 
 _CANONICAL_COLUMNS = (
     "FISCAL_YEAR",
-    "FISCAL_QUARTER",
+    "FISCAL_MONTH",
     "PROFIT_CENTER_LABEL",
     "LABEL_STREAMS",
     "TOTAL_UNIVERSE_STREAMS",
@@ -39,9 +39,9 @@ _CANONICAL_COLUMNS = (
     "MARKET_GROWTH_YOY",
 )
 
-_DEDUPE_COLS = ("FISCAL_YEAR", "FISCAL_QUARTER", "PROFIT_CENTER_LABEL")
+_DEDUPE_COLS = ("FISCAL_YEAR", "FISCAL_MONTH", "PROFIT_CENTER_LABEL")
 
-_PDAY_COLS = ("FISCAL_YEAR", "FISCAL_QUARTER")
+_PDAY_COLS = ("FISCAL_YEAR", "FISCAL_MONTH")
 
 
 @dataclass(frozen=True)
@@ -65,15 +65,20 @@ def _file_signature(path: Path) -> tuple[int, int]:
 
 
 def max_p_day_from_level3_csv(csv_path: Path = DEFAULT_CSV_PATH) -> date:
-    """Latest quarter-end implied by rows on disk (max over parsed ``FISCAL_QUARTER`` ends)."""
+    """Latest month-end implied by rows on disk (max over parsed ``FISCAL_MONTH`` ends)."""
     if not csv_path.is_file():
         logger.info("%s not found; cold start p_day=%s", csv_path.name, _COLD_START_P_DAY)
         return _COLD_START_P_DAY
     try:
         df = pd.read_csv(csv_path, usecols=list(_PDAY_COLS))
     except (ValueError, KeyError) as e:
-        logger.warning("%s missing fiscal columns (%s); cold start p_day", csv_path.name, e)
-        return _COLD_START_P_DAY
+        # Legacy quarterly filename / column during transition.
+        try:
+            df = pd.read_csv(csv_path, usecols=["FISCAL_YEAR", "FISCAL_QUARTER"])
+            df = df.rename(columns={"FISCAL_QUARTER": "FISCAL_MONTH"})
+        except (ValueError, KeyError):
+            logger.warning("%s missing fiscal columns (%s); cold start p_day", csv_path.name, e)
+            return _COLD_START_P_DAY
     if df.empty:
         return _COLD_START_P_DAY
     parsed: list[date] = []
@@ -88,6 +93,9 @@ def max_p_day_from_level3_csv(csv_path: Path = DEFAULT_CSV_PATH) -> date:
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     col_map = {str(c).strip().lower(): c for c in df.columns}
+    if "fiscal_month" not in col_map and "fiscal_quarter" in col_map:
+        df = df.rename(columns={col_map["fiscal_quarter"]: "FISCAL_MONTH"})
+        col_map = {str(c).strip().lower(): c for c in df.columns}
     rename: dict[str, str] = {}
     for want in _CANONICAL_COLUMNS:
         key = want.lower()
@@ -97,11 +105,11 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     missing = [c for c in _CANONICAL_COLUMNS if c not in out.columns]
     if missing:
         raise KeyError(
-            f"quarterly_share_level3.csv missing columns {missing}; got {list(df.columns)}"
+            f"monthly_share_labels.csv missing columns {missing}; got {list(df.columns)}"
         )
     out = out[list(_CANONICAL_COLUMNS)].copy()
     out["FISCAL_YEAR"] = pd.to_numeric(out["FISCAL_YEAR"], errors="coerce").astype("Int64")
-    out["FISCAL_QUARTER"] = out["FISCAL_QUARTER"].astype(str).str.strip()
+    out["FISCAL_MONTH"] = out["FISCAL_MONTH"].astype(str).str.strip()
     out["PROFIT_CENTER_LABEL"] = out["PROFIT_CENTER_LABEL"].astype(str).str.strip()
     for col in ("LABEL_STREAMS", "TOTAL_UNIVERSE_STREAMS"):
         out[col] = pd.to_numeric(out[col], errors="coerce")
@@ -115,7 +123,7 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = out.dropna(
         subset=[
             "FISCAL_YEAR",
-            "FISCAL_QUARTER",
+            "FISCAL_MONTH",
             "PROFIT_CENTER_LABEL",
             "LABEL_STREAMS",
             "TOTAL_UNIVERSE_STREAMS",
@@ -123,10 +131,10 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     )
     out = out.drop_duplicates(subset=list(_DEDUPE_COLS), keep="last")
     out["_p_day"] = [
-        parse_p_day_from_row(fy, fq) for fy, fq in zip(out["FISCAL_YEAR"], out["FISCAL_QUARTER"])
+        parse_p_day_from_row(fy, fm) for fy, fm in zip(out["FISCAL_YEAR"], out["FISCAL_MONTH"])
     ]
     out = out.sort_values(
-        ["PROFIT_CENTER_LABEL", "_p_day", "FISCAL_YEAR", "FISCAL_QUARTER"],
+        ["PROFIT_CENTER_LABEL", "_p_day", "FISCAL_YEAR", "FISCAL_MONTH"],
         na_position="first",
     )
     out = out.drop(columns=["_p_day"]).reset_index(drop=True)
@@ -139,7 +147,7 @@ def normalize_quarterly_share_level3_dataframe(df: pd.DataFrame) -> pd.DataFrame
 
 def load_quarterly_share_level3_df(csv_path: Path = DEFAULT_CSV_PATH) -> pd.DataFrame:
     if not csv_path.is_file():
-        raise FileNotFoundError(f"quarterly_share_level3.csv not found at {csv_path}")
+        raise FileNotFoundError(f"monthly_share_labels.csv not found at {csv_path}")
     key = _CacheKey(*_file_signature(csv_path))
     with _cache_lock:
         cached = _frame_cache.get(key)

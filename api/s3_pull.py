@@ -8,7 +8,7 @@ Design pattern:
 
 Scopes:
   - "db"                   marketshare_data.db
-  - "csvs"                 model/data/*.csv (Current_Data, alist_75k, bigreleaseflag, ytd_fiscal_revenue_by_label, quarterly_share_and_qtd, quarterly_share_level3, releases_by_q_amg_labels). Excludes static 2025_revenue_catalog.csv (manual S3 upload only).
+  - "csvs"                 model/data/*.csv (Current_Data, alist_75k, bigreleaseflag, ytd_fiscal_revenue_by_label, monthly_share_and_qtd, monthly_share_labels, labels_*_marketshare, amg_full_*_marketshare, releases_by_q_amg_labels). Excludes static 2025_revenue_catalog.csv and legacy quarterly_share_*.csv (manual S3 upload only).
   - "parquets"             model/data/*.parquet (heavy; archetype/training inputs)
   - "artifacts_75k"        model/artifacts_75k/** (LGBM/Prophet/spike/df_full/sidecars)
   - "archetypes_artifacts" model/archetypes_artifacts/** (album decay + singles/ subdir; forecast serving)
@@ -60,8 +60,15 @@ _MODEL_DATA_REL = Path("model/data")
 _ARTIFACTS_75K_REL = Path("model/artifacts_75k")
 _ARCHETYPES_REL = Path("model/archetypes_artifacts")
 
-# Static catalog — never pull/push via automated csv scope (refresh_weekly, startup sync).
-_CSV_SYNC_EXCLUDE: frozenset[str] = frozenset({"2025_revenue_catalog.csv"})
+# Static / legacy — never pull/push via automated csv scope (refresh_weekly, startup sync).
+_CSV_SYNC_EXCLUDE: frozenset[str] = frozenset(
+    {
+        "2025_revenue_catalog.csv",
+        # Replaced by monthly_share_and_qtd.csv / monthly_share_labels.csv
+        "quarterly_share_and_qtd.csv",
+        "quarterly_share_level3.csv",
+    }
+)
 
 
 def _csv_sync_excluded(path: Path | str) -> bool:

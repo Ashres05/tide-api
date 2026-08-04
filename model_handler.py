@@ -2139,7 +2139,7 @@ def get_quarterly_share_and_qtd(
     *,
     fiscal_year: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Fiscal-quarter AMG share / QTD from quarterly_share_and_qtd.csv."""
+    """Fiscal-month AMG share / QTD from monthly_share_and_qtd.csv."""
     import quarterly_share_from_csv
 
     return quarterly_share_from_csv.query_quarterly_share_and_qtd(fiscal_year=fiscal_year)
@@ -2160,7 +2160,7 @@ def get_quarterly_share_level3(
     fiscal_year: int | None = None,
     profit_center_label: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Fiscal-quarter level-3 label share from quarterly_share_level3.csv."""
+    """Fiscal-month level-3 label share from monthly_share_labels.csv."""
     import quarterly_share_level3_from_csv
 
     return quarterly_share_level3_from_csv.query_quarterly_share_level3(
@@ -2178,6 +2178,42 @@ def get_quarterly_share_level3_json(
         get_quarterly_share_level3(
             fiscal_year=fiscal_year,
             profit_center_label=profit_center_label,
+        ),
+        default=str,
+    )
+
+
+def get_platform_marketshare(
+    dataset_key: str,
+    *,
+    period_start_date: str | None = None,
+    year: int | None = None,
+    label_bucket: str | None = None,
+) -> list[dict[str, Any]]:
+    """Apple/Spotify label or AMG-full marketshare rows from model/data CSVs."""
+    import platform_marketshare_from_csv as pmc
+
+    return pmc.query_platform_marketshare(
+        dataset_key,
+        period_start_date=period_start_date,
+        year=year,
+        label_bucket=label_bucket,
+    )
+
+
+def get_platform_marketshare_json(
+    dataset_key: str,
+    *,
+    period_start_date: str | None = None,
+    year: int | None = None,
+    label_bucket: str | None = None,
+) -> str:
+    return json.dumps(
+        get_platform_marketshare(
+            dataset_key,
+            period_start_date=period_start_date,
+            year=year,
+            label_bucket=label_bucket,
         ),
         default=str,
     )
@@ -3358,10 +3394,12 @@ def reload_artifacts() -> None:
     import quarterly_share_from_csv
     import quarterly_share_level3_from_csv
     import releases_by_q_amg_labels_from_csv
+    import platform_marketshare_from_csv
 
     quarterly_share_from_csv.clear_cache()
     quarterly_share_level3_from_csv.clear_cache()
     releases_by_q_amg_labels_from_csv.clear_cache()
+    platform_marketshare_from_csv.clear_cache()
     album_art.clear_cache()
     artist_art.clear_cache()
 

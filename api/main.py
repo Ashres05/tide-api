@@ -255,8 +255,8 @@ def prewarm_streaming_roster(_: None = Depends(require_api_key)) -> JobAcceptedR
 @app.get("/v1/revenue/quarterly_share_and_qtd")
 def quarterly_share_and_qtd(fiscal_year: int | None = None):
     """
-    Fiscal-quarter AMG market share and QTD growth (from
-    model/data/quarterly_share_and_qtd.csv on S3).
+    Fiscal-month AMG market share and QTD growth (from
+    model/data/monthly_share_and_qtd.csv on S3).
 
     Optional filter: ``fiscal_year`` (e.g. 2026).
     """
@@ -277,8 +277,8 @@ def quarterly_share_level3(
     profit_center_label: str | None = None,
 ):
     """
-    Fiscal-quarter level-3 profit-center share metrics (from
-    model/data/quarterly_share_level3.csv on S3).
+    Fiscal-month level-3 profit-center share metrics (from
+    model/data/monthly_share_labels.csv on S3).
 
     Optional filters: ``fiscal_year``, ``profit_center_label`` (e.g. ``Atlantic``).
     """
@@ -294,6 +294,115 @@ def quarterly_share_level3(
         raise HTTPException(status_code=404, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+def _platform_marketshare_response(
+    dataset_key: str,
+    *,
+    period_start_date: str | None = None,
+    year: int | None = None,
+    label_bucket: str | None = None,
+) -> Response:
+    try:
+        if period_start_date is not None:
+            model_handler._validate_date(period_start_date)
+        payload = model_handler.get_platform_marketshare_json(
+            dataset_key,
+            period_start_date=period_start_date,
+            year=year,
+            label_bucket=label_bucket,
+        )
+        return Response(content=payload, media_type="application/json")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/v1/revenue/labels_apple_marketshare")
+def labels_apple_marketshare(
+    period_start_date: str | None = None,
+    year: int | None = None,
+    label_bucket: str | None = None,
+):
+    """
+    Per-label Apple US marketshare by month (from
+    model/data/labels_apple_marketshare.csv on S3).
+
+    Optional filters: ``period_start_date`` (YYYY-MM-DD), ``year``,
+    ``label_bucket`` (e.g. ``Atlantic``).
+    """
+    return _platform_marketshare_response(
+        "labels_apple_marketshare",
+        period_start_date=period_start_date,
+        year=year,
+        label_bucket=label_bucket,
+    )
+
+
+@app.get("/v1/revenue/labels_spotify_marketshare")
+def labels_spotify_marketshare(
+    period_start_date: str | None = None,
+    year: int | None = None,
+    label_bucket: str | None = None,
+):
+    """
+    Per-label Spotify US marketshare by month (from
+    model/data/labels_spotify_marketshare.csv on S3).
+
+    Optional filters: ``period_start_date`` (YYYY-MM-DD), ``year``,
+    ``label_bucket`` (e.g. ``Atlantic``).
+    """
+    return _platform_marketshare_response(
+        "labels_spotify_marketshare",
+        period_start_date=period_start_date,
+        year=year,
+        label_bucket=label_bucket,
+    )
+
+
+@app.get("/v1/revenue/amg_full_apple_marketshare")
+def amg_full_apple_marketshare(
+    period_start_date: str | None = None,
+    year: int | None = None,
+    label_bucket: str | None = None,
+):
+    """
+    AMG-full Apple US marketshare by month (from
+    model/data/amg_full_apple_marketshare.csv on S3).
+
+    Optional filters: ``period_start_date`` (YYYY-MM-DD), ``year``,
+    ``label_bucket``.
+    """
+    return _platform_marketshare_response(
+        "amg_full_apple_marketshare",
+        period_start_date=period_start_date,
+        year=year,
+        label_bucket=label_bucket,
+    )
+
+
+@app.get("/v1/revenue/amg_full_spotify_marketshare")
+def amg_full_spotify_marketshare(
+    period_start_date: str | None = None,
+    year: int | None = None,
+    label_bucket: str | None = None,
+):
+    """
+    AMG-full Spotify US marketshare by month (from
+    model/data/amg_full_spotify_marketshare.csv on S3).
+
+    Optional filters: ``period_start_date`` (YYYY-MM-DD), ``year``,
+    ``label_bucket``.
+    """
+    return _platform_marketshare_response(
+        "amg_full_spotify_marketshare",
+        period_start_date=period_start_date,
+        year=year,
+        label_bucket=label_bucket,
+    )
 
 
 @app.get("/v1/revenue/releases_by_q_amg_labels")
