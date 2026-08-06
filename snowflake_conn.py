@@ -1,6 +1,7 @@
 import pandas as pd
 import os
 import snowflake.connector
+from snowflake.connector import options as snowflake_options
 from dotenv import load_dotenv
 from pathlib import Path
 from cryptography.hazmat.primitives import serialization
@@ -81,7 +82,19 @@ class Snowflake:
         try:
             cursor = self.conn.cursor()
             cursor.execute(sql)
-            return cursor.fetch_pandas_all()
+            if cursor.description is None:
+                return pd.DataFrame()
+
+            cols = [col[0] for col in cursor.description]
+            # Avoid fetch_pandas_all(): Snowflake sets installed_pandas=False when
+            # pandas OR pyarrow fail to import at connector load time, but the error
+            # message always says "pandas is not installed" (errno ER_NO_PYARROW).
+            if snowflake_options.installed_pandas:
+                try:
+                    return cursor.fetch_pandas_all()
+                except snowflake.connector.errors.ProgrammingError:
+                    pass
+            return pd.DataFrame(cursor.fetchall(), columns=cols)
         except snowflake.connector.errors.ProgrammingError as e:
             raise SnowflakeConnectionError(f"An error occurred while executing the query: {e}")
         except Exception as e:

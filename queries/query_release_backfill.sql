@@ -15,7 +15,7 @@ WITH mrelg_map AS (
         JOIN luminate_prod.extract_s.vw_musical_release_group_ds mrelg ON mrelg.mrelg_id = mm.mrelg_id
         AND mrelg.compilation_type != 'Compilation'
     WHERE
-        i.level_2_distributor IN ('Atlantic Music Group', 'Interscope/Geffen/A&M')
+        i.level_2_distributor IN ({TARGET_LABELS})
         AND i.is_current = TRUE
         {RELEASE_DATE_FILTER}
         QUALIFY rn = 1

@@ -26,7 +26,28 @@ from .all_data_archetypes_simulator_ae import (
     SimulatorArtifacts,
     resolve_scenario_multiplier,
 )
+from .marketshare_labels import TARGET_LABELS
+
 logger = logging.getLogger(__name__)
+
+# Per-Owner injection columns on the future marketshare frame.
+_INJECT_COL_PREFIX = "Injected__"
+_INJECT_OTHER_COL = "Injected_Other"
+
+
+def _inject_col_for_owner(owner: str) -> str:
+    return f"{_INJECT_COL_PREFIX}{owner}"
+
+
+def _resolve_inject_col(label: str) -> str:
+    """Map release label to an injection column (TARGET_LABELS or Other)."""
+    if label in TARGET_LABELS:
+        return _inject_col_for_owner(label)
+    return _INJECT_OTHER_COL
+
+
+def _all_inject_cols() -> List[str]:
+    return [_inject_col_for_owner(o) for o in TARGET_LABELS] + [_INJECT_OTHER_COL]
 
 
 def _resolve_scenario_multiplier(
@@ -132,8 +153,15 @@ DISTRIBUTIONS = {
         "Rock": [90.0, 10.0, 0.0, 0.0],
     },
     "Label": {
+        # AMG-like prior (default for most of the 7-label set until recomputed)
         "Atlantic Music Group": [35.07, 8.21, 18.66, 38.06],
-        "Interscope/Geffen/A&M": [9.86, 14.08, 50.70, 25.35],
+        "Warner Records": [35.07, 8.21, 18.66, 38.06],
+        "THE ORCHARD": [35.07, 8.21, 18.66, 38.06],
+        "RCA Records": [35.07, 8.21, 18.66, 38.06],
+        "Columbia Records": [35.07, 8.21, 18.66, 38.06],
+        # Former Interscope/Geffen/A&M prior — renamed + copied to Republic
+        "Interscope-Capitol": [9.86, 14.08, 50.70, 25.35],
+        "REPUBLIC Collective": [9.86, 14.08, 50.70, 25.35],
     },
 }
 
@@ -579,7 +607,8 @@ def run_archetype_scenario(
     # --- NEW: Create a separate timeline for the frontend tracker ---
     tracker_dates = df_full[df_full["Week Ending Date"].dt.year == 2026]["Week Ending Date"].sort_values().unique()
 
-    for col in ["Injected_AMG", "Injected_Int", "Injected_Oth"]:
+    inject_cols = _all_inject_cols()
+    for col in inject_cols:
         fut_sim[col] = 0.0
 
     # --- UPDATE: Assign the full year to the tracker ---
@@ -619,15 +648,17 @@ def run_archetype_scenario(
         return pd.DataFrame(temp_curve_rows) if temp_curve_rows else None
 
     volume_report_data = []
-    end_of_year_date = tracker_dates.max()
-
-    volume_report_data = []
-    end_of_year_date = fut_dates.max()
+    end_of_year_date = fut_dates.max() if len(fut_dates) else tracker_dates.max()
 
     for i, release in enumerate(release_calendar):
-        lbl = release.get("label", "")
-        target_col = "Injected_AMG" if lbl == "Atlantic Music Group" else "Injected_Int" if lbl == "Interscope/Geffen/A&M" else "Injected_Oth"
-        
+        lbl = str(release.get("label") or "")
+        target_col = _resolve_inject_col(lbl)
+        if target_col == _INJECT_OTHER_COL and lbl:
+            logger.warning(
+                "Release label %r not in TARGET_LABELS; AE injects into market denominator only",
+                lbl,
+            )
+
         release_name = release_album_title(release)
         logger.info(f"Injecting: {release_name} | {lbl} | {release.get('genre', 'Unknown Genre')}")
 
@@ -645,7 +676,7 @@ def run_archetype_scenario(
         
         drop_dt = pd.to_datetime(release.get("date"))
         cy_total = 0
-        if drop_dt <= end_of_year_date:
+        if pd.notna(drop_dt) and drop_dt <= end_of_year_date:
             weeks_active = min(max(0, (end_of_year_date - drop_dt).days // 7 + 1), NUM_WEEKS)
             cy_total = sum(full_curve[:weeks_active])
             
@@ -667,14 +698,26 @@ def run_archetype_scenario(
 
     df_tracker = df_tracker.fillna(0)
 
-    # --- Marketshare Calculations (Untouched) ---
-    fut_sim["Sim_Total_Market_AE_Volume"] = fut_sim["Total_Market_AE_Volume"] + fut_sim["Injected_AMG"] + fut_sim["Injected_Int"] + fut_sim["Injected_Oth"]
+    # --- Marketshare: N-way Owner injection ---
+    # Sim_Total = baseline market + sum of all injected AE (tracked labels + Other)
+    # Active_Share[owner] = (Base_Num[owner] + Injected[owner]*100) / Sim_Total
+    fut_sim["Sim_Total_Market_AE_Volume"] = fut_sim["Total_Market_AE_Volume"] + fut_sim[inject_cols].sum(axis=1)
     fut_sim["Base_Num"] = fut_sim["Predicted_Baseline_Share"] * fut_sim["Total_Market_AE_Volume"]
-    fut_sim["Sim_AMG_Num"] = np.where(fut_sim["Owner"] == "Atlantic Music Group", fut_sim["Base_Num"] + (fut_sim["Injected_AMG"] * 100), fut_sim["Base_Num"])
-    fut_sim["Sim_Int_Num"] = np.where(fut_sim["Owner"] == "Interscope/Geffen/A&M", fut_sim["Base_Num"] + (fut_sim["Injected_Int"] * 100), fut_sim["Base_Num"])
-    fut_sim["Active_Share"] = np.where(fut_sim["Owner"] == "Atlantic Music Group", fut_sim["Sim_AMG_Num"] / fut_sim["Sim_Total_Market_AE_Volume"], fut_sim["Sim_Int_Num"] / fut_sim["Sim_Total_Market_AE_Volume"])
 
-    fut_sim = fut_sim.drop(columns=["Total_Market_AE_Volume"]).rename(columns={"Sim_Total_Market_AE_Volume": "Total_Market_AE_Volume"})
+    injected_for_owner = np.zeros(len(fut_sim), dtype=float)
+    for owner in TARGET_LABELS:
+        col = _inject_col_for_owner(owner)
+        mask = fut_sim["Owner"].astype(str) == owner
+        if mask.any():
+            injected_for_owner[mask.to_numpy()] = fut_sim.loc[mask, col].to_numpy(dtype=float)
+
+    denom = fut_sim["Sim_Total_Market_AE_Volume"].replace(0, np.nan)
+    fut_sim["Active_Share"] = (fut_sim["Base_Num"] + injected_for_owner * 100.0) / denom
+    fut_sim["Active_Share"] = fut_sim["Active_Share"].fillna(0.0)
+
+    fut_sim = fut_sim.drop(columns=["Total_Market_AE_Volume"]).rename(
+        columns={"Sim_Total_Market_AE_Volume": "Total_Market_AE_Volume"}
+    )
     fut_sim["Data_Type"] = "Forecast"
 
     hist_stack = actuals_2026[["Week Ending Date", "Owner", "Total_Market_AE_Volume", "AE_Share"]].copy().rename(columns={"AE_Share": "Active_Share"})

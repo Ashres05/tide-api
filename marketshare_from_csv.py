@@ -1,5 +1,5 @@
 """
-Compute marketshare actuals (per-week and YTD) directly from Current_Data.csv.
+Compute marketshare actuals (per-week and YTD) directly from current_data_all.csv.
 
 Single source of truth for what the API exposes as "actuals":
   - /v1/marketshare/actuals          → ytd_actuals_for_year()
@@ -8,17 +8,16 @@ Single source of truth for what the API exposes as "actuals":
 Replaces the legacy SQLite chain (MARKETSHARE_YTD / MARKETSHARE_WEEKLY tables
 populated by sqlite_handler.update_sqlite_main). The legacy chain refreshed
 on a different cadence than the CSVs, which let the YTD endpoint drift behind
-alist_75k.csv. By reading Current_Data.csv directly:
+alist data. By reading current_data_all.csv directly:
 
   * The same DataFrame the model trains on is what the API serves.
   * The Luminate chart-year boundary (the YEAR column) is honored — no need
     to infer year from week_ending_date string prefix.
   * No drift possible between actuals and the CSV the next refresh produces.
 
-Caching: Current_Data.csv is small (~30KB, ~250 rows), so the parse cost is
-under 50ms cold. We still cache parsed output keyed by (file mtime, year) so
-hot requests are O(1). reload_artifacts() in model_handler clears this cache
-after every refresh.
+Caching: the CSV is small, so the parse cost is under 50ms cold. We still
+cache parsed output keyed by (file mtime, year) so hot requests are O(1).
+reload_artifacts() in model_handler clears this cache after every refresh.
 """
 
 from __future__ import annotations
@@ -32,11 +31,17 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+from model.marketshare_labels import (
+    CURRENT_DATA_ALL_CSV,
+    MARKET_ANCHOR_LABEL,
+    TARGET_LABELS,
+)
+
 logger = logging.getLogger(__name__)
 
-TARGET_LABELS = ("Atlantic Music Group", "Interscope/Geffen/A&M")
-
-DEFAULT_CSV_PATH = Path(__file__).resolve().parent / "model" / "data" / "Current_Data.csv"
+DEFAULT_CSV_PATH = (
+    Path(__file__).resolve().parent / "model" / "data" / CURRENT_DATA_ALL_CSV
+)
 
 
 @dataclass(frozen=True)
@@ -71,20 +76,23 @@ def _normalize_year_column(current: pd.DataFrame) -> pd.DataFrame:
             out["Year"] = pd.to_numeric(out["Year"], errors="coerce").astype("Int64")
             return out
     raise KeyError(
-        "Current_Data.csv has no Year/YEAR column — cannot derive Luminate chart-year."
+        f"{CURRENT_DATA_ALL_CSV} has no Year/YEAR column — cannot derive Luminate chart-year."
     )
 
 
 def _load_current_data(csv_path: Path) -> pd.DataFrame:
     """
-    Load + filter Current_Data.csv to AMG/Interscope, RELEASE_AGE='Current',
-    rows with usable share + volume. Returns a DataFrame with normalized
-    columns ready for aggregation.
+    Load + filter current_data_all.csv to TARGET_LABELS, RELEASE_AGE='Current',
+    US rows when present, with usable share + volume. Returns a DataFrame with
+    normalized columns ready for aggregation.
     """
     if not csv_path.is_file():
-        raise FileNotFoundError(f"Current_Data.csv not found at {csv_path}")
+        raise FileNotFoundError(f"{CURRENT_DATA_ALL_CSV} not found at {csv_path}")
     df = pd.read_csv(csv_path)
     df = _normalize_year_column(df)
+
+    if "COUNTRY_CODE" in df.columns:
+        df = df.loc[df["COUNTRY_CODE"].astype(str).str.upper() == "US"].copy()
 
     # The training pipeline only uses RELEASE_AGE=Current rows. Mirror that
     # so the API serves the same view of the world.
@@ -119,10 +127,30 @@ def _load_current_data(csv_path: Path) -> pd.DataFrame:
     df["WEEK_ENDING_DATE"] = pd.to_datetime(df["WEEK_ENDING_DATE"], errors="coerce")
     df = df.loc[df["WEEK_ENDING_DATE"].notna()].copy()
 
-    # Estimate the total-market AE volume per row by inverting that label's
-    # share. Different labels in the same week SHOULD agree on this; we
-    # take the median across labels to be robust to one bad row.
-    df["__total_market_est"] = df["ALBUM_EQUIVALENT"] / (df["ALBUM_EQUIVALENT_SHARE"] / 100.0)
+    # Drop Owner×Week dups (keeps last) — same as training load_weekly_labels.
+    dup_n = int(df.duplicated(subset=["LABEL_NAME", "WEEK_ENDING_DATE"]).sum())
+    if dup_n:
+        logger.warning(
+            "%s: dropping %d duplicate LABEL_NAME×WEEK rows (keeps last)",
+            csv_path.name,
+            dup_n,
+        )
+        df = df.drop_duplicates(subset=["LABEL_NAME", "WEEK_ENDING_DATE"], keep="last")
+
+    # Market total inverted from MARKET_ANCHOR_LABEL only (matches training).
+    anchor = df.loc[df["LABEL_NAME"] == MARKET_ANCHOR_LABEL].copy()
+    anchor["__total_market_est"] = np.where(
+        anchor["ALBUM_EQUIVALENT_SHARE"] > 0,
+        (anchor["ALBUM_EQUIVALENT"] / anchor["ALBUM_EQUIVALENT_SHARE"]) * 100.0,
+        np.nan,
+    )
+    market_ref = (
+        anchor[["WEEK_ENDING_DATE", "__total_market_est"]]
+        .drop_duplicates(subset=["WEEK_ENDING_DATE"], keep="last")
+    )
+    df = df.drop(columns=["__total_market_est"], errors="ignore").merge(
+        market_ref, on="WEEK_ENDING_DATE", how="left"
+    )
 
     df["Year"] = df["Year"].astype(int)
     return df
@@ -163,7 +191,7 @@ def _aggregate_for_year(df: pd.DataFrame, year: int) -> pd.DataFrame:
 
     weekly_market = (
         yr.groupby("WEEK_ENDING_DATE", as_index=False)["__total_market_est"]
-        .median()
+        .first()
         .rename(columns={"__total_market_est": "Total_Market_AE_Volume"})
     )
 

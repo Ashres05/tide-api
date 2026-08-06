@@ -2,18 +2,22 @@
 """
 Weekly/monthly training job for 75k marketshare artifacts.
 
-Combines logic from `baselinemarket_75k.ipynb` (LGBM + Prophet + pkls) and
-`75k_parlay.ipynb` (market Prophet, baseline YTD, spike Ridge, df_full,
-actuals_2026, exported static tables).
+Inputs (7 labels; see ``marketshare_labels.py``):
+  model/data/current_data_all.csv
+  model/data/bigrelease_alist_75k_all.csv
+
+Market total AE is inverted from Atlantic Music Group only:
+  (ALBUM_EQUIVALENT * 100) / ALBUM_EQUIVALENT_SHARE
+
+A-list scrub is Owner×Week: AE_Volume -= A_LIST_AE[Owner, week].
+LGBM stays pooled with Owner as a categorical feature; one Prophet per Owner.
 
 Outputs (default: ./artifacts_75k/):
   production_lgbm_75k.pkl, production_prophet_models_75k.pkl,
   production_spike_engine.pkl,
   df_full.parquet, actuals_2026.parquet,
-  artist_profile_dict.json, artist_dna_lookup.json, artist_w2_retention.json (empty dicts),
-  cluster_product_coef.json (GLOBAL_PRODUCT_COEF per archetype cluster),
-  distributions.json,
-  metadata.json (E_score, paths, forecast horizon, etc.)
+  artist_profile_dict.json, artist_dna_lookup.json, artist_w2_retention.json,
+  cluster_product_coef.json, distributions.json, metadata.json
 """
 
 from __future__ import annotations
@@ -41,12 +45,21 @@ from .marketshare_75k_simulation import (
     dna_lookup_to_jsonable,
 )
 from .all_data_archetypes_simulator_ae import train as train_archetype_model
+from .marketshare_labels import (
+    ALIST_VOL_COLS,
+    BIG_RELEASE_COLS,
+    BIGRELEASE_ALIST_CSV,
+    CURRENT_DATA_ALL_CSV,
+    MARKET_ALBUMS_COL,
+    MARKET_ANCHOR_LABEL,
+    TARGET_LABELS,
+    TRAINING_CATEGORIES,
+    WEEK_END_COL,
+    assert_label_maps_complete,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
-
-TARGET_LABELS = ["Atlantic Music Group", "Interscope/Geffen/A&M"]
-TRAINING_CATEGORIES = TARGET_LABELS
 
 
 def _normalize_current_data_year_column(current: pd.DataFrame) -> pd.DataFrame:
@@ -87,9 +100,21 @@ def forecast_year_row_mask(df: pd.DataFrame, forecast_year: int) -> pd.Series:
     return (yr.notna() & (yr == forecast_year)) | (yr.isna() & legacy)
 
 
-def load_weekly_amg_int(data_dir: Path) -> pd.DataFrame:
-    current = pd.read_csv(data_dir / "Current_Data.csv")
+def load_weekly_labels(data_dir: Path) -> pd.DataFrame:
+    """
+    Owner×Week AE panel from ``current_data_all.csv`` for ``TARGET_LABELS``.
+
+    Total market AE is inverted from Atlantic Music Group only:
+    ``(ALBUM_EQUIVALENT * 100) / ALBUM_EQUIVALENT_SHARE``.
+    """
+    assert_label_maps_complete()
+    path = data_dir / CURRENT_DATA_ALL_CSV
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing {path}; sync {CURRENT_DATA_ALL_CSV} from S3.")
+    current = pd.read_csv(path)
     current = _normalize_current_data_year_column(current)
+    if "COUNTRY_CODE" in current.columns:
+        current = current.loc[current["COUNTRY_CODE"].astype(str).str.upper() == "US"].copy()
     if "RELEASE_AGE" in current.columns:
         ra = current["RELEASE_AGE"].astype(str).str.strip()
         n_before = len(current)
@@ -97,18 +122,18 @@ def load_weekly_amg_int(data_dir: Path) -> pd.DataFrame:
         n_after = len(current)
         if n_before and n_after < n_before:
             logger.info(
-                "Current_Data: RELEASE_AGE=='Current' only (%d rows, dropped %d)",
+                "%s: RELEASE_AGE=='Current' only (%d rows, dropped %d)",
+                CURRENT_DATA_ALL_CSV,
                 n_after,
                 n_before - n_after,
             )
         if n_after == 0:
             logger.warning(
-                "Current_Data: zero rows after RELEASE_AGE=='Current' filter; check values/casing"
+                "%s: zero rows after RELEASE_AGE=='Current' filter; check values/casing",
+                CURRENT_DATA_ALL_CSV,
             )
-    weekly_amg_int = current[
-        current["LABEL_NAME"].isin(TARGET_LABELS)
-    ].copy()
-    weekly_amg_int = weekly_amg_int.rename(
+    weekly = current[current["LABEL_NAME"].isin(TARGET_LABELS)].copy()
+    weekly = weekly.rename(
         columns={
             "WEEK_ENDING_DATE": "Week Ending Date",
             "ALBUM_EQUIVALENT": "AE_Volume",
@@ -116,77 +141,136 @@ def load_weekly_amg_int(data_dir: Path) -> pd.DataFrame:
             "LABEL_NAME": "Owner",
         }
     )
-    amg_truth = weekly_amg_int[weekly_amg_int["Owner"] == "Atlantic Music Group"].copy()
-    amg_truth["True_Total_Market"] = np.where(
-        amg_truth["AE_Share"] > 0,
-        (amg_truth["AE_Volume"] / amg_truth["AE_Share"]) * 100,
+    weekly["Week Ending Date"] = pd.to_datetime(weekly["Week Ending Date"], errors="coerce")
+    weekly["AE_Volume"] = pd.to_numeric(weekly["AE_Volume"], errors="coerce")
+    weekly["AE_Share"] = pd.to_numeric(weekly["AE_Share"], errors="coerce")
+    weekly = weekly.dropna(subset=["Week Ending Date", "Owner", "AE_Volume", "AE_Share"])
+
+    amg = weekly[weekly["Owner"] == MARKET_ANCHOR_LABEL].copy()
+    amg["True_Total_Market"] = np.where(
+        amg["AE_Share"] > 0,
+        (amg["AE_Volume"] / amg["AE_Share"]) * 100,
         np.nan,
     )
-    market_ref = amg_truth[["Week Ending Date", "True_Total_Market"]].drop_duplicates()
-    weekly_amg_int["Week Ending Date"] = pd.to_datetime(weekly_amg_int["Week Ending Date"])
-    market_ref["Week Ending Date"] = pd.to_datetime(market_ref["Week Ending Date"])
-    if "Total_Market_AE_Volume" in weekly_amg_int.columns:
-        weekly_amg_int = weekly_amg_int.drop(columns=["Total_Market_AE_Volume"])
-    weekly_amg_int = weekly_amg_int.merge(market_ref, on="Week Ending Date", how="left")
-    weekly_amg_int = weekly_amg_int.rename(columns={"True_Total_Market": "Total_Market_AE_Volume"})
-    dup_n = weekly_amg_int.duplicated(subset=["Owner", "Week Ending Date"]).sum()
+    market_ref = amg[["Week Ending Date", "True_Total_Market"]].drop_duplicates(
+        subset=["Week Ending Date"], keep="last"
+    )
+    if "Total_Market_AE_Volume" in weekly.columns:
+        weekly = weekly.drop(columns=["Total_Market_AE_Volume"])
+    weekly = weekly.merge(market_ref, on="Week Ending Date", how="left")
+    weekly = weekly.rename(columns={"True_Total_Market": "Total_Market_AE_Volume"})
+
+    dup_n = int(weekly.duplicated(subset=["Owner", "Week Ending Date"]).sum())
     if dup_n:
         logger.warning(
-            "Current_Data: dropping %d duplicate Owner×Week rows (keeps last); duplicates skew YTD cumulatives",
-            int(dup_n),
+            "%s: dropping %d duplicate Owner×Week rows (keeps last)",
+            CURRENT_DATA_ALL_CSV,
+            dup_n,
         )
-        weekly_amg_int = weekly_amg_int.drop_duplicates(
+        weekly = weekly.drop_duplicates(
             subset=["Owner", "Week Ending Date"], keep="last"
         ).reset_index(drop=True)
-    return weekly_amg_int
+    logger.info(
+        "load_weekly_labels: %d rows, %d owners, weeks %s → %s",
+        len(weekly),
+        weekly["Owner"].nunique(),
+        weekly["Week Ending Date"].min().date() if len(weekly) else None,
+        weekly["Week Ending Date"].max().date() if len(weekly) else None,
+    )
+    return weekly
 
 
-def build_wk_minus(weekly_amg_int: pd.DataFrame, a_list_wk: pd.DataFrame) -> pd.DataFrame:
-    weekly_amg_int = weekly_amg_int.copy()
-    weekly_amg_int["Week Ending Date"] = pd.to_datetime(weekly_amg_int["Week Ending Date"])
-    a_list_wk = a_list_wk.copy()
-    a_list_wk["WEEK_END_DATE"] = pd.to_datetime(a_list_wk["WEEK_END_DATE"])
+# Back-compat alias for callers that still import the old name.
+load_weekly_amg_int = load_weekly_labels
 
-    # Train only on weeks covered by alist_75k so scrub volumes exist for every row.
-    # Earlier weeks would merge with AMG/INTERSCOPE albums = 0 and bias Prophet.
-    if not a_list_wk.empty:
-        min_scrub_week = a_list_wk["WEEK_END_DATE"].min()
-        before = len(weekly_amg_int)
-        weekly_amg_int = weekly_amg_int[
-            weekly_amg_int["Week Ending Date"] >= min_scrub_week
-        ].reset_index(drop=True)
-        dropped = before - len(weekly_amg_int)
+
+def load_alist_bigrelease_long(data_dir: Path) -> pd.DataFrame:
+    """
+    Melt ``bigrelease_alist_75k_all.csv`` to long Owner×Week scrub + flag rows.
+
+    Columns: WEEK_END_DATE, Owner, A_LIST_AE, BIG_RELEASE_FLAG, MARKET_ALBUMS.
+    """
+    assert_label_maps_complete()
+    path = data_dir / BIGRELEASE_ALIST_CSV
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing {path}; sync {BIGRELEASE_ALIST_CSV} from S3.")
+    wide = pd.read_csv(path)
+    wide.columns = [str(c).strip().upper() for c in wide.columns]
+    if WEEK_END_COL not in wide.columns:
+        raise ValueError(f"{BIGRELEASE_ALIST_CSV} missing {WEEK_END_COL}")
+    wide[WEEK_END_COL] = pd.to_datetime(wide[WEEK_END_COL], errors="coerce")
+    wide = wide.dropna(subset=[WEEK_END_COL])
+    if MARKET_ALBUMS_COL in wide.columns:
+        wide[MARKET_ALBUMS_COL] = pd.to_numeric(wide[MARKET_ALBUMS_COL], errors="coerce").fillna(0.0)
+    else:
+        wide[MARKET_ALBUMS_COL] = 0.0
+
+    rows: List[pd.DataFrame] = []
+    for owner, vol_col in ALIST_VOL_COLS.items():
+        flag_col = BIG_RELEASE_COLS[owner]
+        if vol_col not in wide.columns:
+            raise ValueError(f"{BIGRELEASE_ALIST_CSV} missing alist col {vol_col}")
+        if flag_col not in wide.columns:
+            raise ValueError(f"{BIGRELEASE_ALIST_CSV} missing flag col {flag_col}")
+        chunk = pd.DataFrame(
+            {
+                "WEEK_END_DATE": wide[WEEK_END_COL],
+                "Owner": owner,
+                "A_LIST_AE": pd.to_numeric(wide[vol_col], errors="coerce").fillna(0.0),
+                "BIG_RELEASE_FLAG": pd.to_numeric(wide[flag_col], errors="coerce").fillna(0.0),
+                "MARKET_ALBUMS": wide[MARKET_ALBUMS_COL],
+            }
+        )
+        rows.append(chunk)
+    long = pd.concat(rows, ignore_index=True)
+    long = long.drop_duplicates(subset=["Owner", "WEEK_END_DATE"], keep="last").reset_index(drop=True)
+    logger.info(
+        "load_alist_bigrelease_long: %d rows, weeks %s → %s",
+        len(long),
+        long["WEEK_END_DATE"].min().date() if len(long) else None,
+        long["WEEK_END_DATE"].max().date() if len(long) else None,
+    )
+    return long
+
+
+def build_wk_minus(weekly_labels: pd.DataFrame, alist_long: pd.DataFrame) -> pd.DataFrame:
+    """
+    Scrub A-list AE from each Owner's weekly volume:
+    ``AE_Volume = AE_Volume - A_LIST_AE[Owner, week]``.
+    """
+    weekly = weekly_labels.copy()
+    weekly["Week Ending Date"] = pd.to_datetime(weekly["Week Ending Date"])
+    scrub = alist_long.copy()
+    scrub["WEEK_END_DATE"] = pd.to_datetime(scrub["WEEK_END_DATE"])
+
+    # Train only on weeks covered by the combined alist/big-release file.
+    if not scrub.empty:
+        min_scrub_week = scrub["WEEK_END_DATE"].min()
+        before = len(weekly)
+        weekly = weekly[weekly["Week Ending Date"] >= min_scrub_week].reset_index(drop=True)
+        dropped = before - len(weekly)
         if dropped:
             logger.info(
-                "build_wk_minus: dropped %d weeks before alist_75k coverage (%s)",
+                "build_wk_minus: dropped %d weeks before alist coverage (%s)",
                 dropped,
                 min_scrub_week.date().isoformat(),
             )
 
-    wk_minus = pd.merge(
-        weekly_amg_int,
-        a_list_wk,
-        left_on="Week Ending Date",
-        right_on="WEEK_END_DATE",
+    wk_minus = weekly.merge(
+        scrub[["WEEK_END_DATE", "Owner", "A_LIST_AE", "BIG_RELEASE_FLAG", "MARKET_ALBUMS"]],
+        left_on=["Week Ending Date", "Owner"],
+        right_on=["WEEK_END_DATE", "Owner"],
         how="left",
     )
+    wk_minus["A_LIST_AE"] = wk_minus["A_LIST_AE"].fillna(0.0)
+    wk_minus["BIG_RELEASE_FLAG"] = wk_minus["BIG_RELEASE_FLAG"].fillna(0.0)
+    wk_minus["MARKET_ALBUMS"] = wk_minus["MARKET_ALBUMS"].fillna(0.0)
+    wk_minus["AE_Volume"] = wk_minus["AE_Volume"] - wk_minus["A_LIST_AE"]
     wk_minus["Competitor_AE_Volume"] = wk_minus["Total_Market_AE_Volume"] - wk_minus["AE_Volume"]
-    for c in ["AMG_ALBUMS", "INTERSCOPE_ALBUMS", "MARKET_ALBUMS"]:
-        if c in wk_minus.columns:
-            wk_minus[c] = wk_minus[c].fillna(0)
-    wk_minus["AE_Volume"] = np.where(
-        wk_minus["Owner"] == "Atlantic Music Group",
-        wk_minus["AE_Volume"] - wk_minus["AMG_ALBUMS"].fillna(0),
-        np.where(
-            wk_minus["Owner"] == "Interscope/Geffen/A&M",
-            wk_minus["AE_Volume"] - wk_minus["INTERSCOPE_ALBUMS"].fillna(0),
-            wk_minus["AE_Volume"],
-        ),
-    )
     wk_minus["AE_Share"] = np.where(
         wk_minus["Total_Market_AE_Volume"] > 0,
         (wk_minus["AE_Volume"] / wk_minus["Total_Market_AE_Volume"]) * 100,
-        0.0
+        0.0,
     )
     return wk_minus
 
@@ -205,11 +289,12 @@ def prepare_df_model(wk_minus: pd.DataFrame) -> pd.DataFrame:
         lambda x: x.shift(1).rolling(window=4).mean()
     )
     df_model = df_model.dropna(subset=["Roll4W_AE_Volume"]).reset_index(drop=True)
-    df_model["Owner"] = df_model["Owner"].astype("category")
+    df_model["Owner"] = pd.Categorical(df_model["Owner"], categories=TRAINING_CATEGORIES)
     return df_model
 
 
 def train_lgbm_prophet(df_model: pd.DataFrame) -> Tuple[lgb.LGBMRegressor, Dict[str, Any]]:
+    """Pooled quantile LGBM (Owner categorical) + one Prophet per Owner."""
     features = [
         "Owner",
         "Lag1_AE_Volume",
@@ -217,9 +302,10 @@ def train_lgbm_prophet(df_model: pd.DataFrame) -> Tuple[lgb.LGBMRegressor, Dict[
         "Roll4W_AE_Volume",
         "Roll4W_Competitor_Volume",
     ]
-    X_full = df_model[features]
-    y_full = df_model["AE_Share"] 
-    
+    X_full = df_model[features].copy()
+    X_full["Owner"] = pd.Categorical(X_full["Owner"], categories=TRAINING_CATEGORIES)
+    y_full = df_model["AE_Share"]
+
     production_lgbm = lgb.LGBMRegressor(
         objective="quantile",
         alpha=0.5,
@@ -230,11 +316,13 @@ def train_lgbm_prophet(df_model: pd.DataFrame) -> Tuple[lgb.LGBMRegressor, Dict[
     production_lgbm.fit(X_full, y_full, categorical_feature=["Owner"])
 
     production_prophet_models: Dict[str, Any] = {}
-    for label in df_model["Owner"].unique():
+    for label in TRAINING_CATEGORIES:
         label_df = df_model[df_model["Owner"] == label].copy()
-
+        if label_df.empty:
+            logger.warning("train_lgbm_prophet: no rows for Owner=%s; skipping Prophet", label)
+            continue
         prophet_train = label_df[["Week Ending Date", "AE_Share"]].rename(
-            columns={"Week Ending Date": "ds", "AE_Share": "y"} # BACK TO SHARE
+            columns={"Week Ending Date": "ds", "AE_Share": "y"}
         )
         prophet_model = Prophet(
             yearly_seasonality=2,
@@ -260,27 +348,29 @@ def conformal_e80_2026(
     ensemble_errors: List[pd.Series] = []
     
     for label in TARGET_LABELS:
+        if label not in production_prophet_models:
+            continue
         df_label = backtest_raw[backtest_raw["Owner"] == label].copy()
-                
+
         df_label = df_label[forecast_year_row_mask(df_label, forecast_year)].dropna()
         if df_label.empty:
             continue
-            
+
         lgbm_features = df_label[
             ["Owner", "Lag1_AE_Volume", "Lag1_Competitor_Volume", "Roll4W_AE_Volume", "Roll4W_Competitor_Volume"]
         ].copy()
         lgbm_features["Owner"] = pd.Categorical(lgbm_features["Owner"], categories=TRAINING_CATEGORIES)
-        
+
         df_label["LGBM_Pred"] = production_lgbm.predict(lgbm_features)
-        
+
         prophet_input = df_label[["Week Ending Date"]].rename(columns={"Week Ending Date": "ds"})
         df_label["Prophet_Pred"] = production_prophet_models[label].predict(prophet_input)["yhat"].values
-        
+
         df_label["Ensemble_Share"] = (df_label["LGBM_Pred"] + df_label["Prophet_Pred"]) / 2
-        
+
         df_label["Actual_Weekly_Share"] = (df_label["AE_Volume"] / df_label["Total_Market_AE_Volume"]) * 100
         df_label["Abs_Error"] = (df_label["Actual_Weekly_Share"] - df_label["Ensemble_Share"]).abs()
-        
+
         ensemble_errors.append(df_label["Abs_Error"])
         
     if not ensemble_errors:
@@ -317,7 +407,13 @@ def forecast_baseline_future(
     # 2. Autoregressive Loop for Labels
     future_label_df = pd.DataFrame()
     for label in TARGET_LABELS:
+        if label not in production_prophet_models:
+            logger.warning("forecast_baseline_future: skip %s (no Prophet model)", label)
+            continue
         label_history = df_model[df_model["Owner"] == label].sort_values("Week Ending Date")
+        if label_history.empty or len(label_history) < 4:
+            logger.warning("forecast_baseline_future: skip %s (need ≥4 history weeks)", label)
+            continue
         # Keep the last 4 weeks of volume in a list to seed the rolling averages
         recent_vols = list(label_history.tail(4)["AE_Volume"].values)
         recent_comp = list(label_history.tail(4)["Competitor_AE_Volume"].values)
@@ -338,7 +434,7 @@ def forecast_baseline_future(
                 "Roll4W_AE_Volume": [current_roll4w_ae],
                 "Roll4W_Competitor_Volume": [current_roll4w_comp]
             })
-            lgbm_in["Owner"] = lgbm_in["Owner"].astype("category")
+            lgbm_in["Owner"] = pd.Categorical(lgbm_in["Owner"], categories=TRAINING_CATEGORIES)
             lgbm_pred = float(production_lgbm.predict(lgbm_in)[0])
 
             # Predict Prophet
@@ -379,7 +475,11 @@ def build_ytd_projections(
 ) -> pd.DataFrame:
     ytd_projections = pd.DataFrame()
     for label in TARGET_LABELS:
+        if label not in ytd_bank:
+            continue
         lf = final_forecast[final_forecast["Owner"] == label].sort_values("Week Ending Date").copy()
+        if lf.empty:
+            continue
         banked_num = ytd_bank[label]["Banked_Numerator"]
         banked_den = ytd_bank[label]["Banked_Denominator"]
         lf["Weekly_Num"] = lf["Predicted_Weekly_Share"] * lf["Predicted_Total_Market_Volume"]
@@ -397,43 +497,37 @@ def build_ytd_projections(
 
 
 def enrich_weekly_for_spike(
-    weekly_amg_int: pd.DataFrame,
-    a_list_wk: pd.DataFrame,
-    big_release_flag: pd.DataFrame,
+    weekly_labels: pd.DataFrame,
+    alist_long: pd.DataFrame,
     wk_minus: pd.DataFrame,
+    big_release_flag: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
-    w = weekly_amg_int.copy()
+    """
+    Attach per-Owner A-list incremental volume and big-release flags.
+
+    ``big_release_flag`` is ignored when ``alist_long`` already carries
+    ``BIG_RELEASE_FLAG`` (combined ``bigrelease_alist_75k_all.csv``).
+    """
+    w = weekly_labels.copy()
     w["Week Ending Date"] = pd.to_datetime(w["Week Ending Date"])
-    a_list_wk = a_list_wk.copy()
-    a_list_wk["WEEK_END_DATE"] = pd.to_datetime(a_list_wk["WEEK_END_DATE"])
+    scrub = alist_long.copy()
+    scrub["WEEK_END_DATE"] = pd.to_datetime(scrub["WEEK_END_DATE"])
     w = w.merge(
-        a_list_wk[["WEEK_END_DATE", "AMG_ALBUMS", "INTERSCOPE_ALBUMS"]],
-        left_on="Week Ending Date",
-        right_on="WEEK_END_DATE",
+        scrub[["WEEK_END_DATE", "Owner", "A_LIST_AE", "BIG_RELEASE_FLAG"]],
+        left_on=["Week Ending Date", "Owner"],
+        right_on=["WEEK_END_DATE", "Owner"],
         how="left",
     )
-    w["Incremental_Volume"] = 0.0
-    amg_mask = w["Owner"] == "Atlantic Music Group"
-    w.loc[amg_mask, "Incremental_Volume"] = w.loc[amg_mask, "AMG_ALBUMS"].fillna(0)
-    int_mask = w["Owner"] == "Interscope/Geffen/A&M"
-    w.loc[int_mask, "Incremental_Volume"] = w.loc[int_mask, "INTERSCOPE_ALBUMS"].fillna(0)
+    w["Incremental_Volume"] = w["A_LIST_AE"].fillna(0.0)
+    w["big_release_flag"] = w["BIG_RELEASE_FLAG"].fillna(0.0)
     w["Incremental_Share"] = np.where(
         w["Total_Market_AE_Volume"] > 0,
         (w["Incremental_Volume"] / w["Total_Market_AE_Volume"]) * 100,
         0.0,
     )
-    big_release_flag = big_release_flag.copy()
-    big_release_flag["WEEK_END_DATE"] = pd.to_datetime(big_release_flag["WEEK_END_DATE"])
-    w = w.merge(
-        big_release_flag[["WEEK_END_DATE", "BIG_RELEASE_ATLANTIC", "BIG_RELEASE_INTERSCOPE"]],
-        left_on="Week Ending Date",
-        right_on="WEEK_END_DATE",
-        how="left",
+    scrubbed_vols = wk_minus[["Week Ending Date", "Owner", "AE_Volume"]].rename(
+        columns={"AE_Volume": "Baseline_Volume"}
     )
-    w["big_release_flag"] = 0.0
-    w.loc[amg_mask, "big_release_flag"] = w.loc[amg_mask, "BIG_RELEASE_ATLANTIC"].fillna(0)
-    w.loc[int_mask, "big_release_flag"] = w.loc[int_mask, "BIG_RELEASE_INTERSCOPE"].fillna(0)
-    scrubbed_vols = wk_minus[["Week Ending Date", "Owner", "AE_Volume"]].rename(columns={"AE_Volume": "Baseline_Volume"})
     w = w.merge(scrubbed_vols, on=["Week Ending Date", "Owner"], how="left")
     # Weeks before alist coverage have no wk_minus row: treat as zero A-list scrub.
     w["Baseline_Volume"] = w["Baseline_Volume"].fillna(w["AE_Volume"])
@@ -605,6 +699,21 @@ def build_artist_w2_retention_from_ae_parquet(ae_parquet: Path) -> Dict[str, Dic
     return out
 
 
+def _coerce_ae_metric_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Snowflake/pyarrow parquets often store metrics as decimal.Decimal."""
+    out = df.copy()
+    for c in (
+        "WEEKS_SINCE_RELEASE",
+        "PRODUCT_SALES",
+        "STREAMING_EQUIVALENT",
+        "SONG_SALE_EQUIVALENT",
+        "TOTAL_ALBUM_EQUIVALENTS",
+    ):
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+    return out
+
+
 def _ae_release_pivot_from_parquet(ae_parquet: Path) -> pd.DataFrame:
     cols = [
         "MRELG_ID",
@@ -616,7 +725,7 @@ def _ae_release_pivot_from_parquet(ae_parquet: Path) -> pd.DataFrame:
         "TOTAL_ALBUM_EQUIVALENTS",
     ]
     df = pd.read_parquet(ae_parquet, columns=cols)
-    df["WEEKS_SINCE_RELEASE"] = pd.to_numeric(df["WEEKS_SINCE_RELEASE"], errors="coerce")
+    df = _coerce_ae_metric_columns(df)
     df = df.dropna(subset=["WEEKS_SINCE_RELEASE"]).copy()
     pivot = df.pivot_table(
         index=["MRELG_ID", "TITLE", "DISPLAY_ARTIST", "GENRES"],
@@ -635,6 +744,7 @@ def kmeans_and_dna_from_ae_parquet(
 ) -> Tuple[Dict[str, Dict[int, float]], Any, Dict[str, int], Dict[str, int]]:
     cols = ["MRELG_ID", "TITLE", "DISPLAY_ARTIST", "WEEKS_SINCE_RELEASE", "TOTAL_ALBUM_EQUIVALENTS"]
     df = pd.read_parquet(ae_parquet, columns=cols)
+    df = _coerce_ae_metric_columns(df)
     df["project_label"] = df["DISPLAY_ARTIST"].astype(str).fillna("") + " - " + df["TITLE"].astype(str).fillna("")
     lifespan = df.groupby("project_label")["WEEKS_SINCE_RELEASE"].max()
     mature = lifespan[lifespan >= 52].index
@@ -673,7 +783,9 @@ def build_artist_profile_dict_from_ae_parquet(ae_parquet: Path) -> Dict[str, flo
     pvt = _ae_release_pivot_from_parquet(ae_parquet)
     if "PRODUCT_SALES_w1" not in pvt.columns or "TOTAL_ALBUM_EQUIVALENTS_w1" not in pvt.columns:
         return {}
-    pvt["w1_product_ratio"] = pvt["PRODUCT_SALES_w1"] / pvt["TOTAL_ALBUM_EQUIVALENTS_w1"]
+    den = pd.to_numeric(pvt["TOTAL_ALBUM_EQUIVALENTS_w1"], errors="coerce").replace(0, np.nan)
+    num = pd.to_numeric(pvt["PRODUCT_SALES_w1"], errors="coerce")
+    pvt["w1_product_ratio"] = num / den
     pvt["w1_product_ratio"] = pvt["w1_product_ratio"].replace([np.inf, -np.inf], np.nan)
     agg = pvt.dropna(subset=["w1_product_ratio"]).groupby("DISPLAY_ARTIST")["w1_product_ratio"].median()
     return {str(k): float(v) for k, v in agg.items()}
@@ -756,10 +868,9 @@ def main() -> None:
     art_dir = args.artifacts_dir.expanduser().resolve()
     art_dir.mkdir(parents=True, exist_ok=True)
 
-    a_list_wk = pd.read_csv(data_dir / "alist_75k.csv")
-    big_release_flag = pd.read_csv(data_dir / "bigreleaseflag_75k.csv")
-    weekly_amg_int = load_weekly_amg_int(data_dir)
-    wk_minus = build_wk_minus(weekly_amg_int, a_list_wk)
+    weekly_labels = load_weekly_labels(data_dir)
+    alist_long = load_alist_bigrelease_long(data_dir)
+    wk_minus = build_wk_minus(weekly_labels, alist_long)
 
     df_model = prepare_df_model(wk_minus)
     production_lgbm, production_prophet_models = train_lgbm_prophet(df_model)
@@ -770,11 +881,11 @@ def main() -> None:
     logger.info("Conformal 80th percentile E: %.4f (used as E_score for YTD bands)", e_score)
 
     future_label_df, future_market_volumes = forecast_baseline_future(
-        df_model, weekly_amg_int, production_lgbm, production_prophet_models, args.end_of_year
+        df_model, weekly_labels, production_lgbm, production_prophet_models, args.end_of_year
     )
     final_forecast = pd.merge(future_label_df, future_market_volumes, on="Week Ending Date", how="inner")
 
-    df_2026_base = wk_minus[forecast_year_row_mask(wk_minus, args.forecast_year)].copy()  
+    df_2026_base = wk_minus[forecast_year_row_mask(wk_minus, args.forecast_year)].copy()
     df_2026_base = df_2026_base[df_2026_base["Owner"].isin(TARGET_LABELS)].sort_values(
         ["Owner", "Week Ending Date"]
     ).reset_index(drop=True)
@@ -789,9 +900,13 @@ def main() -> None:
     last_actual_date = df_2026_base["Week Ending Date"].max()
     ytd_bank = {}
     for label in TARGET_LABELS:
-        latest_row = df_2026_base[
+        rows = df_2026_base[
             (df_2026_base["Owner"] == label) & (df_2026_base["Week Ending Date"] == last_actual_date)
-        ].iloc[0]
+        ]
+        if rows.empty:
+            logger.warning("YTD bank: no row for %s at %s; skipping", label, last_actual_date.date())
+            continue
+        latest_row = rows.iloc[0]
         ytd_bank[label] = {
             "Banked_Numerator": float(latest_row["Cum_Numerator"]),
             "Banked_Denominator": float(latest_row["Cum_Denominator"]),
@@ -800,11 +915,11 @@ def main() -> None:
 
     ytd_projections = build_ytd_projections(df_2026_base, ytd_bank, final_forecast, e_score=e_score)
 
-    weekly_enriched = enrich_weekly_for_spike(weekly_amg_int, a_list_wk, big_release_flag, wk_minus)
+    weekly_enriched = enrich_weekly_for_spike(weekly_labels, alist_long, wk_minus)
     spike_engine, df_full, spike_features = train_spike_and_df_full(weekly_enriched, ytd_projections)
 
     # Market volume for future weeks (Prophet on total market) — reuse series from forecast_baseline_future
-    market_history = weekly_amg_int[["Week Ending Date", "Total_Market_AE_Volume"]].drop_duplicates().sort_values(
+    market_history = weekly_labels[["Week Ending Date", "Total_Market_AE_Volume"]].drop_duplicates().sort_values(
         "Week Ending Date"
     )
     market_prophet_train = market_history.rename(columns={"Week Ending Date": "ds", "Total_Market_AE_Volume": "y"})
@@ -815,9 +930,9 @@ def main() -> None:
         start=last_date + pd.Timedelta(days=7), end=pd.to_datetime(args.end_of_year), freq="W-THU"
     )
     full_fc = market_model.predict(pd.DataFrame({"ds": remaining_weeks}))
-    df_full = attach_total_market_volume(df_full, weekly_amg_int, full_fc[["ds", "yhat"]])
+    df_full = attach_total_market_volume(df_full, weekly_labels, full_fc[["ds", "yhat"]])
 
-    actuals_2026 = build_actuals_2026(weekly_amg_int, forecast_year=args.forecast_year)
+    actuals_2026 = build_actuals_2026(weekly_labels, forecast_year=args.forecast_year)
 
     ae_parquet = data_dir / "streams_product_songs_ae_compressed.parquet"
     artist_dna_lookup: Dict[str, Dict[int, float]] = {}
@@ -976,10 +1091,9 @@ def train_artifacts_main(*, csv_only: bool = False) -> None:
     
     art_dir.mkdir(parents=True, exist_ok=True)
 
-    a_list_wk = pd.read_csv(data_dir / "alist_75k.csv")
-    big_release_flag = pd.read_csv(data_dir / "bigreleaseflag_75k.csv")
-    weekly_amg_int = load_weekly_amg_int(data_dir)
-    wk_minus = build_wk_minus(weekly_amg_int, a_list_wk)
+    weekly_labels = load_weekly_labels(data_dir)
+    alist_long = load_alist_bigrelease_long(data_dir)
+    wk_minus = build_wk_minus(weekly_labels, alist_long)
 
     df_model = prepare_df_model(wk_minus)
     production_lgbm, production_prophet_models = train_lgbm_prophet(df_model)
@@ -990,7 +1104,7 @@ def train_artifacts_main(*, csv_only: bool = False) -> None:
     logger.info("Conformal 80th percentile E: %.4f (used as E_score for YTD bands)", e_score)
 
     future_label_df, future_market_volumes = forecast_baseline_future(
-        df_model, weekly_amg_int, production_lgbm, production_prophet_models, end_of_year
+        df_model, weekly_labels, production_lgbm, production_prophet_models, end_of_year
     )
     final_forecast = pd.merge(future_label_df, future_market_volumes, on="Week Ending Date", how="inner")
 
@@ -1009,9 +1123,13 @@ def train_artifacts_main(*, csv_only: bool = False) -> None:
     last_actual_date = df_2026_base["Week Ending Date"].max()
     ytd_bank = {}
     for label in TARGET_LABELS:
-        latest_row = df_2026_base[
+        rows = df_2026_base[
             (df_2026_base["Owner"] == label) & (df_2026_base["Week Ending Date"] == last_actual_date)
-        ].iloc[0]
+        ]
+        if rows.empty:
+            logger.warning("YTD bank: no row for %s at %s; skipping", label, last_actual_date.date())
+            continue
+        latest_row = rows.iloc[0]
         ytd_bank[label] = {
             "Banked_Numerator": float(latest_row["Cum_Numerator"]),
             "Banked_Denominator": float(latest_row["Cum_Denominator"]),
@@ -1020,11 +1138,11 @@ def train_artifacts_main(*, csv_only: bool = False) -> None:
 
     ytd_projections = build_ytd_projections(df_2026_base, ytd_bank, final_forecast, e_score=e_score)
 
-    weekly_enriched = enrich_weekly_for_spike(weekly_amg_int, a_list_wk, big_release_flag, wk_minus)
+    weekly_enriched = enrich_weekly_for_spike(weekly_labels, alist_long, wk_minus)
     spike_engine, df_full, spike_features = train_spike_and_df_full(weekly_enriched, ytd_projections)
 
     # Market volume for future weeks (Prophet on total market) — reuse series from forecast_baseline_future
-    market_history = weekly_amg_int[["Week Ending Date", "Total_Market_AE_Volume"]].drop_duplicates().sort_values(
+    market_history = weekly_labels[["Week Ending Date", "Total_Market_AE_Volume"]].drop_duplicates().sort_values(
         "Week Ending Date"
     )
     market_prophet_train = market_history.rename(columns={"Week Ending Date": "ds", "Total_Market_AE_Volume": "y"})
@@ -1035,9 +1153,9 @@ def train_artifacts_main(*, csv_only: bool = False) -> None:
         start=last_date + pd.Timedelta(days=7), end=pd.to_datetime(end_of_year), freq="W-THU"
     )
     full_fc = market_model.predict(pd.DataFrame({"ds": remaining_weeks}))
-    df_full = attach_total_market_volume(df_full, weekly_amg_int, full_fc[["ds", "yhat"]])
+    df_full = attach_total_market_volume(df_full, weekly_labels, full_fc[["ds", "yhat"]])
 
-    actuals_2026 = build_actuals_2026(weekly_amg_int, forecast_year=forecast_year)
+    actuals_2026 = build_actuals_2026(weekly_labels, forecast_year=forecast_year)
 
     ae_parquet = data_dir / "streams_product_songs_ae_compressed.parquet"
     artist_dna_lookup: Dict[str, Dict[int, float]] = {}

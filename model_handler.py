@@ -28,6 +28,7 @@ import marketshare_from_csv
 import album_art
 import artist_art
 from model.marketshare_75k_simulation import DISTRIBUTIONS, NUM_WEEKS
+from model.marketshare_labels import TARGET_LABELS
 from model.train_catalog_decay import (
     BASELINE52_EPS,
     CATALOG_DECAY_TARGET_HYBRID_SPIKE_GATE_BASELINE52,
@@ -1700,9 +1701,17 @@ def backfill_releases(
         reason = "TIDE_BACKFILL_FULL=1" if full_refresh else "EXPECTED_RELEASES is empty"
         logger.info("backfill_releases: full Snowflake scan (%s)", reason)
 
-    query = load_sql(RELEASE_BACKFILL_QUERY).replace("{RELEASE_DATE_FILTER}", date_filter)
+    labels_sql = ", ".join("'" + lab.replace("'", "''") + "'" for lab in TARGET_LABELS)
+    query = (
+        load_sql(RELEASE_BACKFILL_QUERY)
+        .replace("{RELEASE_DATE_FILTER}", date_filter)
+        .replace("{TARGET_LABELS}", labels_sql)
+    )
 
-    logger.info("backfill_releases: running Snowflake query_release_backfill...")
+    logger.info(
+        "backfill_releases: running Snowflake query_release_backfill for %d labels...",
+        len(TARGET_LABELS),
+    )
     # Single Snowflake connection reused for the candidate list AND per-release metadata.
     with get_snowflake_connection() as sf:
         df = sf.query(query)
