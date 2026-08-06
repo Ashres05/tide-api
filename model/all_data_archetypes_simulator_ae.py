@@ -66,6 +66,129 @@ def archetype_scenario_shape_ratio(cluster_id: int, scenario: Optional[str]) -> 
     return float(row.get(scen, base)) / base
 
 
+# Dynamic asymptotic floor (streams): scale-matched peers + mature-peak filter +
+# live-actuals cap. Shared by simulate_future_drop and fit_backfill_forecast.
+_FLOOR_PEAK_SCALE_BAND = 3.0  # keep peers with peak in [P/band, P*band]
+_FLOOR_MATURE_MAX_PEAK_WEEK = 26.0  # peak must occur by this week (proxy without last_week)
+_FLOOR_MAX_PEER_RETENTION = 0.50  # drop near-flat tails (incomplete / non-asymptotic)
+_FLOOR_LIVE_CAP = 0.95  # F <= 0.95 * last observed week when actuals exist
+_FLOOR_TOP_N = 3
+
+
+def estimate_dynamic_stream_floor(
+    *,
+    artist: str,
+    peak_volume: float,
+    artifacts: "SimulatorArtifacts",
+    last_actual: Optional[float] = None,
+) -> float:
+    """
+    Estimate a late-life weekly streaming floor for ``peak_volume``.
+
+    Peers are same-artist history rows with:
+      - peak within ``_FLOOR_PEAK_SCALE_BAND`` of ``peak_volume``
+      - ``peak_week_obs`` <= ``_FLOOR_MATURE_MAX_PEAK_WEEK`` (when present)
+      - retention = tail/peak <= ``_FLOOR_MAX_PEER_RETENTION``
+
+    Floor = peak_volume * median(top-N peer retentions). If ``last_actual`` is
+    provided (backfill path), floor is capped at ``_FLOOR_LIVE_CAP * last_actual``
+    so the forecast cannot sit above the live trajectory / skip boundary align.
+    """
+    peak = float(peak_volume)
+    if not np.isfinite(peak) or peak <= 0:
+        return 0.0
+
+    floor = 0.0
+    history_df = getattr(
+        artifacts, "artist_release_history", getattr(artifacts, "release_history", None)
+    )
+    artist_key = str(artist or "").strip()
+
+    def _retention_floor_from_hist(hist: pd.DataFrame) -> Optional[float]:
+        if hist is None or hist.empty:
+            return None
+        if "tail_volume_obs" not in hist.columns or "peak_volume_obs" not in hist.columns:
+            return None
+        h = hist.dropna(subset=["tail_volume_obs", "peak_volume_obs"]).copy()
+        h["peak_volume_obs"] = pd.to_numeric(h["peak_volume_obs"], errors="coerce")
+        h["tail_volume_obs"] = pd.to_numeric(h["tail_volume_obs"], errors="coerce")
+        h = h.dropna(subset=["peak_volume_obs", "tail_volume_obs"])
+        h = h[h["peak_volume_obs"] > 0].copy()
+        if h.empty:
+            return None
+
+        band = float(_FLOOR_PEAK_SCALE_BAND)
+        lo, hi = peak / band, peak * band
+        h = h[(h["peak_volume_obs"] >= lo) & (h["peak_volume_obs"] <= hi)].copy()
+        if h.empty:
+            return None
+
+        # Mature-week filter: require an early peak so "tail" is less likely to be
+        # mid-life. If that empties the set, fall back to scale-band-only peers.
+        if "peak_week_obs" in h.columns:
+            pw = pd.to_numeric(h["peak_week_obs"], errors="coerce")
+            mature = h[pw.notna() & (pw <= float(_FLOOR_MATURE_MAX_PEAK_WEEK))].copy()
+            if not mature.empty:
+                h = mature
+
+        h["retention_ratio"] = h["tail_volume_obs"] / h["peak_volume_obs"].replace(0, 1e-9)
+        h = h[
+            np.isfinite(h["retention_ratio"])
+            & (h["retention_ratio"] > 0)
+            & (h["retention_ratio"] <= float(_FLOOR_MAX_PEER_RETENTION))
+        ].copy()
+        if h.empty:
+            return None
+
+        h["peak_diff"] = (h["peak_volume_obs"] - peak).abs()
+        top = h.sort_values("peak_diff").head(int(_FLOOR_TOP_N))
+        median_ratio = float(top["retention_ratio"].median())
+        if not np.isfinite(median_ratio) or median_ratio <= 0:
+            return None
+        return float(peak * median_ratio)
+
+    if history_df is not None and artist_key:
+        # Case-insensitive artist match (DISPLAY_ARTIST casing is inconsistent).
+        disp = history_df["DISPLAY_ARTIST"].astype(str)
+        hist = history_df[disp.str.casefold() == artist_key.casefold()].copy()
+        got = _retention_floor_from_hist(hist)
+        if got is not None:
+            floor = got
+        else:
+            stats = getattr(artifacts, "artist_stats", None)
+            if (
+                stats is not None
+                and "median_tail_volume" in stats.columns
+                and "median_peak_volume" in stats.columns
+            ):
+                sdisp = stats["DISPLAY_ARTIST"].astype(str)
+                stats_row = stats[sdisp.str.casefold() == artist_key.casefold()]
+                if not stats_row.empty and pd.notna(stats_row["median_tail_volume"].iloc[0]):
+                    median_tail = float(stats_row["median_tail_volume"].iloc[0])
+                    median_peak = float(stats_row["median_peak_volume"].iloc[0])
+                    band = float(_FLOOR_PEAK_SCALE_BAND)
+                    if (
+                        np.isfinite(median_peak)
+                        and median_peak > 0
+                        and (peak / band) <= median_peak <= (peak * band)
+                    ):
+                        median_ratio = median_tail / max(median_peak, 1e-9)
+                        if (
+                            np.isfinite(median_ratio)
+                            and 0 < median_ratio <= float(_FLOOR_MAX_PEER_RETENTION)
+                        ):
+                            floor = float(peak * median_ratio)
+
+    if last_actual is not None:
+        y_k = float(last_actual)
+        if np.isfinite(y_k) and y_k > 0:
+            floor = min(floor, float(_FLOOR_LIVE_CAP) * y_k)
+
+    if not np.isfinite(floor) or floor < 0:
+        return 0.0
+    return float(floor)
+
+
 # Cluster ids used to derive a scenario-wide scalar when the caller has no
 # specific cluster pinned. Matches the keys of ARCHETYPE_SCENARIO_MULTIPLIERS.
 _SCENARIO_FALLBACK_CLUSTERS: Tuple[int, ...] = (0, 1, 2, 3)
@@ -943,35 +1066,18 @@ def simulate_future_drop(
     # ==========================================
     # --- UNIFIED ASYMPTOTIC FLOOR LOGIC ---
     # ==========================================
-    final_floor = 0.0
-    
-    # 1. Check for manual override first!
+    # Manual override, else scale-banded / mature-filtered peer retention.
     if stream_floor is not None:
         final_floor = float(stream_floor)
-    # 2. If blank, calculate dynamic Top-3
     else:
-        history_df = getattr(artifacts, "artist_release_history", getattr(artifacts, "release_history", None))
-        if history_df is not None:
-            hist_floor = history_df[history_df["DISPLAY_ARTIST"] == artist].copy()
-            if not hist_floor.empty and "tail_volume_obs" in hist_floor.columns and "peak_volume_obs" in hist_floor.columns:
-                hist_floor = hist_floor.dropna(subset=["tail_volume_obs", "peak_volume_obs"])
-                
-            if not hist_floor.empty:
-                hist_floor["peak_diff"] = (hist_floor["peak_volume_obs"] - peak_volume).abs()
-                top3 = hist_floor.sort_values("peak_diff").head(3).copy()
-                top3["retention_ratio"] = top3["tail_volume_obs"] / top3["peak_volume_obs"].replace(0, 1e-9)
-                median_ratio = float(top3["retention_ratio"].median())
-                final_floor = float(peak_volume * median_ratio)
-                
-            elif "median_tail_volume" in artifacts.artist_stats.columns and "median_peak_volume" in artifacts.artist_stats.columns:
-                stats_row = artifacts.artist_stats[artifacts.artist_stats["DISPLAY_ARTIST"] == artist]
-                if not stats_row.empty and pd.notna(stats_row["median_tail_volume"].iloc[0]):
-                    median_tail = float(stats_row["median_tail_volume"].iloc[0])
-                    median_peak = float(stats_row["median_peak_volume"].iloc[0])
-                    median_ratio = median_tail / max(median_peak, 1e-9)
-                    final_floor = float(peak_volume * median_ratio)
+        final_floor = estimate_dynamic_stream_floor(
+            artist=str(artist),
+            peak_volume=float(peak_volume),
+            artifacts=artifacts,
+            last_actual=None,
+        )
 
-    # 3. Apply final math
+    # Apply final math
     if peak_volume > final_floor:
         amplitude = float(peak_volume - final_floor)
     else:
@@ -1628,33 +1734,20 @@ def fit_backfill_forecast(
     y_norm_full = G_full @ best_p
     fitted_peak = float(best["peak_volume"])
     
-    if stream_floor is None:
-        dynamic_floor = 0.0
-    
     if stream_floor is not None:
         dynamic_floor = float(stream_floor)
+        # Still respect live cap so a hard-coded floor cannot force an upward jump.
+        if k >= 1:
+            y_k_cap = float(y_obs[-1])
+            if np.isfinite(y_k_cap) and y_k_cap > 0:
+                dynamic_floor = min(dynamic_floor, float(_FLOOR_LIVE_CAP) * y_k_cap)
     else:
-        history_df = getattr(artifacts, "artist_release_history", getattr(artifacts, "release_history", None))
-        
-        if history_df is not None:
-            hist = history_df[history_df["DISPLAY_ARTIST"] == artist_canon].copy()
-            if not hist.empty and "tail_volume_obs" in hist.columns and "peak_volume_obs" in hist.columns:
-                hist = hist.dropna(subset=["tail_volume_obs", "peak_volume_obs"])
-                
-            if not hist.empty:
-                hist["peak_diff"] = (hist["peak_volume_obs"] - fitted_peak).abs()
-                top3 = hist.sort_values("peak_diff").head(3).copy()
-                top3["retention_ratio"] = top3["tail_volume_obs"] / top3["peak_volume_obs"].replace(0, 1e-9)
-                median_ratio = float(top3["retention_ratio"].median())
-                dynamic_floor = float(fitted_peak * median_ratio)
-                
-            elif "median_tail_volume" in artifacts.artist_stats.columns and "median_peak_volume" in artifacts.artist_stats.columns:
-                stats_row = artifacts.artist_stats[artifacts.artist_stats["DISPLAY_ARTIST"] == artist_canon]
-                if not stats_row.empty and pd.notna(stats_row["median_tail_volume"].iloc[0]):
-                    median_tail = float(stats_row["median_tail_volume"].iloc[0])
-                    median_peak = float(stats_row["median_peak_volume"].iloc[0])
-                    median_ratio = median_tail / max(median_peak, 1e-9)
-                    dynamic_floor = float(fitted_peak * median_ratio)
+        dynamic_floor = estimate_dynamic_stream_floor(
+            artist=str(artist_canon),
+            peak_volume=float(fitted_peak),
+            artifacts=artifacts,
+            last_actual=float(y_obs[-1]) if k >= 1 else None,
+        )
 
     # --- APPLY ASYMPTOTIC FLOOR MATH ---
     if fitted_peak > dynamic_floor:
