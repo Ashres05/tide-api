@@ -66,13 +66,87 @@ def archetype_scenario_shape_ratio(cluster_id: int, scenario: Optional[str]) -> 
     return float(row.get(scen, base)) / base
 
 
-# Dynamic asymptotic floor (streams): scale-matched peers + mature-peak filter +
-# live-actuals cap. Shared by simulate_future_drop and fit_backfill_forecast.
-_FLOOR_PEAK_SCALE_BAND = 3.0  # keep peers with peak in [P/band, P*band]
-_FLOOR_MATURE_MAX_PEAK_WEEK = 26.0  # peak must occur by this week (proxy without last_week)
-_FLOOR_MAX_PEER_RETENTION = 0.50  # drop near-flat tails (incomplete / non-asymptotic)
+# Dynamic asymptotic floor (streams): artist peers → genre/global peak-bin priors
+# → live-actuals cap. Shared by simulate_future_drop and fit_backfill_forecast.
+_FLOOR_PEAK_SCALE_BAND = 3.0  # tight artist peers: peak in [P/band, P*band]
+_FLOOR_PEAK_SCALE_BAND_WIDE = 10.0  # wide artist peers before prior fallback
+_FLOOR_MATURE_MAX_PEAK_WEEK = 26.0  # prefer peers whose peak occurred by this week
 _FLOOR_LIVE_CAP = 0.95  # F <= 0.95 * last observed week when actuals exist
 _FLOOR_TOP_N = 3
+
+
+def _floor_bin_name(peak: float, priors: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not priors or not isinstance(priors.get("bins"), list):
+        return None
+    p = float(peak)
+    if not np.isfinite(p) or p <= 0:
+        return None
+    for b in priors["bins"]:
+        try:
+            name = str(b["name"])
+            lo = float(b.get("lo", 0.0))
+            hi_raw = b.get("hi", None)
+            hi = float("inf") if hi_raw is None else float(hi_raw)
+        except (TypeError, ValueError, KeyError):
+            continue
+        if p >= lo and p < hi:
+            return name
+    # Open-ended last bin
+    try:
+        last = priors["bins"][-1]
+        if p >= float(last.get("lo", 0.0)):
+            return str(last["name"])
+    except (IndexError, TypeError, ValueError, KeyError):
+        pass
+    return None
+
+
+def _floor_prior_cell(
+    priors: Optional[Dict[str, Any]],
+    *,
+    genre: Optional[str],
+    bin_name: Optional[str],
+) -> Optional[Dict[str, float]]:
+    if not priors or not bin_name:
+        return None
+    gkey = str(genre or "").strip()
+    if gkey and gkey.casefold() != "unknown":
+        genre_table = priors.get("genre") or {}
+        # case-insensitive genre match
+        for gk, bins in genre_table.items():
+            if str(gk).casefold() == gkey.casefold() and isinstance(bins, dict):
+                cell = bins.get(bin_name)
+                if isinstance(cell, dict) and cell.get("n", 0) >= int(
+                    priors.get("min_genre_n", 50)
+                ):
+                    return cell
+    glob = priors.get("global") or {}
+    cell = glob.get(bin_name)
+    return cell if isinstance(cell, dict) else None
+
+
+def _clip_retention_to_prior_band(
+    ret: float,
+    peer_peak: float,
+    priors: Optional[Dict[str, Any]],
+) -> Optional[float]:
+    """Clip peer retention to the peak-bin [p10, p90] when priors exist."""
+    if not np.isfinite(ret) or ret <= 0:
+        return None
+    cell = _floor_prior_cell(priors, genre=None, bin_name=_floor_bin_name(peer_peak, priors))
+    if cell is None:
+        # No prior table: keep a soft upper guard only.
+        return float(ret) if ret <= 0.80 else None
+    try:
+        lo = float(cell.get("p10", 0.0))
+        hi = float(cell.get("p90", 1.0))
+    except (TypeError, ValueError):
+        return float(ret)
+    if not np.isfinite(lo):
+        lo = 0.0
+    if not np.isfinite(hi) or hi < lo:
+        hi = lo
+    return float(np.clip(ret, lo, hi))
 
 
 def estimate_dynamic_stream_floor(
@@ -81,30 +155,36 @@ def estimate_dynamic_stream_floor(
     peak_volume: float,
     artifacts: "SimulatorArtifacts",
     last_actual: Optional[float] = None,
+    genre: Optional[str] = None,
 ) -> float:
     """
     Estimate a late-life weekly streaming floor for ``peak_volume``.
 
-    Peers are same-artist history rows with:
-      - peak within ``_FLOOR_PEAK_SCALE_BAND`` of ``peak_volume``
-      - ``peak_week_obs`` <= ``_FLOOR_MATURE_MAX_PEAK_WEEK`` (when present)
-      - retention = tail/peak <= ``_FLOOR_MAX_PEER_RETENTION``
+    Ladder:
+      1. Same-artist peers in tight peak band [P/3, 3P]
+      2. Same-artist peers in wide peak band [P/10, 10P]
+      3. Genre × peak-bin prior (floor_priors.json)
+      4. Global peak-bin prior
+      5. Soft zero if nothing available
 
-    Floor = peak_volume * median(top-N peer retentions). If ``last_actual`` is
-    provided (backfill path), floor is capped at ``_FLOOR_LIVE_CAP * last_actual``
-    so the forecast cannot sit above the live trajectory / skip boundary align.
+    Peer retentions are clipped to the peak-bin [p10, p90] from priors (not a
+    hard 0.5 kill). If ``last_actual`` is provided, floor is capped at
+    ``_FLOOR_LIVE_CAP * last_actual``.
     """
     peak = float(peak_volume)
     if not np.isfinite(peak) or peak <= 0:
         return 0.0
 
-    floor = 0.0
+    priors = getattr(artifacts, "floor_priors", None)
+    if not isinstance(priors, dict):
+        priors = None
+
     history_df = getattr(
         artifacts, "artist_release_history", getattr(artifacts, "release_history", None)
     )
     artist_key = str(artist or "").strip()
 
-    def _retention_floor_from_hist(hist: pd.DataFrame) -> Optional[float]:
+    def _retention_floor_from_hist(hist: pd.DataFrame, scale_band: float) -> Optional[float]:
         if hist is None or hist.empty:
             return None
         if "tail_volume_obs" not in hist.columns or "peak_volume_obs" not in hist.columns:
@@ -117,44 +197,49 @@ def estimate_dynamic_stream_floor(
         if h.empty:
             return None
 
-        band = float(_FLOOR_PEAK_SCALE_BAND)
-        lo, hi = peak / band, peak * band
+        lo, hi = peak / float(scale_band), peak * float(scale_band)
         h = h[(h["peak_volume_obs"] >= lo) & (h["peak_volume_obs"] <= hi)].copy()
         if h.empty:
             return None
 
-        # Mature-week filter: require an early peak so "tail" is less likely to be
-        # mid-life. If that empties the set, fall back to scale-band-only peers.
         if "peak_week_obs" in h.columns:
             pw = pd.to_numeric(h["peak_week_obs"], errors="coerce")
             mature = h[pw.notna() & (pw <= float(_FLOOR_MATURE_MAX_PEAK_WEEK))].copy()
             if not mature.empty:
                 h = mature
+            elif priors is not None:
+                # With peak-bin priors available, skip late-peak / catalog-reactivation
+                # peers and let the prior ladder set the floor (avoids week-70+
+                # near-peak "tails" dominating breakout albums).
+                return None
 
         h["retention_ratio"] = h["tail_volume_obs"] / h["peak_volume_obs"].replace(0, 1e-9)
-        h = h[
-            np.isfinite(h["retention_ratio"])
-            & (h["retention_ratio"] > 0)
-            & (h["retention_ratio"] <= float(_FLOOR_MAX_PEER_RETENTION))
-        ].copy()
+        h["ret_clipped"] = [
+            _clip_retention_to_prior_band(float(r), float(p), priors)
+            for r, p in zip(h["retention_ratio"], h["peak_volume_obs"])
+        ]
+        h = h[h["ret_clipped"].notna()].copy()
         if h.empty:
             return None
-
         h["peak_diff"] = (h["peak_volume_obs"] - peak).abs()
         top = h.sort_values("peak_diff").head(int(_FLOOR_TOP_N))
-        median_ratio = float(top["retention_ratio"].median())
+        median_ratio = float(pd.to_numeric(top["ret_clipped"], errors="coerce").median())
         if not np.isfinite(median_ratio) or median_ratio <= 0:
             return None
         return float(peak * median_ratio)
 
+    floor: Optional[float] = None
+
+    # Steps 1–2: same-artist peers (tight, then wide).
     if history_df is not None and artist_key:
-        # Case-insensitive artist match (DISPLAY_ARTIST casing is inconsistent).
         disp = history_df["DISPLAY_ARTIST"].astype(str)
         hist = history_df[disp.str.casefold() == artist_key.casefold()].copy()
-        got = _retention_floor_from_hist(hist)
-        if got is not None:
-            floor = got
-        else:
+        floor = _retention_floor_from_hist(hist, _FLOOR_PEAK_SCALE_BAND)
+        if floor is None:
+            floor = _retention_floor_from_hist(hist, _FLOOR_PEAK_SCALE_BAND_WIDE)
+
+        # Legacy artist_stats fallback only when still empty and scale-matched.
+        if floor is None:
             stats = getattr(artifacts, "artist_stats", None)
             if (
                 stats is not None
@@ -166,23 +251,40 @@ def estimate_dynamic_stream_floor(
                 if not stats_row.empty and pd.notna(stats_row["median_tail_volume"].iloc[0]):
                     median_tail = float(stats_row["median_tail_volume"].iloc[0])
                     median_peak = float(stats_row["median_peak_volume"].iloc[0])
-                    band = float(_FLOOR_PEAK_SCALE_BAND)
+                    band = float(_FLOOR_PEAK_SCALE_BAND_WIDE)
                     if (
                         np.isfinite(median_peak)
                         and median_peak > 0
                         and (peak / band) <= median_peak <= (peak * band)
                     ):
                         median_ratio = median_tail / max(median_peak, 1e-9)
-                        if (
-                            np.isfinite(median_ratio)
-                            and 0 < median_ratio <= float(_FLOOR_MAX_PEER_RETENTION)
-                        ):
-                            floor = float(peak * median_ratio)
+                        clipped = _clip_retention_to_prior_band(
+                            median_ratio, median_peak, priors
+                        )
+                        if clipped is not None:
+                            floor = float(peak * clipped)
+
+    # Steps 3–4: genre × peak-bin prior, then global peak-bin prior.
+    if floor is None and priors is not None:
+        bin_name = _floor_bin_name(peak, priors)
+        cell = _floor_prior_cell(priors, genre=genre, bin_name=bin_name)
+        if cell is None:
+            cell = _floor_prior_cell(priors, genre=None, bin_name=bin_name)
+        if cell is not None:
+            try:
+                r = float(cell.get("median", 0.0))
+            except (TypeError, ValueError):
+                r = 0.0
+            if np.isfinite(r) and r > 0:
+                floor = float(peak * r)
+
+    if floor is None:
+        floor = 0.0
 
     if last_actual is not None:
         y_k = float(last_actual)
         if np.isfinite(y_k) and y_k > 0:
-            floor = min(floor, float(_FLOOR_LIVE_CAP) * y_k)
+            floor = min(float(floor), float(_FLOOR_LIVE_CAP) * y_k)
 
     if not np.isfinite(floor) or floor < 0:
         return 0.0
@@ -863,6 +965,9 @@ class SimulatorArtifacts:
     # When None (older artifacts), callers fall back to the hardcoded global
     # ARCHETYPE_SCENARIO_MULTIPLIERS table.
     scenario_multipliers: Optional[Dict[str, Dict[str, float]]] = None
+    # Peak-bin / genre retention priors for dynamic stream floors
+    # (floor_priors.json from scripts/build_floor_priors.py).
+    floor_priors: Optional[Dict[str, Any]] = None
 
 
 def resolve_peak_match_column(peak_match_on: str, hist: pd.DataFrame) -> str:
@@ -1075,6 +1180,7 @@ def simulate_future_drop(
             peak_volume=float(peak_volume),
             artifacts=artifacts,
             last_actual=None,
+            genre=genre,
         )
 
     # Apply final math
@@ -1747,6 +1853,7 @@ def fit_backfill_forecast(
             peak_volume=float(fitted_peak),
             artifacts=artifacts,
             last_actual=float(y_obs[-1]) if k >= 1 else None,
+            genre=genre,
         )
 
     # --- APPLY ASYMPTOTIC FLOOR MATH ---
@@ -2234,6 +2341,17 @@ def load_artifacts(out_dir: str) -> SimulatorArtifacts:
         except (OSError, json.JSONDecodeError):
             scenario_multipliers = None
 
+    floor_priors_path = os.path.join(out_dir, "floor_priors.json")
+    floor_priors: Optional[Dict[str, Any]] = None
+    if os.path.exists(floor_priors_path):
+        try:
+            with open(floor_priors_path, "r", encoding="utf-8") as f:
+                raw_fp = json.load(f)
+            if isinstance(raw_fp, dict) and isinstance(raw_fp.get("global"), dict):
+                floor_priors = raw_fp
+        except (OSError, json.JSONDecodeError):
+            floor_priors = None
+
     return SimulatorArtifacts(
         horizon_weeks=horizon_weeks,
         archetype_params=archetype_params,
@@ -2242,6 +2360,7 @@ def load_artifacts(out_dir: str) -> SimulatorArtifacts:
         artist_genre_cluster_probs=artist_genre_cluster_probs,
         artist_release_history=artist_release_history,
         scenario_multipliers=scenario_multipliers,
+        floor_priors=floor_priors,
     )
 
 
