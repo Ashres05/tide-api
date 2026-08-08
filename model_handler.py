@@ -1976,12 +1976,14 @@ def _fill_missing_roster_artist_ids(*, batch_size: int = 500) -> dict:
 
 def backfill_streaming_roster() -> dict:
     """
-    Populate STREAMING_ROSTER_2026 from Snowflake (YTD streaming revenue board).
+    Populate STREAMING_ROSTER_2026 from Snowflake (streaming revenue board).
 
     Returns {"inserted": int, "upserted": int, "skipped": int, "errors": [...]}.
 
     Full scan (first run or TIDE_STREAMING_ROSTER_FULL=1):
-      release_date >= start of current calendar year.
+      release_date >= CURRENT_DATE - N weeks (default 78; override with
+      TIDE_STREAMING_ROSTER_FULL_WEEKS), still gated by the SQL US-week AE >= 10k
+      threshold. Clears STREAMING_ROSTER_2026 first so the table matches that window.
 
     Incremental (default when the table already has rows):
       release_date >= (max RELEASE_DATE in roster) minus TIDE_STREAMING_ROSTER_OVERLAP_DAYS
@@ -1998,6 +2000,10 @@ def backfill_streaming_roster() -> dict:
         "1", "true", "yes"
     )
     overlap_days = int(_os.environ.get("TIDE_STREAMING_ROSTER_OVERLAP_DAYS", "7"))
+    full_weeks = int(_os.environ.get("TIDE_STREAMING_ROSTER_FULL_WEEKS", "78"))
+    full_date_filter = (
+        f"AND mrelg.release_date >= DATEADD(week, -{full_weeks}, CURRENT_DATE())"
+    )
 
     if existing and not full_refresh:
         max_release_date = _max_streaming_roster_release_date()
@@ -2007,27 +2013,31 @@ def backfill_streaming_roster() -> dict:
             )
             logger.info(
                 "backfill_streaming_roster: incremental — release_date >= %s minus %d+1 day overlap "
-                "(TIDE_STREAMING_ROSTER_FULL=1 for full YTD scan)",
+                "(TIDE_STREAMING_ROSTER_FULL=1 for %d-week full scan)",
                 max_release_date,
                 overlap_days,
+                full_weeks,
             )
         else:
-            date_filter = (
-                "AND mrelg.release_date >= DATE_TRUNC('year', CURRENT_DATE())"
-            )
+            date_filter = full_date_filter
             logger.info(
-                "backfill_streaming_roster: no RELEASE_DATE in roster, falling back to YTD scan"
+                "backfill_streaming_roster: no RELEASE_DATE in roster, falling back to "
+                "%d-week full window",
+                full_weeks,
             )
     else:
-        date_filter = (
-            "AND mrelg.release_date >= DATE_TRUNC('year', CURRENT_DATE())"
-        )
+        date_filter = full_date_filter
         reason = (
             "TIDE_STREAMING_ROSTER_FULL=1"
             if full_refresh
             else "STREAMING_ROSTER_2026 is empty"
         )
-        logger.info("backfill_streaming_roster: full YTD Snowflake scan (%s)", reason)
+        logger.info(
+            "backfill_streaming_roster: full Snowflake scan (%s) — "
+            "release_date >= CURRENT_DATE - %d weeks, AE>=10k",
+            reason,
+            full_weeks,
+        )
 
     query = load_sql(STREAMING_ROSTER_YTD_QUERY).replace(
         "{RELEASE_DATE_FILTER}", date_filter
@@ -2042,7 +2052,9 @@ def backfill_streaming_roster() -> dict:
         return {"inserted": 0, "upserted": 0, "skipped": 0, "errors": []}
 
     rows = _streaming_roster_rows_from_df(df)
-    new_rows = [r for r in rows if r[0] not in existing]
+    # After a full clear, every upserted row is new; otherwise count net-new mrelg_ids.
+    existing_for_count = set() if full_refresh or not existing else existing
+    new_rows = [r for r in rows if r[0] not in existing_for_count]
     skipped = len(rows) - len(new_rows)
 
     insert_sql = load_sql(INSERT_STREAMING_ROSTER_2026)
@@ -2054,6 +2066,11 @@ def backfill_streaming_roster() -> dict:
         with sqlite3.connect(DATABASE_NAME) as conn:
             ensure_streaming_roster_2026_table(conn)
             cur = conn.cursor()
+            if full_refresh or not existing:
+                cur.execute("DELETE FROM STREAMING_ROSTER_2026")
+                logger.info(
+                    "backfill_streaming_roster: cleared STREAMING_ROSTER_2026 before full rebuild"
+                )
             for i in range(0, len(rows), batch_size):
                 chunk = rows[i : i + batch_size]
                 try:
@@ -2079,6 +2096,17 @@ def backfill_streaming_roster() -> dict:
 
     if (upserted > 0 or artist_id_fill.get("updated", 0) > 0) and not errors:
         sync_db_to_s3()
+        try:
+            snap = export_streaming_roster_json_snapshot()
+            logger.info(
+                "backfill_streaming_roster: frontend snapshot %s (%s releases)",
+                snap.get("s3_uri"),
+                snap.get("count"),
+            )
+        except Exception:
+            logger.exception(
+                "backfill_streaming_roster: failed to export streaming_roster.json"
+            )
 
     return {
         "inserted": inserted,
@@ -2106,6 +2134,47 @@ def get_streaming_roster_2026() -> List[dict]:
 
 def get_streaming_roster_2026_json() -> str:
     return json.dumps(get_streaming_roster_2026(), default=str)
+
+
+# Canonical static snapshot for the frontend (Monday cron + ad-hoc rebuilds).
+STREAMING_ROSTER_JSON_REL = Path("model/data/streaming_roster.json")
+STREAMING_ROSTER_S3_KEY = "streaming_roster.json"
+
+
+def export_streaming_roster_json_snapshot() -> dict:
+    """
+    Write STREAMING_ROSTER_2026 to local ``model/data/streaming_roster.json`` and
+    upload to ``s3://…/streaming_roster.json`` for the frontend weekly cache.
+    """
+    from datetime import datetime, timezone
+
+    from api.s3_pull import upload_streaming_roster_json
+
+    rows = get_streaming_roster_2026()
+    payload = {
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "source": "STREAMING_ROSTER_2026",
+        "count": len(rows),
+        "releases": rows,
+    }
+    body = json.dumps(payload, default=str, separators=(",", ":"))
+    local_path = Path(__file__).resolve().parent / STREAMING_ROSTER_JSON_REL
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    local_path.write_text(body, encoding="utf-8")
+    logger.info(
+        "export_streaming_roster_json_snapshot: wrote %s (%d releases, %d bytes)",
+        local_path,
+        len(rows),
+        local_path.stat().st_size,
+    )
+    s3_uri = upload_streaming_roster_json(body)
+    return {
+        "local_path": str(local_path),
+        "s3_uri": s3_uri,
+        "count": len(rows),
+        "generated_at": payload["generated_at"],
+        "bytes": local_path.stat().st_size,
+    }
 
 
 def get_ytd_fiscal_revenue_by_label(
@@ -3369,6 +3438,25 @@ def refresh_weekly(force_refresh_parquets: bool = False) -> dict:
 
     set_step("reload_artifacts")
     reload_artifacts()
+
+    # Frontend weekly cache: snapshot STREAMING_ROSTER_2026 → S3 streaming_roster.json
+    set_step("export_streaming_roster_json")
+    t0 = _now()
+    try:
+        roster_snap = export_streaming_roster_json_snapshot()
+        summary["stages"]["streaming_roster_json"] = {
+            "ok": True,
+            "elapsed_sec": _elapsed(t0),
+            **roster_snap,
+        }
+    except Exception as e:
+        logger.exception("refresh_weekly: export_streaming_roster_json_snapshot failed")
+        summary["stages"]["streaming_roster_json"] = {
+            "ok": False,
+            "error": str(e),
+            "elapsed_sec": _elapsed(t0),
+        }
+
     # Push only what weekly mutates: db + csvs + artifacts_75k.
     set_step("sync_to_s3")
     sync_weekly_outputs_to_s3()

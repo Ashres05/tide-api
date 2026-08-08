@@ -374,12 +374,15 @@ def refresh_marketshare_search_summary_singles() -> int:
 def recompute_ytd_share_from_current_data(data_path: Path) -> pd.DataFrame:
     """
     Match current_data_test.py logic exactly:
-      1) Read Current_Data.csv
+      1) Read current_data_all.csv (7-label panel)
       2) Use ALBUM_EQUIVALENT / ALBUM_EQUIVALENT_SHARE to estimate weekly total market
       3) Compute YTD by label as cumulative(label weekly volume) / cumulative(total market)
     Returns percent-point shares (e.g. 8.85).
     """
+    from model.marketshare_labels import TARGET_LABELS
+
     current = pd.read_csv(data_path)
+    current.columns = [str(c).strip().lstrip("\ufeff") for c in current.columns]
     year_col = next((c for c in ("YEAR", "Year", "year") if c in current.columns), None)
     if year_col is None:
         return pd.DataFrame(columns=["YEAR", "WEEK_ENDING_DATE", "LABEL_NAME", "ALBUM_EQUIVALENT_SHARE"])
@@ -393,7 +396,7 @@ def recompute_ytd_share_from_current_data(data_path: Path) -> pd.DataFrame:
         current["ALBUM_EQUIVALENT_SHARE"] = current["ALBUM_EQUIVALENT_SHARE"] / 100.0
 
     current = current[
-        current["LABEL_NAME"].isin(["Atlantic Music Group", "Interscope/Geffen/A&M"])
+        current["LABEL_NAME"].isin(TARGET_LABELS)
         & current["YEAR"].notna()
         & current["ALBUM_EQUIVALENT"].notna()
         & current["ALBUM_EQUIVALENT_SHARE"].notna()
@@ -479,6 +482,12 @@ def update_sqlite_main() -> None:
     def _snowflake_string_literal(value: str) -> str:
         return "'" + str(value).replace("'", "''") + "'"
 
+    from model.marketshare_labels import TARGET_LABELS
+
+    target_labels_sql = ", ".join(
+        "'" + lab.replace("'", "''") + "'" for lab in TARGET_LABELS
+    )
+
     release_ids = (
         expected_releases_df['MRELG_ID']
         .dropna()
@@ -488,13 +497,20 @@ def update_sqlite_main() -> None:
         .tolist()
     )
     # Get data from Snowflake
-    logger.info("sqlite_handler: querying Snowflake weekly/ytd marketshare tables")
+    logger.info(
+        "sqlite_handler: querying Snowflake weekly/ytd marketshare tables for %d labels",
+        len(TARGET_LABELS),
+    )
     with get_snowflake_connection() as sf:
         weekly_marketshare_data = sf.query(
-            load_sql(WEEKLY_MARKETSHARE_QUERY).replace("{MIN_WEEK_END_DATE}", min_week_marketshare)
+            load_sql(WEEKLY_MARKETSHARE_QUERY)
+            .replace("{MIN_WEEK_END_DATE}", min_week_marketshare)
+            .replace("{TARGET_LABELS}", target_labels_sql)
         )
         ytd_marketshare_data = sf.query(
-            load_sql(YTD_MARKETSHARE_QUERY).replace("{MIN_WEEK_END_DATE}", min_week_marketshare)
+            load_sql(YTD_MARKETSHARE_QUERY)
+            .replace("{MIN_WEEK_END_DATE}", min_week_marketshare)
+            .replace("{TARGET_LABELS}", target_labels_sql)
         )
         logger.info(
             "sqlite_handler: Snowflake rows weekly=%d ytd=%d",
@@ -567,7 +583,9 @@ def update_sqlite_main() -> None:
     if "WEEK_ENDING_DATE" in ytd_marketshare_data.columns:
         ytd_marketshare_data["WEEK_ENDING_DATE"] = ytd_marketshare_data["WEEK_ENDING_DATE"].astype(str)
     try:
-        current_path = Path(__file__).resolve().parent / "model" / "data" / "Current_Data.csv"
+        current_path = (
+            Path(__file__).resolve().parent / "model" / "data" / "current_data_all.csv"
+        )
         ytd_recalc = recompute_ytd_share_from_current_data(current_path)
         if not ytd_recalc.empty:
             ytd_marketshare_data = ytd_marketshare_data.merge(
@@ -584,7 +602,7 @@ def update_sqlite_main() -> None:
             )
             ytd_marketshare_data = ytd_marketshare_data.drop(columns=["ALBUM_EQUIVALENT_SHARE_RECALC"])
     except Exception:
-        # If Current_Data.csv is unavailable, keep Snowflake-provided YTD share.
+        # If current_data_all.csv is unavailable, keep Snowflake-provided YTD share.
         pass
 
     # Update tables

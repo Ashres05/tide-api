@@ -1,5 +1,8 @@
--- YTD streaming revenue roster (Album, Single, EP) with US week AE >= 10k.
+-- Streaming revenue roster (Album, Single, EP) with US week AE >= 10k.
 -- Used by backfill_streaming_roster() -> STREAMING_ROSTER_2026.
+-- {RELEASE_DATE_FILTER} is injected by Python:
+--   full (TIDE_STREAMING_ROSTER_FULL=1): release_date >= CURRENT_DATE - 78 weeks
+--   incremental: release_date >= max(roster) - overlap days
 -- Per-MRELG weekly worldwide streams use query_release_global_streaming.sql instead.
 --
 -- LUMINATE_ARTIST_ID is the first Main Artist from VW_MUSICAL_RELEASE_GROUP_DS.ARTISTS

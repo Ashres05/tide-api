@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # WEEKLY (Mon 14:00 UTC): hit /v1/data/refresh_weekly and poll until done.
 # Endpoint pulls weekly inputs from S3, runs CSV-only refresh+train, runs
-# release backfill, and pushes outputs back to S3. Heavy parquets are skipped
-# by default — call /v1/data/refresh_model when those need rebuilding.
+# release backfill, exports streaming_roster.json for the frontend, and pushes
+# outputs back to S3. Heavy parquets are skipped by default — call
+# /v1/data/refresh_model when those need rebuilding.
 # Quarterly-share CSVs (bi_sandbox) are best-effort: if Snowflake denies that
 # database, core CSVs, training, backfill, and S3 sync still complete.
 set -euo pipefail

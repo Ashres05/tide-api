@@ -8,7 +8,7 @@ Design pattern:
 
 Scopes:
   - "db"                   marketshare_data.db
-  - "csvs"                 model/data/*.csv (Current_Data, alist_75k, bigreleaseflag, ytd_fiscal_revenue_by_label, monthly_share_and_qtd, monthly_share_labels, labels_*_marketshare, amg_full_*_marketshare, releases_by_q_amg_labels). Excludes static 2025_revenue_catalog.csv and legacy quarterly_share_*.csv (manual S3 upload only).
+  - "csvs"                 model/data/*.csv (current_data_all, bigrelease_alist_75k_all, ytd_fiscal_revenue_by_label, monthly_share_and_qtd, monthly_share_labels, labels_*_marketshare, amg_full_*_marketshare, releases_by_q_amg_labels). Excludes static 2025_revenue_catalog.csv and legacy Current_Data/alist_75k/bigreleaseflag_75k/quarterly_share_*.csv (manual S3 upload only).
   - "parquets"             model/data/*.parquet (heavy; archetype/training inputs)
   - "artifacts_75k"        model/artifacts_75k/** (LGBM/Prophet/spike/df_full/sidecars)
   - "archetypes_artifacts" model/archetypes_artifacts/** (album decay + singles/ subdir; forecast serving)
@@ -60,6 +60,16 @@ _MODEL_DATA_REL = Path("model/data")
 _ARTIFACTS_75K_REL = Path("model/artifacts_75k")
 _ARCHETYPES_REL = Path("model/archetypes_artifacts")
 
+# 7-label training / actuals CSVs (weekly cron + serving). Kept here so the
+# sync scope docs stay explicit; pull/push still uses model/data/*.csv minus
+# _CSV_SYNC_EXCLUDE (these names are not excluded).
+_CSV_SYNC_CORE_7LABEL: frozenset[str] = frozenset(
+    {
+        "current_data_all.csv",
+        "bigrelease_alist_75k_all.csv",
+    }
+)
+
 # Static / legacy — never pull/push via automated csv scope (refresh_weekly, startup sync).
 _CSV_SYNC_EXCLUDE: frozenset[str] = frozenset(
     {
@@ -67,6 +77,12 @@ _CSV_SYNC_EXCLUDE: frozenset[str] = frozenset(
         # Replaced by monthly_share_and_qtd.csv / monthly_share_labels.csv
         "quarterly_share_and_qtd.csv",
         "quarterly_share_level3.csv",
+        # Replaced by current_data_all.csv / bigrelease_alist_75k_all.csv
+        "Current_Data.csv",
+        "current_data.csv",
+        "alist_75k.csv",
+        "bigreleaseflag_75k.csv",
+        "bigrelease_75k.csv",
     }
 )
 
@@ -443,3 +459,42 @@ def sync_parquets_from_s3() -> None:
 
 def sync_parquets_to_s3() -> None:
     sync_artifacts_to_s3_if_configured(scopes={SCOPE_PARQUETS})
+
+
+def upload_streaming_roster_json(body: str | bytes) -> Optional[str]:
+    """
+    Upload the frontend streaming-roster snapshot to
+    ``s3://{bucket}/streaming_roster.json`` with a 7-day edge-friendly Cache-Control.
+    Returns the ``s3://`` URI, or None if push is disabled / misconfigured.
+    """
+    if os.environ.get("TIDE_ARTIFACTS_S3_PUSH", "1").strip().lower() in (
+        "0", "false", "no", "off",
+    ):
+        logger.info("S3 streaming_roster.json push skipped (TIDE_ARTIFACTS_S3_PUSH=0).")
+        return None
+
+    resolved = _resolve_bucket_prefix("push")
+    if resolved is None:
+        return None
+    bucket, prefix = resolved
+
+    try:
+        import boto3
+    except ImportError:
+        logger.error("boto3 is required to upload streaming_roster.json")
+        return None
+
+    pfx = _norm_s3_prefix(prefix)
+    key = f"{pfx}streaming_roster.json".replace("//", "/")
+    data = body.encode("utf-8") if isinstance(body, str) else body
+    client = boto3.client("s3")
+    client.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=data,
+        ContentType="application/json; charset=utf-8",
+        CacheControl="public, max-age=604800, stale-while-revalidate=86400",
+    )
+    uri = f"s3://{bucket}/{key}"
+    logger.info("S3 push: streaming_roster.json -> %s (%d bytes)", uri, len(data))
+    return uri

@@ -25,9 +25,8 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).resolve().parent / "model" / "data"
 
-CURRENT_DATA_QUERY = "query_model_current_data.sql"
-A_LIST_75K_QUERY = "query_model_a_list_75k.sql"
-BIG_RELEASE_FLAG_75K_QUERY = "query_model_big_release_flag.sql"
+CURRENT_DATA_ALL_QUERY = "query_model_current_data_all.sql"
+BIGRELEASE_ALIST_75K_ALL_QUERY = "query_model_bigrelease_alist_75k_all.sql"
 YTD_FISCAL_REVENUE_BY_LABEL_QUERY = "query_ytd_fiscal_revenue_by_label.sql"
 RELEASES_BY_Q_AMG_LABELS_QUERY = "query_releases_by_q_amg_labels.sql"
 # monthly, not quarterly now but name left for ease
@@ -41,24 +40,24 @@ MODEL_PARQUET_METRICS_STREAMING_QUERY = "query_model_parquet_metrics_streaming.s
 
 # Phase 2 design notes
 # --------------------
-# The weekly CSV queries (Current_Data, alist_75k, bigreleaseflag_75k) accept
+# The weekly CSV queries (current_data_all, bigrelease_alist_75k_all) accept
 # a {MIN_WEEK_END_DATE} placeholder and emit only weeks >= that anchor (with an
 # upper guard so the in-progress week is never persisted). The Python layer
 # appends the result onto the existing CSV and de-dupes on a row-level primary
 # key so re-runs within the overlap window are idempotent.
 #
-# Each CSV now computes its own anchor from its own max week column. This avoids
-# a stale/corrupt alist_75k.csv pinning the other files to an old lower bound.
+# Each CSV computes its own anchor from its own max week column. This avoids
+# a stale/corrupt file pinning the other to an old lower bound.
 #
-# Cold start (no alist_75k.csv yet): anchor defaults to '2018-01-01', which
-# reproduces the original behavior of the un-parameterized queries.
+# Cold start (CSV missing): anchor defaults to '2018-01-01', which reproduces
+# the original full-history behavior.
 #
 # Parquet queries (query_model_parquet_metrics*.sql) are intentionally NOT
 # incremental in this phase: they back the archetype KMeans models, which we
 # retrain infrequently, and are invoked via /refresh_model rather than the
 # weekly cron.
 
-# Cold-start anchor when alist_75k.csv does not yet exist.
+# Cold-start anchor when a weekly model CSV does not yet exist.
 _COLD_START_MIN_WEEK = "2018-01-01"
 
 # Quarterly-share CSVs read bi_sandbox. When that database is unavailable the
@@ -72,7 +71,7 @@ _BI_SANDBOX_CSV_STAGES = (
 
 def refresh_data(*, csv_only: bool = False) -> dict[str, Any]:
     """
-    Incrementally refresh the three weekly CSVs from Snowflake, then train artifacts.
+    Incrementally refresh weekly model CSVs from Snowflake, then train artifacts.
 
     ``csv_only=False`` (default): full train including AE parquet KMeans/DNA and
     archetype decay (heavy; use from ``/v1/data/refresh_data`` or ad-hoc runs).
@@ -118,38 +117,42 @@ def _refresh_data_directory() -> tuple[list[dict[str, Any]], list[dict[str, str]
     Incrementally refresh weekly CSVs from Snowflake. Sequential because
     snowflake.connector cursors serialize work on a single socket.
 
-    Core model CSVs (Current_Data, alist_75k, bigreleaseflag_75k) and
+    Core model CSVs (current_data_all, bigrelease_alist_75k_all) and
     releases_by_q_amg_labels are required — failures abort refresh_data.
-    Quarterly-share CSVs depend on bi_sandbox and are best-effort.
+    Monthly-share CSVs depend on bi_sandbox and are best-effort.
     """
     optional_errors: list[dict[str, str]] = []
     csv_stages: list[dict[str, Any]] = []
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     current_min_week = _get_min_week_end_date(
-        DATA_DIR / "Current_Data.csv",
+        DATA_DIR / "current_data_all.csv",
         week_col="WEEK_ENDING_DATE",
     )
-    alist_min_week = _get_min_week_end_date(
-        DATA_DIR / "alist_75k.csv",
-        week_col="WEEK_END_DATE",
-    )
-    big_release_min_week = _get_min_week_end_date(
-        DATA_DIR / "bigreleaseflag_75k.csv",
+    bigrelease_alist_min_week = _get_min_week_end_date(
+        DATA_DIR / "bigrelease_alist_75k_all.csv",
         week_col="WEEK_END_DATE",
     )
     logger.info(
         "train_model.py: Refreshing CSV directory "
-        "(Current_Data min=%s, alist_75k min=%s, bigreleaseflag_75k min=%s)",
+        "(current_data_all min=%s, bigrelease_alist_75k_all min=%s)",
         current_min_week,
-        alist_min_week,
-        big_release_min_week,
+        bigrelease_alist_min_week,
     )
 
     with get_snowflake_connection() as sf:
         for name, updater, min_week, week_col in (
-            ("Current_Data.csv", _update_current_data, current_min_week, "WEEK_ENDING_DATE"),
-            ("alist_75k.csv", _update_a_list_75k, alist_min_week, "WEEK_END_DATE"),
-            ("bigreleaseflag_75k.csv", _update_big_release_flag_75k, big_release_min_week, "WEEK_END_DATE"),
+            (
+                "current_data_all.csv",
+                _update_current_data_all,
+                current_min_week,
+                "WEEK_ENDING_DATE",
+            ),
+            (
+                "bigrelease_alist_75k_all.csv",
+                _update_bigrelease_alist_75k_all,
+                bigrelease_alist_min_week,
+                "WEEK_END_DATE",
+            ),
         ):
             csv_stages.append(
                 _run_stage(
@@ -257,7 +260,11 @@ def _get_min_week_end_date(path: Path, *, week_col: str) -> str:
         logger.info("%s not found; cold start from %s", path.name, _COLD_START_MIN_WEEK)
         return _COLD_START_MIN_WEEK
     try:
-        df = pd.read_csv(path, usecols=[week_col])
+        df = pd.read_csv(path)
+        df.columns = [str(c).strip().lstrip("\ufeff") for c in df.columns]
+        if week_col not in df.columns:
+            raise KeyError(week_col)
+        df = df[[week_col]]
     except (ValueError, KeyError) as e:
         logger.warning("%s missing %s column (%s); cold start", path.name, week_col, e)
         return _COLD_START_MIN_WEEK
@@ -338,12 +345,14 @@ def _append_and_write_csv(
 
     if path.exists():
         existing = pd.read_csv(path)
+        existing.columns = [str(c).strip().lstrip("\ufeff") for c in existing.columns]
         before = len(existing)
         merged = pd.concat([existing, new_df], ignore_index=True)
     else:
         before = 0
         merged = new_df.copy()
 
+    merged.columns = [str(c).strip().lstrip("\ufeff") for c in merged.columns]
     merged = merged.drop_duplicates(subset=dedupe_subset, keep="last")
     if sort_by:
         merged = merged.sort_values(sort_by).reset_index(drop=True)
@@ -351,35 +360,26 @@ def _append_and_write_csv(
     return len(merged) - before
 
 
-def _update_current_data(sf: Snowflake, min_week: str) -> int:
+def _update_current_data_all(sf: Snowflake, min_week: str) -> int:
     """
-    Current_Data rows are one-per-(week, label). De-dupe on that composite.
+    current_data_all rows are one-per-(week, label). De-dupe on that composite.
     """
-    df = _run_incremental_query(sf, CURRENT_DATA_QUERY, min_week)
+    df = _run_incremental_query(sf, CURRENT_DATA_ALL_QUERY, min_week)
+    df.columns = [str(c).strip().lstrip("\ufeff").upper() for c in df.columns]
     return _append_and_write_csv(
-        DATA_DIR / "Current_Data.csv",
+        DATA_DIR / "current_data_all.csv",
         df,
         dedupe_subset=["WEEK_ENDING_DATE", "LABEL_NAME"],
-        sort_by=["WEEK_ENDING_DATE"],
+        sort_by=["WEEK_ENDING_DATE", "LABEL_NAME"],
     )
 
 
-def _update_a_list_75k(sf: Snowflake, min_week: str) -> int:
-    """alist_75k rows are one-per-week. De-dupe on WEEK_END_DATE alone."""
-    df = _run_incremental_query(sf, A_LIST_75K_QUERY, min_week)
+def _update_bigrelease_alist_75k_all(sf: Snowflake, min_week: str) -> int:
+    """Combined A-list scrub + big-release flags; one row per WEEK_END_DATE."""
+    df = _run_incremental_query(sf, BIGRELEASE_ALIST_75K_ALL_QUERY, min_week)
+    df.columns = [str(c).strip().lstrip("\ufeff").upper() for c in df.columns]
     return _append_and_write_csv(
-        DATA_DIR / "alist_75k.csv",
-        df,
-        dedupe_subset=["WEEK_END_DATE"],
-        sort_by=["WEEK_END_DATE"],
-    )
-
-
-def _update_big_release_flag_75k(sf: Snowflake, min_week: str) -> int:
-    """bigreleaseflag rows are one-per-week. De-dupe on WEEK_END_DATE alone."""
-    df = _run_incremental_query(sf, BIG_RELEASE_FLAG_75K_QUERY, min_week)
-    return _append_and_write_csv(
-        DATA_DIR / "bigreleaseflag_75k.csv",
+        DATA_DIR / "bigrelease_alist_75k_all.csv",
         df,
         dedupe_subset=["WEEK_END_DATE"],
         sort_by=["WEEK_END_DATE"],

@@ -1,3 +1,4 @@
+-- {TARGET_LABELS} is injected from model.marketshare_labels.TARGET_LABELS.
 SELECT
     WEEK_ENDING_DATE,
     LABEL_NAME,
@@ -5,7 +6,7 @@ SELECT
     ALBUM_EQUIVALENT_SHARE
 FROM MARKETSHARE_WEEKLY
 WHERE
-    LABEL_NAME IN ('Atlantic Music Group', 'Interscope/Geffen/A&M')
+    LABEL_NAME IN ({TARGET_LABELS})
     AND COUNTRY_CODE = 'US'
     AND RELEASE_AGE = 'Current'
 ORDER BY date(WEEK_ENDING_DATE) ASC;
