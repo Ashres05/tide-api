@@ -2,7 +2,7 @@
 """
 Weekly/monthly training job for 75k marketshare artifacts.
 
-Inputs (7 labels; see ``marketshare_labels.py``):
+Inputs (8 labels; see ``marketshare_labels.py``):
   model/data/current_data_all.csv
   model/data/bigrelease_alist_75k_all.csv
 

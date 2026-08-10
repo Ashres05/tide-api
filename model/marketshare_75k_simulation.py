@@ -153,14 +153,15 @@ DISTRIBUTIONS = {
         "Rock": [90.0, 10.0, 0.0, 0.0],
     },
     "Label": {
-        # AMG-like prior (default for most of the 7-label set until recomputed)
+        # AMG-like prior (default for most of the 8-label set until recomputed)
         "Atlantic Music Group": [35.07, 8.21, 18.66, 38.06],
         "Warner Records": [35.07, 8.21, 18.66, 38.06],
         "THE ORCHARD": [35.07, 8.21, 18.66, 38.06],
         "RCA Records": [35.07, 8.21, 18.66, 38.06],
         "Columbia Records": [35.07, 8.21, 18.66, 38.06],
-        # Former Interscope/Geffen/A&M prior — renamed + copied to Republic
-        "Interscope-Capitol": [9.86, 14.08, 50.70, 25.35],
+        # Former Interscope/Geffen/A&M prior — IGA/CMG (level_3) + Republic
+        "IGA": [9.86, 14.08, 50.70, 25.35],
+        "CMG": [9.86, 14.08, 50.70, 25.35],
         "REPUBLIC Collective": [9.86, 14.08, 50.70, 25.35],
     },
 }

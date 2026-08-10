@@ -1,9 +1,10 @@
 """
-Canonical marketshare label set (7 entities) and scrub / big-release column maps.
+Canonical marketshare label set (8 entities) and scrub / big-release column maps.
 
 ``LABEL_NAME`` values in ``current_data_all.csv`` match these strings exactly —
 no aliasing. Scrub + flag volumes come from ``bigrelease_alist_75k_all.csv``
 (column names are UPPERCASE on disk / S3).
+IGA and CMG are level_3 distributors; other labels remain level_2.
 """
 
 from __future__ import annotations
@@ -14,7 +15,8 @@ from typing import Dict, List, Tuple
 TARGET_LABELS: List[str] = [
     "Warner Records",
     "Atlantic Music Group",
-    "Interscope-Capitol",
+    "IGA",
+    "CMG",
     "REPUBLIC Collective",
     "THE ORCHARD",
     "RCA Records",
@@ -31,7 +33,8 @@ MARKET_ANCHOR_LABEL: str = "Atlantic Music Group"
 ALIST_VOL_COLS: Dict[str, str] = {
     "Warner Records": "WARNER_ALBUMS",
     "Atlantic Music Group": "AMG_ALBUMS",
-    "Interscope-Capitol": "INTERSCOPE_CAPITOL_ALBUMS",
+    "IGA": "IGA_ALBUMS",
+    "CMG": "CMG_ALBUMS",
     "REPUBLIC Collective": "REPUBLIC_ALBUMS",
     "THE ORCHARD": "ORCHARD_ALBUMS",
     "RCA Records": "RCA_ALBUMS",
@@ -42,7 +45,8 @@ ALIST_VOL_COLS: Dict[str, str] = {
 BIG_RELEASE_COLS: Dict[str, str] = {
     "Warner Records": "BIG_RELEASE_WARNER",
     "Atlantic Music Group": "BIG_RELEASE_ATLANTIC",
-    "Interscope-Capitol": "BIG_RELEASE_INTERSCOPE_CAPITOL",
+    "IGA": "BIG_RELEASE_IGA",
+    "CMG": "BIG_RELEASE_CMG",
     "REPUBLIC Collective": "BIG_RELEASE_REPUBLIC",
     "THE ORCHARD": "BIG_RELEASE_ORCHARD",
     "RCA Records": "BIG_RELEASE_RCA",

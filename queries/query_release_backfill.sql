@@ -1,8 +1,15 @@
+-- Release backfill roster: one row per mrelg_id that cleared 75k AE.
+-- label_name is level_2 for most TARGET_LABELS; IGA / CMG use level_3.
+-- {TARGET_LABELS} is injected from model.marketshare_labels.TARGET_LABELS.
+-- {RELEASE_DATE_FILTER} is optional (full vs incremental backfill).
 WITH mrelg_map AS (
     SELECT
         DISTINCT mrelg.mrelg_id,
         mrelg.release_type,
-        i.level_2_distributor AS label_group,
+        CASE
+            WHEN i.level_3_distributor IN ('IGA', 'CMG') THEN i.level_3_distributor
+            ELSE i.level_2_distributor
+        END AS label_group,
         ROW_NUMBER() OVER (
             PARTITION BY mrelg.mrelg_id
             ORDER BY
@@ -15,7 +22,14 @@ WITH mrelg_map AS (
         JOIN luminate_prod.extract_s.vw_musical_release_group_ds mrelg ON mrelg.mrelg_id = mm.mrelg_id
         AND mrelg.compilation_type != 'Compilation'
     WHERE
-        i.level_2_distributor IN ({TARGET_LABELS})
+        (
+            i.level_2_distributor IN ({TARGET_LABELS})
+            OR i.level_3_distributor IN ('IGA', 'CMG')
+        )
+        AND CASE
+            WHEN i.level_3_distributor IN ('IGA', 'CMG') THEN i.level_3_distributor
+            ELSE i.level_2_distributor
+        END IN ({TARGET_LABELS})
         AND i.is_current = TRUE
         {RELEASE_DATE_FILTER}
         QUALIFY rn = 1

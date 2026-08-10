@@ -2096,17 +2096,6 @@ def backfill_streaming_roster() -> dict:
 
     if (upserted > 0 or artist_id_fill.get("updated", 0) > 0) and not errors:
         sync_db_to_s3()
-        try:
-            snap = export_streaming_roster_json_snapshot()
-            logger.info(
-                "backfill_streaming_roster: frontend snapshot %s (%s releases)",
-                snap.get("s3_uri"),
-                snap.get("count"),
-            )
-        except Exception:
-            logger.exception(
-                "backfill_streaming_roster: failed to export streaming_roster.json"
-            )
 
     return {
         "inserted": inserted,
@@ -2134,47 +2123,6 @@ def get_streaming_roster_2026() -> List[dict]:
 
 def get_streaming_roster_2026_json() -> str:
     return json.dumps(get_streaming_roster_2026(), default=str)
-
-
-# Canonical static snapshot for the frontend (Monday cron + ad-hoc rebuilds).
-STREAMING_ROSTER_JSON_REL = Path("model/data/streaming_roster.json")
-STREAMING_ROSTER_S3_KEY = "streaming_roster.json"
-
-
-def export_streaming_roster_json_snapshot() -> dict:
-    """
-    Write STREAMING_ROSTER_2026 to local ``model/data/streaming_roster.json`` and
-    upload to ``s3://…/streaming_roster.json`` for the frontend weekly cache.
-    """
-    from datetime import datetime, timezone
-
-    from api.s3_pull import upload_streaming_roster_json
-
-    rows = get_streaming_roster_2026()
-    payload = {
-        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "source": "STREAMING_ROSTER_2026",
-        "count": len(rows),
-        "releases": rows,
-    }
-    body = json.dumps(payload, default=str, separators=(",", ":"))
-    local_path = Path(__file__).resolve().parent / STREAMING_ROSTER_JSON_REL
-    local_path.parent.mkdir(parents=True, exist_ok=True)
-    local_path.write_text(body, encoding="utf-8")
-    logger.info(
-        "export_streaming_roster_json_snapshot: wrote %s (%d releases, %d bytes)",
-        local_path,
-        len(rows),
-        local_path.stat().st_size,
-    )
-    s3_uri = upload_streaming_roster_json(body)
-    return {
-        "local_path": str(local_path),
-        "s3_uri": s3_uri,
-        "count": len(rows),
-        "generated_at": payload["generated_at"],
-        "bytes": local_path.stat().st_size,
-    }
 
 
 def get_ytd_fiscal_revenue_by_label(
@@ -3438,25 +3386,6 @@ def refresh_weekly(force_refresh_parquets: bool = False) -> dict:
 
     set_step("reload_artifacts")
     reload_artifacts()
-
-    # Frontend weekly cache: snapshot STREAMING_ROSTER_2026 → S3 streaming_roster.json
-    set_step("export_streaming_roster_json")
-    t0 = _now()
-    try:
-        roster_snap = export_streaming_roster_json_snapshot()
-        summary["stages"]["streaming_roster_json"] = {
-            "ok": True,
-            "elapsed_sec": _elapsed(t0),
-            **roster_snap,
-        }
-    except Exception as e:
-        logger.exception("refresh_weekly: export_streaming_roster_json_snapshot failed")
-        summary["stages"]["streaming_roster_json"] = {
-            "ok": False,
-            "error": str(e),
-            "elapsed_sec": _elapsed(t0),
-        }
-
     # Push only what weekly mutates: db + csvs + artifacts_75k.
     set_step("sync_to_s3")
     sync_weekly_outputs_to_s3()

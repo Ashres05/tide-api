@@ -9,7 +9,8 @@ WHERE w.release_age = 'Current'
     AND w.label_name IN (
         'Warner Records',
         'Atlantic Music Group',
-        'Interscope-Capitol',
+        'IGA',
+        'CMG',
         'REPUBLIC Collective',
         'THE ORCHARD',
         'RCA Records',

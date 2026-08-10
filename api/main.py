@@ -452,10 +452,10 @@ def releases_by_q_amg_labels(
 @app.get("/v1/revenue/streaming_roster")
 def list_streaming_roster():
     """
-    List STREAMING_ROSTER_2026 (streaming revenue board) — live SQLite read.
+    List STREAMING_ROSTER_2026 (streaming revenue board).
 
-    Prefer ``GET /v1/revenue/streaming_roster.json`` (weekly S3 snapshot) for the
-    frontend board so page loads do not hit SQLite every time.
+    Each row includes ``LUMINATE_ARTIST_ID`` (main artist) when available —
+    use with ``GET /v1/artist_art/{LUMINATE_ARTIST_ID}``.
     """
     try:
         return Response(
@@ -464,66 +464,6 @@ def list_streaming_roster():
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
-
-
-@app.get("/v1/revenue/streaming_roster.json")
-def streaming_roster_json_snapshot():
-    """
-    Weekly frontend cache of the streaming roster.
-
-    Serves ``model/data/streaming_roster.json`` (written by Monday
-    ``refresh_weekly`` / ``export_streaming_roster_json`` and mirrored to
-    ``s3://parquetgarage/streaming_roster.json``). Falls back to a live
-    SQLite snapshot if the file is missing.
-
-    Response shape::
-        {"generated_at": "...Z", "source": "STREAMING_ROSTER_2026",
-         "count": N, "releases": [ ... ]}
-    """
-    import json as _json
-    from pathlib import Path
-
-    path = Path(__file__).resolve().parents[1] / "model" / "data" / "streaming_roster.json"
-    try:
-        if path.is_file():
-            body = path.read_text(encoding="utf-8")
-        else:
-            releases = model_handler.get_streaming_roster_2026()
-            body = _json.dumps(
-                {
-                    "generated_at": None,
-                    "source": "STREAMING_ROSTER_2026",
-                    "count": len(releases),
-                    "releases": releases,
-                },
-                default=str,
-            )
-        return Response(
-            content=body,
-            media_type="application/json",
-            headers={
-                "Cache-Control": "public, max-age=604800, stale-while-revalidate=86400",
-            },
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-
-@app.post(
-    "/v1/revenue/export_streaming_roster_json",
-    status_code=status.HTTP_202_ACCEPTED,
-    response_model=JobAcceptedResponse,
-)
-def export_streaming_roster_json(_: None = Depends(require_api_key)) -> JobAcceptedResponse:
-    """
-    Snapshot STREAMING_ROSTER_2026 to ``model/data/streaming_roster.json`` and
-    upload to ``s3://…/streaming_roster.json`` for the frontend weekly cache.
-    Also runs automatically at the end of ``/v1/data/refresh_weekly``.
-    """
-    return _dispatch(
-        "export_streaming_roster_json",
-        model_handler.export_streaming_roster_json_snapshot,
-    )
 
 
 @app.get("/v1/revenue/ytd_fiscal_revenue")
