@@ -5,6 +5,9 @@
 --   incremental: release_date >= max(roster) - overlap days
 -- Per-MRELG weekly worldwide streams use query_release_global_streaming.sql instead.
 --
+-- label_name is level_2 for most distributors; IGA / CMG use level_3.
+-- Legacy Interscope/Geffen/A&M (and Interscope-Capitol) level_2 maps to IGA.
+--
 -- LUMINATE_ARTIST_ID is the first Main Artist from VW_MUSICAL_RELEASE_GROUP_DS.ARTISTS
 -- (same ID as CURRENT_DEV.DATA.ARTIST_METADATA.LUMINATE_ARTIST_ID / artist_art/{id}.jpeg).
 WITH mrelg_map AS (
@@ -14,7 +17,14 @@ WITH mrelg_map AS (
         mrelg.title,
         mrelg.display_artist AS artist,
         mrelg.artists,
-        i.level_2_distributor AS label_group,
+        CASE
+            WHEN i.level_3_distributor IN ('IGA', 'CMG') THEN i.level_3_distributor
+            WHEN i.level_2_distributor IN (
+                'Interscope/Geffen/A&M',
+                'Interscope-Capitol'
+            ) THEN 'IGA'
+            ELSE i.level_2_distributor
+        END AS label_group,
         i.level_1_distributor AS parent_group,
         COALESCE(mrelg.first_sale_date, mrelg.release_date) AS release_date,
         ROW_NUMBER() OVER (
@@ -29,9 +39,12 @@ WITH mrelg_map AS (
         AND mrelg.compilation_type != 'Compilation'
         AND mrelg.release_type IN ('Album', 'Single', 'EP')
         AND mrelg.display_artist NOT IN ('VARIOUS', 'VARIOUS ARTISTS', 'Various Artists')
-        AND i.level_2_distributor IS NOT NULL
     WHERE
         i.is_current = TRUE
+        AND (
+            i.level_2_distributor IS NOT NULL
+            OR i.level_3_distributor IN ('IGA', 'CMG')
+        )
         {RELEASE_DATE_FILTER}
         QUALIFY rn = 1
 ),

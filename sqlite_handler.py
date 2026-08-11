@@ -697,6 +697,14 @@ def _incremental_daily_filter(max_report_date: str | None) -> str:
 
 
 def _incremental_weekly_filter(max_week_ending_date: str | None) -> str:
+    """
+    Min week-ending floor for incremental Snowflake weekly-stream pulls.
+
+    When the SQLite cache already has a max WEEK_ENDING_DATE for the MRELG,
+    only request weeks on/after (max - overlap). This is what keeps boot
+    prewarm / daily+weekly crons from re-pulling the full YTD window every run.
+    Cold cache (max is None) returns "" so the SQL release_date / YTD floors apply.
+    """
     if not max_week_ending_date:
         return ""
     max_dt = pd.to_datetime(max_week_ending_date, errors="coerce")
@@ -704,7 +712,8 @@ def _incremental_weekly_filter(max_week_ending_date: str | None) -> str:
         return ""
     overlap = int(os.environ.get("TIDE_WEEKLY_STREAMS_OVERLAP_WEEKS", str(WEEKLY_STREAMS_INCREMENTAL_OVERLAP_WEEKS)))
     floor = (max_dt - pd.Timedelta(weeks=overlap)).strftime("%Y-%m-%d")
-    return f"\n        AND da.week_end_date > {_snowflake_date_literal(floor)}"
+    # Inclusive >= so overlap weeks re-upsert cleanly (INSERT OR REPLACE / UNIQUE).
+    return f"\n        AND da.week_end_date >= {_snowflake_date_literal(floor)}"
 
 
 def _max_daily_streams_report_date(cursor: sqlite3.Cursor, mrelg_id: str) -> str | None:

@@ -1,14 +1,23 @@
 #!/usr/bin/env bash
-# WEEKLY (Mon 14:00 UTC): hit /v1/data/refresh_weekly and poll until done.
-# Endpoint pulls weekly inputs from S3, runs CSV-only refresh+train, runs
-# release backfill, and pushes outputs back to S3. Heavy parquets are skipped
-# by default — call /v1/data/refresh_model when those need rebuilding.
-# Quarterly-share CSVs (bi_sandbox) are best-effort: if Snowflake denies that
-# database, core CSVs, training, backfill, and S3 sync still complete.
+# WEEKLY (Mon 15:00 UTC via crontab): hit /v1/data/refresh_weekly and poll until done.
+#
+# Pipeline (server-side):
+#   CSV-only refresh+train → release backfill → weekly stream prewarm →
+#   export_boot_json_snapshot (FULL boot.json) → S3 sync.
+#
+# Full boot.json includes:
+#   streaming.releases (+ weekly stream actuals)
+#   marketshare.actuals / marketshare.weekly
+#   releases.items[].weekly  = Actual + Forecast album units
+#     (same path as GET /v1/releases/{id}/weekly; boot version >= 2)
+#
+# Heavy parquets are skipped by default — call /v1/data/refresh_model when
+# those need rebuilding. Quarterly-share CSVs (bi_sandbox) are best-effort.
 set -euo pipefail
 API_URL="${API_URL:-http://127.0.0.1:8000}"
 POLL_SEC="${POLL_SEC:-30}"
-MAX_WAIT="${MAX_WAIT:-4800}"
+# Train + backfill + ~1m release-forecast bake into boot; leave headroom.
+MAX_WAIT="${MAX_WAIT:-5400}"
 HDR=()
 [[ -n "${API_KEY:-}" ]] && HDR=(-H "X-API-Key: ${API_KEY}")
 ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
@@ -35,7 +44,8 @@ print(d.get("status",""), step)')"
       log "DONE in $(( $(date +%s) - START ))s"
       printf '%s' "$JOB_JSON" | python3 -c 'import sys,json
 d=json.load(sys.stdin)
-rd=(d.get("result") or {}).get("stages",{}).get("refresh_data",{}) or {}
+stages=(d.get("result") or {}).get("stages",{}) or {}
+rd=stages.get("refresh_data",{}) or {}
 for st in rd.get("csv_stages") or []:
     name=st.get("csv","?")
     added=st.get("rows_added",0)
@@ -49,7 +59,24 @@ for st in rd.get("csv_stages") or []:
     print(f"CSV_REFRESH {name}: +{added} rows{suffix}")
 errs=rd.get("optional_csv_errors") or []
 for e in errs:
-    print("WARN optional_csv_skipped:", e.get("csv"), ":", (e.get("error") or "")[:200])' || true
+    print("WARN optional_csv_skipped:", e.get("csv"), ":", (e.get("error") or "")[:200])
+boot=stages.get("boot_json") or {}
+if not boot:
+    print("ERROR boot_json stage missing from weekly result")
+    raise SystemExit(4)
+if not boot.get("ok", False):
+    print("ERROR boot_json stage failed:", (boot.get("error") or "")[:300])
+    raise SystemExit(4)
+print(
+    "BOOT_JSON ok bytes=%s releases=%s with_forecast=%s fallback=%s s3=%s"
+    % (
+        boot.get("bytes"),
+        boot.get("releases_count"),
+        boot.get("releases_with_forecast"),
+        boot.get("releases_actual_only_fallback"),
+        boot.get("s3_uri"),
+    )
+)' || exit $?
       exit 0
       ;;
     failed) log "FAILED: $JOB_JSON"; exit 3 ;;

@@ -203,6 +203,56 @@ def reload_forecast_artifacts_from_disk() -> dict:
     model_handler.reload_artifacts()
     return {"status": "ok", "detail": "forecast caches cleared; next API use loads from disk"}
 
+
+@app.post(
+    "/v1/data/export_boot_json",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=JobAcceptedResponse,
+)
+def export_boot_json(_: None = Depends(require_api_key)) -> JobAcceptedResponse:
+    """
+    Build model/data/boot.json and upload to s3://…/boot.json.
+    Prefer running after roster prewarm so streaming.weekly_streams is populated.
+    """
+    return _dispatch("export_boot_json", model_handler.export_boot_json_snapshot)
+
+
+@app.get("/v1/boot.json")
+def get_boot_json():
+    """
+    Cold-start snapshot: streaming roster + weekly stream actuals, marketshare
+    actuals/weekly, and expected releases with Actual + Forecast weekly AE
+    (same shape as GET /v1/releases/{id}/weekly).
+
+    FE should load this once at startup. Insert/edit/delete drops via
+    POST/PUT/DELETE /v1/releases (live). See payload ``ui`` for the contract.
+    """
+    from boot_snapshot import export_boot_json_snapshot, load_boot_json_bytes
+
+    body = load_boot_json_bytes()
+    if body is None:
+        try:
+            export_boot_json_snapshot()
+            body = load_boot_json_bytes()
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"boot.json missing and live build failed: {e}",
+            ) from e
+    if body is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="boot.json unavailable",
+        )
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={
+            "Cache-Control": "private, max-age=60, stale-while-revalidate=3600",
+        },
+    )
+
+
 @app.post(
     "/v1/releases/backfill",
     status_code=status.HTTP_202_ACCEPTED,
@@ -538,11 +588,23 @@ def list_releases():
 
 @app.post("/v1/releases", status_code=status.HTTP_201_CREATED)
 def create_release(body: ReleaseCreateBody):
+    """
+    Insert a drop. Live path — does not rebuild boot.json.
+
+    Response includes a boot-shaped ``release`` for FE local-state patch.
+    After create, FE should refetch GET /v1/marketshare/weekly (server cache cleared).
+    """
     try:
+        from boot_snapshot import release_boot_item_by_id
+
         rid = model_handler.create_release(
             **model_handler.normalize_release_write_kwargs(body.model_dump())
         )
-        return {"release_id": int(rid)}
+        return {
+            "release_id": int(rid),
+            "release": release_boot_item_by_id(int(rid)),
+            "refetch": ["GET /v1/marketshare/weekly", "GET /v1/marketshare/actuals"],
+        }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -564,12 +626,24 @@ def get_release(release_id: int):
 
 @app.put("/v1/releases/{release_id}")
 def update_release(release_id: int, body: ReleaseUpdateBody):
+    """
+    Edit a drop. Live path — does not rebuild boot.json.
+
+    Returns boot-shaped ``release`` for FE patch; refetch marketshare weekly after.
+    """
     try:
+        from boot_snapshot import release_boot_item_by_id
+
         model_handler.update_release(
             id=int(release_id),
             **model_handler.normalize_release_write_kwargs(body.model_dump()),
         )
-        return {"ok": True}
+        return {
+            "ok": True,
+            "release_id": int(release_id),
+            "release": release_boot_item_by_id(int(release_id)),
+            "refetch": ["GET /v1/marketshare/weekly", "GET /v1/marketshare/actuals"],
+        }
     except ValueError as e:
         msg = str(e)
         code = 404 if "No release found" in msg else 400
@@ -580,9 +654,14 @@ def update_release(release_id: int, body: ReleaseUpdateBody):
 
 @app.delete("/v1/releases/{release_id}")
 def delete_release(release_id: int):
+    """Delete a drop. Live path — FE should drop local item and refetch marketshare."""
     try:
         model_handler.delete_release(int(release_id))
-        return {"ok": True}
+        return {
+            "ok": True,
+            "release_id": int(release_id),
+            "refetch": ["GET /v1/marketshare/weekly", "GET /v1/marketshare/actuals"],
+        }
     except ValueError as e:
         msg = str(e)
         code = 404 if "No release found" in msg else 400

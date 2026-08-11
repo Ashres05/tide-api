@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# DAILY (02:00 PT): backfill releases, then backfill streaming roster.
+# DAILY (02:00 PT): backfill releases, then backfill streaming roster, then boot.json.
 #
 # 1. POST /v1/releases/backfill — pulls new mrelg_ids from Snowflake, inserts
 #    into SQLite, refreshes per-release historical metrics, pushes DB to S3.
 # 2. POST /v1/revenue/backfill_streaming_roster — incremental roster update
 #    (last 30 days by default). Pushes DB to S3 when new rows are inserted.
+# 3. POST /v1/data/export_boot_json — FULL boot.json (streaming actuals,
+#    marketshare, expected releases with Actual+Forecast album units) → S3.
 set -euo pipefail
 API_URL="${API_URL:-http://127.0.0.1:8000}"
 POLL_SEC="${POLL_SEC:-20}"
@@ -49,3 +51,8 @@ dispatch_and_poll "/v1/releases/backfill" "releases"
 
 # --- Stage 2: streaming roster backfill ---
 dispatch_and_poll "/v1/revenue/backfill_streaming_roster" "streaming_roster"
+
+# --- Stage 3: refresh boot.json (weekly streams + release actuals snapshot) ---
+# Prefer a prior prewarm so streaming.weekly_streams is populated; export still
+# succeeds with empty arrays if caches are cold.
+dispatch_and_poll "/v1/data/export_boot_json" "export_boot_json"

@@ -14,11 +14,12 @@ Scopes:
   - "archetypes_artifacts" model/archetypes_artifacts/** (album decay + singles/ subdir; forecast serving)
 
 Convenience entry points:
-  - sync_serving_inputs_from_s3()   -> startup: db + csvs + artifacts_75k + archetypes
-  - sync_weekly_inputs_from_s3()    -> refresh_weekly start: db + csvs + artifacts_75k
-  - sync_weekly_outputs_to_s3()     -> refresh_weekly end: db + csvs + artifacts_75k
+  - sync_serving_inputs_from_s3()   -> startup: db + csvs + artifacts_75k + archetypes + boot.json
+  - sync_weekly_inputs_from_s3()    -> refresh_weekly start: db + csvs + artifacts_75k + boot.json
+  - sync_weekly_outputs_to_s3()     -> refresh_weekly end: db + csvs + artifacts_75k (+ boot.json if local)
   - sync_full_inputs_from_s3()      -> full refresh_data: all scopes
   - sync_full_outputs_to_s3()       -> full refresh_data: all scopes
+  - upload_boot_json(body)          -> s3://…/boot.json (+ model/data/boot.json mirror)
 
 Configuration (env):
   TIDE_ARTIFACTS_S3_URI=s3://parquetgarage           (preferred)
@@ -415,10 +416,11 @@ def sync_artifacts_to_s3_if_configured(
 # ---------------------------------------------------------------------------
 
 def sync_serving_inputs_from_s3() -> None:
-    """API startup: db + weekly CSVs + forecast artifacts (same CSVs refresh_weekly pulls first)."""
+    """API startup: db + weekly CSVs + forecast artifacts + boot.json."""
     sync_artifacts_from_s3_if_configured(
         scopes={SCOPE_DB, SCOPE_CSVS, SCOPE_ARTIFACTS_75K, SCOPE_ARCHETYPES},
     )
+    download_boot_json_from_s3()
 
 
 def sync_weekly_inputs_from_s3() -> None:
@@ -426,6 +428,7 @@ def sync_weekly_inputs_from_s3() -> None:
     sync_artifacts_from_s3_if_configured(
         scopes={SCOPE_DB, SCOPE_CSVS, SCOPE_ARTIFACTS_75K},
     )
+    download_boot_json_from_s3()
 
 
 def sync_weekly_outputs_to_s3() -> None:
@@ -433,6 +436,11 @@ def sync_weekly_outputs_to_s3() -> None:
     sync_artifacts_to_s3_if_configured(
         scopes={SCOPE_DB, SCOPE_CSVS, SCOPE_ARTIFACTS_75K},
     )
+    # boot.json is uploaded by export_boot_json_snapshot / upload_boot_json;
+    # re-push local file if present so weekly outputs stay consistent.
+    local_boot = _repo_root() / _MODEL_DATA_REL / "boot.json"
+    if local_boot.is_file():
+        upload_boot_json(local_boot.read_bytes())
 
 
 def sync_full_inputs_from_s3() -> None:
@@ -459,3 +467,112 @@ def sync_parquets_from_s3() -> None:
 
 def sync_parquets_to_s3() -> None:
     sync_artifacts_to_s3_if_configured(scopes={SCOPE_PARQUETS})
+
+
+# ---------------------------------------------------------------------------
+# boot.json (startup payload for the frontend)
+# ---------------------------------------------------------------------------
+
+_BOOT_JSON_NAME = "boot.json"
+_BOOT_LOCAL_REL = _MODEL_DATA_REL / _BOOT_JSON_NAME
+_BOOT_CACHE_CONTROL = "public, max-age=86400, stale-while-revalidate=3600"
+
+
+def upload_boot_json(body: bytes | str) -> Optional[str]:
+    """
+    Upload boot.json to the artifacts bucket root (s3://…/boot.json) and mirror
+    under model/data/boot.json.
+
+    Returns the primary s3 URI, or None when push is disabled / unconfigured.
+    """
+    if os.environ.get("TIDE_ARTIFACTS_S3_PUSH", "1").strip().lower() in (
+        "0", "false", "no", "off",
+    ):
+        logger.info("S3 boot.json push disabled (TIDE_ARTIFACTS_S3_PUSH=0).")
+        return None
+
+    resolved = _resolve_bucket_prefix("push")
+    if resolved is None:
+        return None
+    bucket, prefix = resolved
+    pfx = _norm_s3_prefix(prefix)
+
+    data = body.encode("utf-8") if isinstance(body, str) else body
+    local = _repo_root() / _BOOT_LOCAL_REL
+    local.parent.mkdir(parents=True, exist_ok=True)
+    if not local.is_file() or local.read_bytes() != data:
+        local.write_bytes(data)
+
+    try:
+        import boto3
+    except ImportError:
+        logger.warning("boto3 not installed; cannot upload boot.json")
+        return None
+
+    client = boto3.client("s3")
+    root_key = f"{pfx}{_BOOT_JSON_NAME}".replace("//", "/")
+    data_key = f"{pfx}model/data/{_BOOT_JSON_NAME}".replace("//", "/")
+    extra = {
+        "ContentType": "application/json",
+        "CacheControl": _BOOT_CACHE_CONTROL,
+    }
+    for key in (root_key, data_key):
+        client.put_object(Bucket=bucket, Key=key, Body=data, **extra)
+        logger.info("S3 push: boot.json -> s3://%s/%s (%d bytes)", bucket, key, len(data))
+    return f"s3://{bucket}/{root_key}"
+
+
+def download_boot_json_from_s3() -> bool:
+    """
+    Pull boot.json into model/data/boot.json (bucket root key, then model/data/).
+    Returns True if a local file was written/updated.
+    """
+    if os.environ.get("TIDE_ARTIFACTS_S3_SYNC", "1").strip().lower() in (
+        "0", "false", "no", "off",
+    ):
+        return False
+
+    resolved = _resolve_bucket_prefix("pull")
+    if resolved is None:
+        return False
+    bucket, prefix = resolved
+    pfx = _norm_s3_prefix(prefix)
+
+    try:
+        import boto3
+        from botocore.exceptions import ClientError
+    except ImportError:
+        logger.warning("boto3 not installed; cannot download boot.json")
+        return False
+
+    client = boto3.client("s3")
+    candidates = [
+        f"{pfx}{_BOOT_JSON_NAME}".replace("//", "/"),
+        f"{pfx}model/data/{_BOOT_JSON_NAME}".replace("//", "/"),
+        _BOOT_JSON_NAME,
+        f"model/data/{_BOOT_JSON_NAME}",
+    ]
+    seen: set[str] = set()
+    keys: list[str] = []
+    for k in candidates:
+        if k not in seen:
+            seen.add(k)
+            keys.append(k)
+
+    dest = _repo_root() / _BOOT_LOCAL_REL
+    for key in keys:
+        try:
+            head = client.head_object(Bucket=bucket, Key=key)
+        except ClientError:
+            continue
+        expected = head.get("ContentLength")
+        if dest.is_file() and expected is not None and dest.stat().st_size == int(expected):
+            logger.info("S3 pull: skip unchanged boot.json s3://%s/%s", bucket, key)
+            return True
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        client.download_file(bucket, key, str(dest))
+        logger.info("S3 pull: boot.json <- s3://%s/%s", bucket, key)
+        return True
+
+    logger.info("S3 pull: boot.json not found under s3://%s (prefix=%r)", bucket, pfx)
+    return False

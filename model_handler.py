@@ -3237,10 +3237,18 @@ def refresh_weekly(force_refresh_parquets: bool = False) -> dict:
          only. Skips AE parquet KMeans/DNA and all archetype decay.
       3. backfill_releases — inserts new mrelg_ids and refreshes per-release
          historical metrics. Skipped when TIDE_WEEKLY_SKIP_BACKFILL=1.
+      4. (optional) backfill_streaming_roster — skipped by default
+         (TIDE_WEEKLY_SKIP_STREAMING_ROSTER_BACKFILL=1).
+      5. prewarm_streaming_roster_caches(weekly only) + export_boot_json_snapshot
+         (FULL boot.json: streaming actuals, marketshare, expected releases with
+         Actual+Forecast album units via get_release_forecasts). Boot export
+         failure fails the weekly job so Monday cron cannot silently ship a
+         stale/partial boot.
 
-    Returns a per-stage summary. Stage 1 failures are non-fatal (archetype
+    Returns a per-stage summary. Stage 1 failures are non-fatal (archetype)
     training falls back to whatever parquets are already on disk); stages 2
-    and 3 re-raise so the job is marked failed.
+    and 3 re-raise so the job is marked failed. Stage 5 boot export also
+    re-raises on failure.
 
     Progress: each stage calls api.jobs.set_step() so the caller can
     diagnose which phase is slow by polling GET /v1/jobs/{id}.steps. The
@@ -3386,11 +3394,60 @@ def refresh_weekly(force_refresh_parquets: bool = False) -> dict:
 
     set_step("reload_artifacts")
     reload_artifacts()
-    # Push only what weekly mutates: db + csvs + artifacts_75k.
+
+    # Ensure weekly worldwide streams exist for roster titles, then export the
+    # FULL boot.json (streaming actuals + marketshare + expected-release
+    # Actual+Forecast album units) for Monday cron / FE cold start.
+    set_step("prewarm_streaming_roster:start")
+    t0 = _now()
+    try:
+        prewarm_stats = prewarm_streaming_roster_caches(
+            daily=False, weekly=True, only_stale=True
+        )
+        summary["stages"]["prewarm_streaming_roster"] = {
+            "ok": True,
+            "elapsed_sec": _elapsed(t0),
+            **prewarm_stats,
+        }
+    except Exception as e:
+        logger.exception("refresh_weekly: prewarm_streaming_roster_caches failed")
+        summary["stages"]["prewarm_streaming_roster"] = {
+            "ok": False,
+            "error": str(e),
+            "elapsed_sec": _elapsed(t0),
+        }
+
+    set_step("export_boot_json:start")
+    t0 = _now()
+    try:
+        boot_summary = export_boot_json_snapshot()
+        summary["stages"]["boot_json"] = {
+            "ok": True,
+            "elapsed_sec": _elapsed(t0),
+            **{k: v for k, v in boot_summary.items() if k != "ok"},
+        }
+    except Exception as e:
+        logger.exception("refresh_weekly: export_boot_json_snapshot failed")
+        summary["stages"]["boot_json"] = {
+            "ok": False,
+            "error": str(e),
+            "elapsed_sec": _elapsed(t0),
+        }
+        # Monday cron must publish full boot (incl. expected-release forecasts).
+        raise
+
+    # Push only what weekly mutates: db + csvs + artifacts_75k (+ boot.json).
     set_step("sync_to_s3")
     sync_weekly_outputs_to_s3()
     set_step("done")
     return summary
+
+
+def export_boot_json_snapshot() -> dict:
+    """Build/upload boot.json (thin wrapper around ``boot_snapshot``)."""
+    from boot_snapshot import export_boot_json_snapshot as _export
+
+    return _export()
 
 
 def _elapsed(t0: float) -> float:

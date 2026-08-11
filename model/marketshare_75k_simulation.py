@@ -41,6 +41,9 @@ def _inject_col_for_owner(owner: str) -> str:
 
 def _resolve_inject_col(label: str) -> str:
     """Map release label to an injection column (TARGET_LABELS or Other)."""
+    # Legacy Interscope names → IGA (level_3 split)
+    if label in ("Interscope/Geffen/A&M", "Interscope-Capitol"):
+        label = "IGA"
     if label in TARGET_LABELS:
         return _inject_col_for_owner(label)
     return _INJECT_OTHER_COL

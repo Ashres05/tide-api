@@ -36,11 +36,16 @@ curl -s http://127.0.0.1:8000/v1/jobs/<job_id>
 
 `refresh_weekly` runs, in order:
 
-1. `refresh_model` — updates the AE + worldwide-streams parquets.
-2. `refresh_data` — pulls CSV inputs and retrains LGBM / Prophet / Ridge /
-   archetype models.
-3. `backfill_releases` — inserts any newly surfaced Luminate releases into
-   SQLite and refreshes per-release historical metrics.
+1. (optional) parquet refresh — only with `force_refresh_parquets=true`
+2. `refresh_data` (CSV-only) — pulls CSVs and retrains LGBM / Prophet / spike /
+   `df_full`
+3. `backfill_releases` — new Luminate releases into SQLite + metrics
+4. (optional) streaming roster backfill — off by default
+5. weekly stream prewarm + **`export_boot_json_snapshot`** — publishes the
+   **full** `boot.json` (streaming actuals, marketshare, expected releases with
+   **Actual + Forecast** album units). Boot export failure fails the job.
+
+Crontab (this host): `0 15 * * 1 …/api_refresh_s3.sh` → Monday 15:00 UTC.
 
 On success the in-process forecast engine cache is invalidated so subsequent
 `/v1/marketshare/*` and `/v1/releases/*/weekly` calls see the fresh models.
