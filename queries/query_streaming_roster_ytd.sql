@@ -78,7 +78,7 @@ mrelg_metrics AS (
         LEFT JOIN mrelg_main_artist a ON a.mrelg_id = m.mrelg_id
         JOIN luminate_prod.extract_s.vw_daily_fact_mrelg_summary_ds s ON s.mrelg_id = m.mrelg_id
         AND s.country_code = 'US'
-        AND s.report_date >= DATEADD(MONTH, -19, CURRENT_DATE())
+        AND s.report_date >= DATEADD(WEEK, -78, CURRENT_DATE())
         JOIN luminate_prod.extract_s.vw_date_ds da ON da.datename = s.report_date
     GROUP BY
         ALL

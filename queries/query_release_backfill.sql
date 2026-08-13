@@ -2,6 +2,9 @@
 -- label_name is level_2 for most TARGET_LABELS; IGA / CMG use level_3.
 -- {TARGET_LABELS} is injected from model.marketshare_labels.TARGET_LABELS.
 -- {RELEASE_DATE_FILTER} is optional (full vs incremental backfill).
+-- Excludes Various Artists (same artist set as query_streaming_roster_ytd.sql).
+-- Fact window is WEEK -78 to match archetype NUM_WEEKS / FE pull−78w logic
+-- (replaces MONTH -19 ≈ 82 weeks).
 WITH mrelg_map AS (
     SELECT
         DISTINCT mrelg.mrelg_id,
@@ -21,6 +24,7 @@ WITH mrelg_map AS (
         JOIN luminate_prod.extract_s.vw_mrel_mrelg_map_ds mm ON mm.mrel_id = m.mrel_id
         JOIN luminate_prod.extract_s.vw_musical_release_group_ds mrelg ON mrelg.mrelg_id = mm.mrelg_id
         AND mrelg.compilation_type != 'Compilation'
+        AND mrelg.display_artist NOT IN ('VARIOUS', 'VARIOUS ARTISTS', 'Various Artists', 'various')
     WHERE
         (
             i.level_2_distributor IN ({TARGET_LABELS})
@@ -45,7 +49,7 @@ mrelg_metrics AS (
         mrelg_map m
         JOIN luminate_prod.extract_s.vw_daily_fact_mrelg_summary_ds s ON s.mrelg_id = m.mrelg_id
         AND s.country_code = 'US'
-        AND s.report_date >= DATEADD(MONTH, -19, CURRENT_DATE()) -- Current releases cannot have data older than 19 months
+        AND s.report_date >= DATEADD(WEEK, -78, CURRENT_DATE())
         JOIN luminate_prod.extract_s.vw_date_ds da ON da.datename = s.report_date
     GROUP BY
         ALL
