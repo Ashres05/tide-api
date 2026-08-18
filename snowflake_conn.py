@@ -79,6 +79,7 @@ class Snowflake:
         if not self.conn:
             raise SnowflakeConnectionError("Snowflake connection is not established.")
 
+        cursor = None
         try:
             cursor = self.conn.cursor()
             cursor.execute(sql)
@@ -99,6 +100,15 @@ class Snowflake:
             raise SnowflakeConnectionError(f"An error occurred while executing the query: {e}")
         except Exception as e:
             raise SnowflakeConnectionError(f"Unexpected error: {e}")
+        finally:
+            # Each unclosed cursor can hold result-set FDs. Weekly roster prewarm
+            # runs hundreds of queries on one session; leaking them hits EMFILE
+            # (soft ulimit 1024) before boot.json export / S3 push.
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
 
 
 class SnowflakeConnectionError(Exception):
@@ -139,8 +149,18 @@ def get_snowflake_connection():
     return Snowflake(creds)
 
 
+_SQL_CACHE: dict[str, str] = {}
+_SQL_CACHE_LOCK = threading.Lock()
+
+
 def load_sql(file_name: str) -> str:
     """Takes file name and goes into the queries folder to return the file as text."""
+    with _SQL_CACHE_LOCK:
+        cached = _SQL_CACHE.get(file_name)
+        if cached is not None:
+            return cached
     current_dir = Path(__file__).parent
-    path = current_dir / 'queries' / file_name
-    return path.read_text(encoding='utf-8')
+    text = (current_dir / "queries" / file_name).read_text(encoding="utf-8")
+    with _SQL_CACHE_LOCK:
+        _SQL_CACHE[file_name] = text
+    return text

@@ -1560,7 +1560,7 @@ def _create_backfilled_release(
     label_name: str,
     product_type: str | None = None,
     scenario: str = "Base",
-    fw_vol: float = 100000.0,  # Default; irrelevant once known_vols are loaded.
+    fw_vol: float = 0.0,  # Filled from street-week metrics after sqlite refresh.
     _sf: "Snowflake | None" = None,
 ) -> int:
     """
@@ -3417,6 +3417,23 @@ def refresh_weekly(force_refresh_parquets: bool = False) -> dict:
             "elapsed_sec": _elapsed(t0),
         }
 
+    # Push CSVs / DB / artifacts even if boot export fails. Monday 2026-08-17
+    # trained successfully then died at boot.json (EMFILE); S3 stayed on the
+    # prior week's snapshot because this sync lived after the raise.
+    set_step("sync_to_s3")
+    t0 = _now()
+    try:
+        sync_weekly_outputs_to_s3()
+        summary["stages"]["sync_to_s3"] = {"ok": True, "elapsed_sec": _elapsed(t0)}
+    except Exception as e:
+        logger.exception("refresh_weekly: sync_weekly_outputs_to_s3 failed")
+        summary["stages"]["sync_to_s3"] = {
+            "ok": False,
+            "error": str(e),
+            "elapsed_sec": _elapsed(t0),
+        }
+        raise
+
     set_step("export_boot_json:start")
     t0 = _now()
     try:
@@ -3436,9 +3453,6 @@ def refresh_weekly(force_refresh_parquets: bool = False) -> dict:
         # Monday cron must publish full boot (incl. expected-release forecasts).
         raise
 
-    # Push only what weekly mutates: db + csvs + artifacts_75k (+ boot.json).
-    set_step("sync_to_s3")
-    sync_weekly_outputs_to_s3()
     set_step("done")
     return summary
 
@@ -3597,6 +3611,9 @@ def _sqlite_row_to_release_map(row: sqlite3.Row) -> dict:
     rd = row["RELEASE_DATE"]
     date_str = rd if isinstance(rd, str) else str(rd)
 
+    # UI / boot fw_vol is the persisted street-week AE (chart week containing
+    # RELEASE_DATE, stub week skipped). Do not substitute max(known_vols) —
+    # that peak is only for injection gating via release_peak_w1_vol.
     expected_fw_vol = float(row["EXPECTED_ALBUM_EQUIVALENT"] or 0)
     if mrelg_id:
         has_nonzero_known = bool(known_vols) and any(float(x) > 0 for x in known_vols)
@@ -3605,9 +3622,7 @@ def _sqlite_row_to_release_map(row: sqlite3.Row) -> dict:
                 f"Release {rid} has mrelg_id={mrelg_id!r} but no backfilled metrics yet "
                 "Ensure known_vols is populated."
             )
-        fw_vol = float(max(known_vols)) if has_nonzero_known else expected_fw_vol
-    else:
-        fw_vol = expected_fw_vol
+    fw_vol = expected_fw_vol
 
     def _sql_float(col: str, default: float = 0.0) -> float:
         if col not in row.keys():
@@ -4541,22 +4556,30 @@ def prewarm_streaming_roster_caches(
             try:
                 with sqlite3.connect(DATABASE_NAME) as conn:
                     cur = conn.cursor()
+                    do_daily = False
+                    do_weekly = False
                     if daily:
                         if only_stale and _daily_streams_is_fresh(cur, mrelg_id):
                             stats["daily_skipped"] += 1
                         else:
-                            refresh_daily_global_streams_for_mrelg(
-                                mrelg_id, release_date, sf_conn=sf
-                            )
-                            stats["daily_refreshed"] += 1
+                            do_daily = True
                     if weekly:
                         if only_stale and _weekly_streams_is_fresh(cur, mrelg_id):
                             stats["weekly_skipped"] += 1
                         else:
-                            refresh_weekly_global_streams_for_mrelg(
-                                mrelg_id, release_date, sf_conn=sf
-                            )
-                            stats["weekly_refreshed"] += 1
+                            do_weekly = True
+                # Refresh outside the freshness connection so we don't hold a
+                # SQLite FD across the Snowflake round-trip.
+                if do_daily:
+                    refresh_daily_global_streams_for_mrelg(
+                        mrelg_id, release_date, sf_conn=sf
+                    )
+                    stats["daily_refreshed"] += 1
+                if do_weekly:
+                    refresh_weekly_global_streams_for_mrelg(
+                        mrelg_id, release_date, sf_conn=sf
+                    )
+                    stats["weekly_refreshed"] += 1
             except Exception as e:
                 stats["errors"].append({"mrelg_id": mrelg_id, "error": str(e)})
                 logger.exception(

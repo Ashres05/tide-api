@@ -218,6 +218,7 @@ def release_boot_item_from_row(
         "product_type": product_type,
         "genre": str(_row_get(row, "GENRE") or "").strip(),
         "scenario": str(_row_get(row, "SCENARIO") or "").strip() or "Base",
+        # Persisted street-week AE (chart week of RELEASE_DATE; stub weeks already skipped).
         "fw_vol": _num_float(_row_get(row, "EXPECTED_ALBUM_EQUIVALENT")),
         "fw_streams": _num_float(_row_get(row, "FW_STREAMS")),
         "fw_songs": _num_float(_row_get(row, "FW_SONGS")),

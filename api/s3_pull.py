@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -84,6 +85,7 @@ _CSV_SYNC_EXCLUDE: frozenset[str] = frozenset(
         "alist_75k.csv",
         "bigreleaseflag_75k.csv",
         "bigrelease_75k.csv",
+        "alist_and_flag.csv",
     }
 )
 
@@ -288,6 +290,20 @@ def sync_artifacts_from_s3_if_configured(
                 )
                 continue
             dest = (root / local_rel / rel) if rel else (root / local_rel / Path(key).name)
+            # Do not clobber a locally newer file (e.g. Snowflake refresh in
+            # flight, then API OOM-restart pulls stale S3).
+            s3_mt = obj.get("LastModified")
+            if dest.is_file() and s3_mt is not None:
+                local_mt = datetime.fromtimestamp(dest.stat().st_mtime, tz=timezone.utc)
+                remote_mt = s3_mt if s3_mt.tzinfo else s3_mt.replace(tzinfo=timezone.utc)
+                if local_mt >= remote_mt:
+                    logger.info(
+                        "S3 pull: skip %s (local mtime %s >= s3 %s)",
+                        dest.name,
+                        local_mt.isoformat(),
+                        remote_mt.isoformat(),
+                    )
+                    continue
             download_key(key, dest, expected_size=obj.get("Size"))
             n += 1
         logger.info("S3 pull: %d objects under s3://%s/%s (suffixes=%s)",

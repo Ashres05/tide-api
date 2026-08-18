@@ -4,6 +4,7 @@ import sqlite3
 import pandas as pd
 import numpy as np
 import os
+from datetime import date, timedelta
 from pathlib import Path
 import logging
 
@@ -116,6 +117,148 @@ def ensure_expected_releases_fw_columns(conn: sqlite3.Connection) -> None:
         except sqlite3.OperationalError:
             pass
         cur.execute("PRAGMA user_version = 2")
+
+
+# Street-week first-week AE stored on EXPECTED_RELEASES so UI/boot do not
+# recompute on every load. If the chart week containing RELEASE_DATE is a
+# stub (<= this fraction of the next week), use week 2 instead.
+FW_STUB_MAX_FRAC_OF_W2 = 0.10
+
+
+def _parse_iso_date(value) -> date | None:
+    if value is None:
+        return None
+    try:
+        ts = pd.to_datetime(value, errors="coerce")
+        if pd.isna(ts):
+            return None
+        return ts.date()
+    except Exception:
+        return None
+
+
+def resolve_street_week_fw(
+    release_date,
+    weeks: list[tuple],
+    *,
+    stub_frac: float = FW_STUB_MAX_FRAC_OF_W2,
+) -> dict | None:
+    """
+    Pick first-week AE for an expected release.
+
+    ``weeks`` is chronological ``(week_ending_date, ae, streams, sales, songs)``.
+    Uses the Luminate chart week that contains ``release_date`` (week_end-6
+    through week_end). If that week's AE is <= ``stub_frac`` of the following
+    week's AE, the following week is used instead (pre-street leakage).
+    """
+    rel = _parse_iso_date(release_date)
+    if rel is None or not weeks:
+        return None
+
+    parsed: list[tuple] = []
+    for row in weeks:
+        we = _parse_iso_date(row[0])
+        if we is None:
+            continue
+        ae = float(row[1] or 0)
+        streams = float(row[2] or 0) if len(row) > 2 else 0.0
+        sales = float(row[3] or 0) if len(row) > 3 else 0.0
+        songs = float(row[4] or 0) if len(row) > 4 else 0.0
+        parsed.append((we, ae, streams, sales, songs))
+    if not parsed:
+        return None
+    parsed.sort(key=lambda r: r[0])
+
+    w1_idx = None
+    for i, (we, *_rest) in enumerate(parsed):
+        week_start = we - timedelta(days=6)
+        if week_start <= rel <= we:
+            w1_idx = i
+            break
+    if w1_idx is None:
+        for i, (we, *_rest) in enumerate(parsed):
+            if we >= rel:
+                w1_idx = i
+                break
+    if w1_idx is None:
+        return None
+
+    chosen = w1_idx
+    if w1_idx + 1 < len(parsed):
+        w1_ae = parsed[w1_idx][1]
+        w2_ae = parsed[w1_idx + 1][1]
+        days_apart = (parsed[w1_idx + 1][0] - parsed[w1_idx][0]).days
+        # Only treat the next metrics row as "week 2" when it is the next
+        # chart week (7 days). Gaps are missing data, not a stub-vs-street pair.
+        if days_apart == 7 and w2_ae > 0 and w1_ae <= stub_frac * w2_ae:
+            chosen = w1_idx + 1
+
+    we, ae, streams, sales, songs = parsed[chosen]
+    return {
+        "week_ending_date": we.strftime("%Y-%m-%d"),
+        "fw_vol": ae,
+        "fw_streams": streams,
+        "fw_sales": sales,
+        "fw_songs": songs,
+        "skipped_stub_week": chosen != w1_idx,
+    }
+
+
+def persist_expected_release_fw_vols(release_id: int | None = None) -> dict:
+    """
+    Write street-week fw_vol (+ component FW_* columns) onto EXPECTED_RELEASES.
+
+    Call after MARKETSHARE_RELEASE_METRICS is refreshed. Skips rows with no
+    usable metrics. Returns counts for logging.
+    """
+    stats = {"updated": 0, "skipped_no_metrics": 0, "skipped_stub": 0, "errors": 0}
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        ensure_expected_releases_fw_columns(conn)
+        cur = conn.cursor()
+        if release_id is not None:
+            rel_rows = cur.execute(
+                "SELECT RELEASE_ID, RELEASE_DATE FROM EXPECTED_RELEASES WHERE RELEASE_ID = ?",
+                (int(release_id),),
+            ).fetchall()
+        else:
+            rel_rows = cur.execute(
+                "SELECT RELEASE_ID, RELEASE_DATE FROM EXPECTED_RELEASES"
+            ).fetchall()
+
+        for rid, release_date in rel_rows:
+            weeks = cur.execute(
+                "SELECT WEEK_ENDING_DATE, ALBUM_EQUIVALENT, STREAMING_EQUIVALENT, "
+                "PRODUCT_SALES, SONG_SALE_EQUIVALENT "
+                "FROM MARKETSHARE_RELEASE_METRICS WHERE RELEASE_ID = ? "
+                "ORDER BY date(WEEK_ENDING_DATE) ASC",
+                (int(rid),),
+            ).fetchall()
+            resolved = resolve_street_week_fw(release_date, weeks)
+            if resolved is None:
+                stats["skipped_no_metrics"] += 1
+                continue
+            try:
+                cur.execute(
+                    "UPDATE EXPECTED_RELEASES SET "
+                    "EXPECTED_ALBUM_EQUIVALENT = ?, FW_STREAMS = ?, "
+                    "FW_SALES = ?, FW_SONGS = ? WHERE RELEASE_ID = ?",
+                    (
+                        resolved["fw_vol"],
+                        resolved["fw_streams"],
+                        resolved["fw_sales"],
+                        resolved["fw_songs"],
+                        int(rid),
+                    ),
+                )
+                stats["updated"] += 1
+                if resolved["skipped_stub_week"]:
+                    stats["skipped_stub"] += 1
+            except sqlite3.Error:
+                stats["errors"] += 1
+                logger.exception("persist_expected_release_fw_vols: failed id=%s", rid)
+        conn.commit()
+    logger.info("persist_expected_release_fw_vols: %s", stats)
+    return stats
 
 
 def _chunked(values: list[str], size: int) -> list[list[str]]:
@@ -641,6 +784,14 @@ def update_sqlite_main() -> None:
     # Commit and close connection
     sqlite_conn.commit()
     sqlite_conn.close()
+
+    # Street-week fw_vol on EXPECTED_RELEASES (chart week of RELEASE_DATE,
+    # skipping pre-street stubs). Stored so UI/boot do not recompute the 10%
+    # rule on every load.
+    try:
+        persist_expected_release_fw_vols()
+    except Exception:
+        logger.exception("sqlite_handler: persist_expected_release_fw_vols failed")
 
     # Rebuild the search-summary table from Snowflake. Daily-stream snapshot
     # data is fully replaced rather than merged so search results never carry
