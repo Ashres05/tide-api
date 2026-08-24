@@ -319,7 +319,13 @@ def main() -> int:
     p_ms = sub.add_parser("marketshare", help="Full marketshare sim + decay summary")
     _add_release_args(p_ms)
     p_ms.add_argument("--e-score", type=float, default=0.82, help="Conformal band width on forecast YTD")
-    p_ms.add_argument("--volume-threshold", type=float, default=75_000, help="Min weekly AE to dilute market")
+    p_ms.add_argument(
+        "--volume-threshold",
+        type=float,
+        default=20_000,
+        help="Catalog floor AE subtracted from 75k-book weekly volume "
+        "(inject max(0, weekly_AE - floor); default 20000)",
+    )
     p_ms.add_argument(
         "--weekly-all",
         action="store_true",

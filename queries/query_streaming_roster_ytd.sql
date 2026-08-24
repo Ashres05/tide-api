@@ -6,7 +6,8 @@
 -- Per-MRELG weekly worldwide streams use query_release_global_streaming.sql instead.
 --
 -- label_name is level_2 for most distributors; IGA / CMG use level_3.
--- Legacy Interscope/Geffen/A&M (and Interscope-Capitol) level_2 maps to IGA.
+-- Legacy level_2 Interscope/Geffen/A&M maps to IGA. Do not alias
+-- Interscope-Capitol — that name is IGA or CMG; only level_3 disambiguates.
 --
 -- LUMINATE_ARTIST_ID is the first Main Artist from VW_MUSICAL_RELEASE_GROUP_DS.ARTISTS
 -- (same ID as CURRENT_DEV.DATA.ARTIST_METADATA.LUMINATE_ARTIST_ID / artist_art/{id}.jpeg).
@@ -19,10 +20,7 @@ WITH mrelg_map AS (
         mrelg.artists,
         CASE
             WHEN i.level_3_distributor IN ('IGA', 'CMG') THEN i.level_3_distributor
-            WHEN i.level_2_distributor IN (
-                'Interscope/Geffen/A&M',
-                'Interscope-Capitol'
-            ) THEN 'IGA'
+            WHEN i.level_2_distributor = 'Interscope/Geffen/A&M' THEN 'IGA'
             ELSE i.level_2_distributor
         END AS label_group,
         i.level_1_distributor AS parent_group,

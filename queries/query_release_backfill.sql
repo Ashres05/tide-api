@@ -1,5 +1,7 @@
 -- Release backfill roster: one row per mrelg_id that cleared 75k AE.
 -- label_name is level_2 for most TARGET_LABELS; IGA / CMG use level_3.
+-- Legacy level_2 Interscope/Geffen/A&M maps to IGA. Do not alias
+-- Interscope-Capitol (ambiguous IGA vs CMG).
 -- {TARGET_LABELS} is injected from model.marketshare_labels.TARGET_LABELS.
 -- {RELEASE_DATE_FILTER} is optional (full vs incremental backfill).
 -- Excludes Various Artists (same artist set as query_streaming_roster_ytd.sql).
@@ -11,6 +13,7 @@ WITH mrelg_map AS (
         mrelg.release_type,
         CASE
             WHEN i.level_3_distributor IN ('IGA', 'CMG') THEN i.level_3_distributor
+            WHEN i.level_2_distributor = 'Interscope/Geffen/A&M' THEN 'IGA'
             ELSE i.level_2_distributor
         END AS label_group,
         ROW_NUMBER() OVER (
@@ -28,10 +31,12 @@ WITH mrelg_map AS (
     WHERE
         (
             i.level_2_distributor IN ({TARGET_LABELS})
+            OR i.level_2_distributor = 'Interscope/Geffen/A&M'
             OR i.level_3_distributor IN ('IGA', 'CMG')
         )
         AND CASE
             WHEN i.level_3_distributor IN ('IGA', 'CMG') THEN i.level_3_distributor
+            WHEN i.level_2_distributor = 'Interscope/Geffen/A&M' THEN 'IGA'
             ELSE i.level_2_distributor
         END IN ({TARGET_LABELS})
         AND i.is_current = TRUE

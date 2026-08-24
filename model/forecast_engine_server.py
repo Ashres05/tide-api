@@ -17,6 +17,10 @@ POST /simulate
       "enrich_w2_retention": true
     }
 
+  volume_threshold is a catalog floor for 75k-book titles
+  (inject max(0, weekly_AE - threshold)). Titles with W1/peak below 75k
+  are not injected.
+
   Simulation uses the archetypal engine: per-metric decay curves (streams / sales / songs),
   genre/label priors, Bear/Base/Bull multipliers, and optional request-body enrichment
   (product ratios, W2 retention) when provided.

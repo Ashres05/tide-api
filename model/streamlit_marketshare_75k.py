@@ -488,7 +488,14 @@ def main() -> None:
         streams_dir = st.text_input("Decay Artifacts directory (Streams)", value=str(default_streams))
         st.header("Simulation parameters")
         e_score = st.number_input("E-score (conformal band on forecast)", value=0.71, min_value=0.0, max_value=5.0, step=0.01)
-        vol_threshold = st.number_input("Injection threshold (AE / week to dilute market)", value=75000.0, min_value=0.0, step=1000.0)
+        vol_threshold = st.number_input(
+            "Catalog floor (AE subtracted from 75k-book weeks)",
+            value=20000.0,
+            min_value=0.0,
+            step=1000.0,
+            help="Inject max(0, weekly AE − this floor) for titles with W1/peak ≥ 75k. "
+            "Weeks below the floor stay in the catalog baseline (0 injected).",
+        )
         enrich = st.checkbox("Auto-enrich product ratios (artist history)", value=True)
         enrich_w2 = st.checkbox(
             "Adjust week-2+ tail using full65 W2/W1 (median per artist)",

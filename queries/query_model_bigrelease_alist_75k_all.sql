@@ -2,7 +2,11 @@
 -- {MIN_WEEK_END_DATE} is substituted from Python as the max WEEK_END_DATE
 -- currently in bigrelease_alist_75k_all.csv (or '2018-01-01' on a cold start).
 -- Upper bound excludes the in-progress week.
--- IGA / CMG are level_3 distributors; other labels remain level_2.
+--
+-- label_group must match query_streaming_roster_ytd.sql / query_release_backfill.sql:
+--   level_3 IGA/CMG as-is; legacy level_2 Interscope/Geffen/A&M → IGA;
+--   Atlantic Records → Atlantic Music Group; else level_2.
+-- Do not alias Interscope-Capitol (IGA vs CMG).
 WITH weekly_performance AS (
     SELECT
         da.week_end_date,
@@ -32,8 +36,12 @@ WITH weekly_performance AS (
 album_metadata AS (
     SELECT
         mrel.mrelg_id,
-        i.level_2_distributor,
-        i.level_3_distributor,
+        CASE
+            WHEN i.level_3_distributor IN ('IGA', 'CMG') THEN i.level_3_distributor
+            WHEN i.level_2_distributor = 'Interscope/Geffen/A&M' THEN 'IGA'
+            WHEN i.level_2_distributor IN ('Atlantic Music Group', 'Atlantic Records') THEN 'Atlantic Music Group'
+            ELSE i.level_2_distributor
+        END AS label_group,
         prod.display_artist
     FROM
         luminate_prod.extract_s.vw_mrel_mrelg_map_ds mrel
@@ -45,6 +53,7 @@ album_metadata AS (
             ON prod.mp_id = mp.mp_id
     WHERE
         i.country_code = 'US'
+        AND i.is_current = TRUE
         AND EXISTS (
             SELECT 1
             FROM weekly_performance wp
@@ -52,26 +61,46 @@ album_metadata AS (
         )
     QUALIFY ROW_NUMBER() OVER (
         PARTITION BY mrel.mrelg_id
-        ORDER BY i.mp_id
+        ORDER BY
+            IFF(
+                CASE
+                    WHEN i.level_3_distributor IN ('IGA', 'CMG') THEN i.level_3_distributor
+                    WHEN i.level_2_distributor = 'Interscope/Geffen/A&M' THEN 'IGA'
+                    WHEN i.level_2_distributor IN ('Atlantic Music Group', 'Atlantic Records') THEN 'Atlantic Music Group'
+                    ELSE i.level_2_distributor
+                END IN (
+                    'Warner Records',
+                    'Atlantic Music Group',
+                    'IGA',
+                    'CMG',
+                    'REPUBLIC Collective',
+                    'THE ORCHARD',
+                    'RCA Records',
+                    'Columbia Records'
+                ),
+                0,
+                1
+            ),
+            i.mp_id
     ) = 1
 )
 
 SELECT
     wp.week_end_date AS WEEK_END_DATE,
 
-    SUM(IFF(am.level_2_distributor = 'Warner Records', wp.equivalent_quantity, 0)) AS WARNER_ALBUMS,
-    SUM(IFF(am.level_2_distributor IN ('Atlantic Music Group', 'Atlantic Records'), wp.equivalent_quantity, 0)) AS AMG_ALBUMS,
-    SUM(IFF(am.level_3_distributor = 'IGA', wp.equivalent_quantity, 0)) AS IGA_ALBUMS,
-    SUM(IFF(am.level_3_distributor = 'CMG', wp.equivalent_quantity, 0)) AS CMG_ALBUMS,
-    SUM(IFF(am.level_2_distributor = 'REPUBLIC Collective', wp.equivalent_quantity, 0)) AS REPUBLIC_ALBUMS,
-    SUM(IFF(am.level_2_distributor = 'THE ORCHARD', wp.equivalent_quantity, 0)) AS ORCHARD_ALBUMS,
-    SUM(IFF(am.level_2_distributor = 'RCA Records', wp.equivalent_quantity, 0)) AS RCA_ALBUMS,
-    SUM(IFF(am.level_2_distributor = 'Columbia Records', wp.equivalent_quantity, 0)) AS COLUMBIA_ALBUMS,
+    SUM(IFF(am.label_group = 'Warner Records', wp.equivalent_quantity, 0)) AS WARNER_ALBUMS,
+    SUM(IFF(am.label_group = 'Atlantic Music Group', wp.equivalent_quantity, 0)) AS AMG_ALBUMS,
+    SUM(IFF(am.label_group = 'IGA', wp.equivalent_quantity, 0)) AS IGA_ALBUMS,
+    SUM(IFF(am.label_group = 'CMG', wp.equivalent_quantity, 0)) AS CMG_ALBUMS,
+    SUM(IFF(am.label_group = 'REPUBLIC Collective', wp.equivalent_quantity, 0)) AS REPUBLIC_ALBUMS,
+    SUM(IFF(am.label_group = 'THE ORCHARD', wp.equivalent_quantity, 0)) AS ORCHARD_ALBUMS,
+    SUM(IFF(am.label_group = 'RCA Records', wp.equivalent_quantity, 0)) AS RCA_ALBUMS,
+    SUM(IFF(am.label_group = 'Columbia Records', wp.equivalent_quantity, 0)) AS COLUMBIA_ALBUMS,
 
     SUM(wp.equivalent_quantity) AS MARKET_ALBUMS,
 
     MAX(IFF(
-        am.level_2_distributor = 'Warner Records'
+        am.label_group = 'Warner Records'
         AND LOWER(am.display_artist) NOT LIKE '%various%'
         AND wp.first_sale_date >= DATEADD(MONTH, -18, CURRENT_DATE())
         AND wp.first_sale_date BETWEEN DATEADD(DAY, -7, wp.week_end_date) AND wp.week_end_date,
@@ -79,7 +108,7 @@ SELECT
     )) AS BIG_RELEASE_WARNER,
 
     MAX(IFF(
-        am.level_2_distributor IN ('Atlantic Music Group', 'Atlantic Records')
+        am.label_group = 'Atlantic Music Group'
         AND LOWER(am.display_artist) NOT LIKE '%various%'
         AND wp.first_sale_date >= DATEADD(MONTH, -18, CURRENT_DATE())
         AND wp.first_sale_date BETWEEN DATEADD(DAY, -7, wp.week_end_date) AND wp.week_end_date,
@@ -87,7 +116,7 @@ SELECT
     )) AS BIG_RELEASE_ATLANTIC,
 
     MAX(IFF(
-        am.level_3_distributor = 'IGA'
+        am.label_group = 'IGA'
         AND LOWER(am.display_artist) NOT LIKE '%various%'
         AND wp.first_sale_date >= DATEADD(MONTH, -18, CURRENT_DATE())
         AND wp.first_sale_date BETWEEN DATEADD(DAY, -7, wp.week_end_date) AND wp.week_end_date,
@@ -95,7 +124,7 @@ SELECT
     )) AS BIG_RELEASE_IGA,
 
     MAX(IFF(
-        am.level_3_distributor = 'CMG'
+        am.label_group = 'CMG'
         AND LOWER(am.display_artist) NOT LIKE '%various%'
         AND wp.first_sale_date >= DATEADD(MONTH, -18, CURRENT_DATE())
         AND wp.first_sale_date BETWEEN DATEADD(DAY, -7, wp.week_end_date) AND wp.week_end_date,
@@ -103,7 +132,7 @@ SELECT
     )) AS BIG_RELEASE_CMG,
 
     MAX(IFF(
-        am.level_2_distributor = 'REPUBLIC Collective'
+        am.label_group = 'REPUBLIC Collective'
         AND LOWER(am.display_artist) NOT LIKE '%various%'
         AND wp.first_sale_date >= DATEADD(MONTH, -18, CURRENT_DATE())
         AND wp.first_sale_date BETWEEN DATEADD(DAY, -7, wp.week_end_date) AND wp.week_end_date,
@@ -111,7 +140,7 @@ SELECT
     )) AS BIG_RELEASE_REPUBLIC,
 
     MAX(IFF(
-        am.level_2_distributor = 'THE ORCHARD'
+        am.label_group = 'THE ORCHARD'
         AND LOWER(am.display_artist) NOT LIKE '%various%'
         AND wp.first_sale_date >= DATEADD(MONTH, -18, CURRENT_DATE())
         AND wp.first_sale_date BETWEEN DATEADD(DAY, -7, wp.week_end_date) AND wp.week_end_date,
@@ -119,7 +148,7 @@ SELECT
     )) AS BIG_RELEASE_ORCHARD,
 
     MAX(IFF(
-        am.level_2_distributor = 'RCA Records'
+        am.label_group = 'RCA Records'
         AND LOWER(am.display_artist) NOT LIKE '%various%'
         AND wp.first_sale_date >= DATEADD(MONTH, -18, CURRENT_DATE())
         AND wp.first_sale_date BETWEEN DATEADD(DAY, -7, wp.week_end_date) AND wp.week_end_date,
@@ -127,7 +156,7 @@ SELECT
     )) AS BIG_RELEASE_RCA,
 
     MAX(IFF(
-        am.level_2_distributor = 'Columbia Records'
+        am.label_group = 'Columbia Records'
         AND LOWER(am.display_artist) NOT LIKE '%various%'
         AND wp.first_sale_date >= DATEADD(MONTH, -18, CURRENT_DATE())
         AND wp.first_sale_date BETWEEN DATEADD(DAY, -7, wp.week_end_date) AND wp.week_end_date,

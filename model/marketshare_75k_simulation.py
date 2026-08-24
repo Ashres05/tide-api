@@ -41,8 +41,8 @@ def _inject_col_for_owner(owner: str) -> str:
 
 def _resolve_inject_col(label: str) -> str:
     """Map release label to an injection column (TARGET_LABELS or Other)."""
-    # Legacy Interscope names → IGA (level_3 split)
-    if label in ("Interscope/Geffen/A&M", "Interscope-Capitol"):
+    # Legacy level_2 name for IGA. Interscope-Capitol is IGA or CMG — do not guess.
+    if label == "Interscope/Geffen/A&M":
         label = "IGA"
     if label in TARGET_LABELS:
         return _inject_col_for_owner(label)
@@ -595,12 +595,20 @@ def run_archetype_scenario(
     artifacts_sales: SimulatorArtifacts,   
     artifacts_songs: SimulatorArtifacts,
     e_score: float = 0.8,
-    volume_threshold: float = 75000,
+    volume_threshold: float = 20000,
     *,
     artifacts_streams_singles: Optional[SimulatorArtifacts] = None,
     artifacts_sales_singles: Optional[SimulatorArtifacts] = None,
     artifacts_songs_singles: Optional[SimulatorArtifacts] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Stitch 2026 actuals to a catalog baseline plus 75k-book injection.
+
+    ``volume_threshold`` is a catalog floor (AE), not a binary include gate.
+    Titles with W1/peak below 75k are not injected. For the 75k book, each
+    future week contributes ``max(0, weekly_AE - volume_threshold)``.
+    Production passes 20_000.
+    """
     
     max_hist_date = actuals_2026["Week Ending Date"].max()
     fut_sim = df_full[
@@ -622,7 +630,9 @@ def run_archetype_scenario(
         fw_vol = release_peak_w1_vol(release_dict)
         if pd.isna(drop_date) or not drop_date or fw_vol <= 0:
             return None
-            
+        # 75k book: W1/peak >= 75k. Sub-75k titles stay in catalog Prophet.
+        in_75k_book = float(fw_vol) >= 75_000.0
+
         req_date = pd.to_datetime(drop_date)
         full_curve = generate_archetype_decay_curve(
             release_dict,
@@ -644,11 +654,15 @@ def run_archetype_scenario(
                 if week_idx < len(full_curve):
                     weekly_vol = full_curve[week_idx]
                     temp_curve_rows.append({"Week Ending Date": current_date, release_name: weekly_vol})
-                    
-                    # --- UPDATE: Only inject into marketshare if the date is in the future! ---
-                    if weekly_vol >= volume_threshold and current_date > max_hist_date:
-                        mask = fut_sim["Week Ending Date"] == current_date
-                        fut_sim.loc[mask, label_col] += weekly_vol
+
+                    # Future marketshare: only the 75k book. Catalog already owns
+                    # ~volume_threshold AE of those titles (API default 20k).
+                    # Inject excess so a 73k week is +53k and a 15k week stays 0.
+                    if in_75k_book and current_date > max_hist_date:
+                        excess = max(0.0, float(weekly_vol) - float(volume_threshold))
+                        if excess > 0:
+                            mask = fut_sim["Week Ending Date"] == current_date
+                            fut_sim.loc[mask, label_col] += excess
         return pd.DataFrame(temp_curve_rows) if temp_curve_rows else None
 
     volume_report_data = []

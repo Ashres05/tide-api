@@ -380,6 +380,28 @@ def conformal_e80_2026(
     return float(np.percentile(all_errors, 80))
 
 
+def _catalog_recency_params() -> Tuple[int, float]:
+    """
+    Post-fit overlay on remaining-year catalog share.
+
+    TIDE_CATALOG_RECENCY_WEEKS — last N scrubbed weeks (default 8).
+    TIDE_CATALOG_RECENCY_ALPHA — weight on that mean vs LGBM/Prophet ensemble
+    (default 0.5). Alpha 0 is the unblended ensemble (legacy behavior).
+    """
+    weeks_raw = os.environ.get("TIDE_CATALOG_RECENCY_WEEKS", "8").strip()
+    alpha_raw = os.environ.get("TIDE_CATALOG_RECENCY_ALPHA", "0.5").strip()
+    try:
+        weeks = max(1, int(weeks_raw))
+    except ValueError:
+        weeks = 8
+    try:
+        alpha = float(alpha_raw)
+    except ValueError:
+        alpha = 0.5
+    alpha = min(1.0, max(0.0, alpha))
+    return weeks, alpha
+
+
 def forecast_baseline_future(
     df_model: pd.DataFrame,
     weekly_amg_int: pd.DataFrame,
@@ -389,6 +411,12 @@ def forecast_baseline_future(
     week_freq: str = "W-THU",
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Returns (future_label_df, future_market_volumes) using an autoregressive loop."""
+    recency_weeks, recency_alpha = _catalog_recency_params()
+    logger.info(
+        "forecast_baseline_future: catalog recency weeks=%d alpha=%.3f",
+        recency_weeks,
+        recency_alpha,
+    )
     last_date = pd.to_datetime(df_model["Week Ending Date"].max())
     end_dt = pd.to_datetime(end_of_year)
     remaining_weeks = pd.date_range(start=last_date + pd.Timedelta(days=7), end=end_dt, freq=week_freq)
@@ -417,6 +445,7 @@ def forecast_baseline_future(
         # Keep the last 4 weeks of volume in a list to seed the rolling averages
         recent_vols = list(label_history.tail(4)["AE_Volume"].values)
         recent_comp = list(label_history.tail(4)["Competitor_AE_Volume"].values)
+        recent_share = float(label_history.tail(recency_weeks)["AE_Share"].mean())
 
         temp_rows = []
         for i, week_dt in enumerate(remaining_weeks):
@@ -440,7 +469,10 @@ def forecast_baseline_future(
             # Predict Prophet
             prophet_pred = float(production_prophet_models[label].predict(pd.DataFrame({"ds": [week_dt]}))["yhat"].iloc[0])
 
-            pred_weekly_share = (lgbm_pred + prophet_pred) / 2
+            ensemble = (lgbm_pred + prophet_pred) / 2
+            pred_weekly_share = (
+                (1.0 - recency_alpha) * ensemble + recency_alpha * recent_share
+            )
 
             temp_rows.append({
                 "Week Ending Date": week_dt,
@@ -990,6 +1022,8 @@ def main() -> None:
         "target_labels": TARGET_LABELS,
         "spike_features": spike_features,
         "end_of_year": args.end_of_year,
+        "catalog_recency_weeks": _catalog_recency_params()[0],
+        "catalog_recency_alpha": _catalog_recency_params()[1],
     }
     with open(art_dir / "metadata.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
@@ -1227,6 +1261,8 @@ def train_artifacts_main(*, csv_only: bool = False) -> None:
         "target_labels": TARGET_LABELS,
         "spike_features": spike_features,
         "end_of_year": end_of_year,
+        "catalog_recency_weeks": _catalog_recency_params()[0],
+        "catalog_recency_alpha": _catalog_recency_params()[1],
     }
     with open(art_dir / "metadata.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
