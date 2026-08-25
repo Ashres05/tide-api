@@ -1,12 +1,14 @@
 -- SQLite's sqlite3.Cursor.execute() permits only one statement per call, so
--- this file must contain exactly one DDL. The supporting popularity-ordered
--- index (IDX_MARKETSHARE_SEARCH_SUMMARY_SINGLES_STREAMS) is created idempotently in
+-- this file must contain exactly one DDL. Supporting indexes (streams,
+-- LUMINATE_ARTIST_ID) are created idempotently in
 -- ensure_marketshare_search_summary_singles_columns() in sqlite_handler.py, which
 -- runs immediately after this CREATE TABLE.
 CREATE TABLE IF NOT EXISTS MARKETSHARE_SEARCH_SUMMARY_SINGLES (
     MRELG_ID TEXT PRIMARY KEY,
     TITLE TEXT,
     ARTIST TEXT,
+    LUMINATE_ARTIST_ID TEXT,
+    RELEASE_TYPE TEXT,
     LABEL_NAME TEXT,
     RELEASE_DATE DATE,
     GENRE TEXT,

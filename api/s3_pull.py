@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
@@ -321,8 +322,29 @@ def sync_artifacts_from_s3_if_configured(
             db_key = root_db_key
         try:
             db_head = client.head_object(Bucket=bucket, Key=db_key)
-            download_key(db_key, root / "marketshare_data.db",
-                         expected_size=db_head.get("ContentLength"))
+            dest = root / "marketshare_data.db"
+            s3_mt = db_head.get("LastModified")
+            # Same mtime guard as CSV/parquet trees. Size-only skip is not
+            # enough: a filled artist index can differ in size from S3, and
+            # tmp.replace() would unlink the live file (search wipe).
+            if dest.is_file() and s3_mt is not None:
+                local_mt = datetime.fromtimestamp(dest.stat().st_mtime, tz=timezone.utc)
+                remote_mt = s3_mt if s3_mt.tzinfo else s3_mt.replace(tzinfo=timezone.utc)
+                if local_mt >= remote_mt:
+                    logger.info(
+                        "S3 pull: skip %s (local mtime %s >= s3 %s)",
+                        dest.name,
+                        local_mt.isoformat(),
+                        remote_mt.isoformat(),
+                    )
+                else:
+                    download_key(
+                        db_key, dest, expected_size=db_head.get("ContentLength")
+                    )
+            else:
+                download_key(
+                    db_key, dest, expected_size=db_head.get("ContentLength")
+                )
         except ClientError as e:
             logger.warning("S3 pull: database object missing: s3://%s/%s (%s)",
                            bucket, db_key, e)
@@ -383,6 +405,19 @@ def sync_artifacts_to_s3_if_configured(
         logger.info("S3 push: %s -> s3://%s/%s", path, bucket, key)
         client.upload_file(str(path), bucket, key)
 
+    def _checkpoint_sqlite(path: Path) -> None:
+        if not path.is_file():
+            return
+        try:
+            with sqlite3.connect(str(path)) as conn:
+                conn.execute("PRAGMA wal_checkpoint(FULL)")
+        except sqlite3.Error:
+            logger.warning(
+                "S3 push: wal_checkpoint failed for %s; uploading anyway",
+                path,
+                exc_info=True,
+            )
+
     def _upload_tree(local_dir: Path, s3_sub: str, suffix_filter: Optional[set[str]] = None) -> int:
         if not local_dir.exists():
             return 0
@@ -406,8 +441,9 @@ def sync_artifacts_to_s3_if_configured(
         return n
 
     if SCOPE_DB in selected:
-        upload_file(root / "marketshare_data.db",
-                    f"{pfx}marketshare_data.db".replace("//", "/"))
+        db_path = root / "marketshare_data.db"
+        _checkpoint_sqlite(db_path)
+        upload_file(db_path, f"{pfx}marketshare_data.db".replace("//", "/"))
 
     if SCOPE_CSVS in selected:
         _upload_tree(root / _MODEL_DATA_REL, "model/data/", suffix_filter={".csv"})

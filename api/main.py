@@ -1,5 +1,6 @@
 from __future__ import annotations
 from contextlib import asynccontextmanager
+import logging
 import sys
 from pathlib import Path
 
@@ -31,8 +32,15 @@ except ModuleNotFoundError:
 async def lifespan(_app: FastAPI):
     """Pull from S3: db, model/data/*.csv (e.g. current_data_all), artifacts_75k, archetypes."""
     from api.s3_pull import sync_serving_inputs_from_s3
+    from sqlite_handler import ensure_marketshare_search_artists_index
 
     sync_serving_inputs_from_s3()
+    try:
+        ensure_marketshare_search_artists_index()
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "startup: artist search index rebuild failed"
+        )
     yield
 
 
@@ -722,7 +730,8 @@ def artist_art(luminate_artist_id: str):
     Stream the artist profile image for a Luminate artist id from
     ``s3://<bucket>/artist_art/{LUMINATE_ARTIST_ID}.jpeg``.
 
-    Pair with ``LUMINATE_ARTIST_ID`` from ``GET /v1/revenue/streaming_roster``.
+    Pair with ``LUMINATE_ARTIST_ID`` from ``GET /v1/revenue/search_artists``
+    or ``GET /v1/revenue/streaming_roster``.
     Returns 404 when no image has been uploaded — frontend should use a
     placeholder on load error. Cached at the edge for one day.
     """
@@ -763,6 +772,47 @@ def weekly_marketshare(week_ending_date: str | None = None):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/v1/revenue/search_artists")
+def search_artists(
+    q: str = "",
+    limit: int = 20,
+):
+    """
+    Artist typeahead. Queries MARKETSHARE_SEARCH_ARTISTS only (one row per
+    LUMINATE_ARTIST_ID, rebuilt when the search snapshots refresh). Does not
+    scan albums, singles, or EPs.
+
+    Pair artwork with ``GET /v1/artist_art/{luminate_artist_id}``. The artist
+    page should load discography by that id (not the streaming roster).
+    """
+    try:
+        payload = model_handler.search_artists_json(q=q, limit=limit)
+        return Response(content=payload, media_type="application/json")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v1/revenue/releases_by_artist/{luminate_artist_id}")
+def releases_by_artist(luminate_artist_id: str):
+    """
+    Artist-page discography: albums, EPs, and singles in the search snapshots
+    for this LUMINATE_ARTIST_ID. Does not use STREAMING_ROSTER_2026.
+
+    Each row: mrelg_id, title, artist, product_type, release_date,
+    daily_global_streams, forecast_route (``album`` vs ``singles`` for the
+    weekly-stream endpoints). Ordered by daily worldwide streams descending.
+    """
+    try:
+        payload = model_handler.get_releases_by_artist_json(luminate_artist_id)
+        return Response(content=payload, media_type="application/json")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/v1/revenue/search_global_streaming")
 def search_global_streaming(
     artist: str = "",
@@ -772,9 +822,11 @@ def search_global_streaming(
     """
     Search the local MARKETSHARE_SEARCH_SUMMARY table for the best-matching
     Luminate releases given a free-text artist and album title. Returns a
-    ranked list of candidates (each carrying its `mrelg_id`) so the front
-    end can call /v1/releases/global_streaming_by_mrelg/{mrelg_id} without
-    ever exposing the MRELG lookup to the user.
+    ranked list of candidates (each carrying its `mrelg_id` and
+    `luminate_artist_id` when the snapshot has been refreshed) so the front
+    end can open an artist page or call
+    /v1/releases/global_streaming_by_mrelg/{mrelg_id} without ever exposing
+    the MRELG lookup to the user.
 
     Ranking: weighted blend of fuzzy text match and log-scaled daily streams
     (text-dominant by default) so popular releases bubble up but never drown

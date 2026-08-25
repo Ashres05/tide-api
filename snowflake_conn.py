@@ -110,6 +110,38 @@ class Snowflake:
                 except Exception:
                     pass
 
+    def iter_query(self, sql: str, chunksize: int = 25000):
+        """
+        Yield DataFrame chunks from a Snowflake SELECT without materializing
+        the full result. Used for search-snapshot rebuilds (millions of rows).
+        """
+        if not self.conn:
+            raise SnowflakeConnectionError("Snowflake connection is not established.")
+        if chunksize < 1:
+            raise ValueError("chunksize must be a positive integer.")
+
+        cursor = self.conn.cursor()
+        try:
+            cursor.arraysize = int(chunksize)
+            cursor.execute(sql)
+            if cursor.description is None:
+                return
+            cols = [col[0] for col in cursor.description]
+            while True:
+                batch = cursor.fetchmany(int(chunksize))
+                if not batch:
+                    break
+                yield pd.DataFrame.from_records(batch, columns=cols)
+        except snowflake.connector.errors.ProgrammingError as e:
+            raise SnowflakeConnectionError(f"An error occurred while executing the query: {e}")
+        except Exception as e:
+            raise SnowflakeConnectionError(f"Unexpected error: {e}")
+        finally:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+
 
 class SnowflakeConnectionError(Exception):
     """

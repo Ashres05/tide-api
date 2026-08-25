@@ -19,6 +19,9 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 from sqlite_handler import (
     DATABASE_NAME,
     ensure_expected_releases_fw_columns,
+    ensure_marketshare_search_artists_table,
+    ensure_marketshare_search_summary_columns,
+    ensure_marketshare_search_summary_singles_columns,
     ensure_streaming_roster_2026_table,
     refresh_marketshare_search_summary,
     refresh_marketshare_search_summary_singles,
@@ -94,6 +97,7 @@ _WORLDWIDE_STREAMING_PRODUCT_SINGLE = "single"
 MARKETSHARE_RELEASE_METRICS_TABLE = "MARKETSHARE_RELEASE_METRICS"
 MARKETSHARE_SEARCH_SUMMARY_TABLE = "MARKETSHARE_SEARCH_SUMMARY"
 MARKETSHARE_SEARCH_SUMMARY_SINGLES_TABLE = "MARKETSHARE_SEARCH_SUMMARY_SINGLES"
+MARKETSHARE_SEARCH_ARTISTS_TABLE = "MARKETSHARE_SEARCH_ARTISTS"
 
 # Query names for the database.
 RELEASE_CREATE_QUERY = "release_create.sql"
@@ -105,6 +109,7 @@ MARKETSHARE_ACTUALS_QUERY = "select_marketshare_actuals.sql"
 MARKETSHARE_WEEKLY_ACTUALS_QUERY = "select_marketshare_weekly_actuals.sql"
 MRELG_METADATA_QUERY = "query_mrelg_id.sql"
 RELEASE_BACKFILL_QUERY = "query_release_backfill.sql"
+RELEASES_BY_ARTIST_QUERY = "query_releases_by_artist.sql"
 STREAMING_ROSTER_YTD_QUERY = "query_streaming_roster_ytd.sql"
 ROSTER_MAIN_ARTIST_IDS_QUERY = "query_roster_main_artist_ids.sql"
 GLOBAL_STREAMING_QUERY = "query_release_global_streaming.sql"
@@ -2466,6 +2471,7 @@ _SEARCH_TEXT_FLOOR = 0.30  # rows with text similarity below this are dropped
 _SEARCH_MIN_TOKEN_LEN = 2
 _SEARCH_CANDIDATE_LIMIT = 8000
 _SEARCH_FALLBACK_TOPK = 2000  # used when no usable tokens exist (e.g. all 1-char)
+_ARTIST_SEARCH_CANDIDATE_LIMIT = 500
 
 
 def _normalize_search_text(value: Any) -> str:
@@ -2492,6 +2498,19 @@ def _text_similarity(a: str, b: str) -> float:
         jaccard = 0.0
 
     return max(seq, jaccard)
+
+
+def _row_luminate_artist_id(row: sqlite3.Row) -> Optional[str]:
+    """First Main Artist ID from a search-summary row, or None if unset."""
+    if "LUMINATE_ARTIST_ID" not in row.keys():
+        return None
+    raw = row["LUMINATE_ARTIST_ID"]
+    if raw is None:
+        return None
+    value = str(raw).strip()
+    if not value or value.lower() in {"none", "nan"}:
+        return None
+    return value
 
 
 def _search_tokens(*texts: str) -> List[str]:
@@ -2533,14 +2552,19 @@ def _fetch_search_candidates(
     tokens = _search_tokens(artist_norm, title_norm)
 
     fetch_sql = (
-        "SELECT MRELG_ID, TITLE, ARTIST, LABEL_NAME, RELEASE_DATE, GENRE, "
-        "DAILY_GLOBAL_STREAMS, ARTIST_SEARCH, TITLE_SEARCH "
+        "SELECT MRELG_ID, TITLE, ARTIST, LUMINATE_ARTIST_ID, LABEL_NAME, "
+        "RELEASE_DATE, GENRE, DAILY_GLOBAL_STREAMS, ARTIST_SEARCH, TITLE_SEARCH "
         f"FROM {search_table}"
     )
 
     try:
         with sqlite3.connect(DATABASE_NAME) as conn:
             conn.row_factory = sqlite3.Row
+            if search_table == MARKETSHARE_SEARCH_SUMMARY_SINGLES_TABLE:
+                ensure_marketshare_search_summary_singles_columns(conn)
+            else:
+                ensure_marketshare_search_summary_columns(conn)
+            conn.commit()
             cur = conn.cursor()
 
             normalized_columns_present = _has_normalized_search_columns(
@@ -2760,6 +2784,7 @@ def search_releases_by_artist_title(
                     "mrelg_id": row["MRELG_ID"],
                     "title": row["TITLE"],
                     "artist": row["ARTIST"],
+                    "luminate_artist_id": _row_luminate_artist_id(row),
                     "label_name": row["LABEL_NAME"],
                     "release_date": row["RELEASE_DATE"],
                     "genre": row["GENRE"],
@@ -2852,6 +2877,269 @@ def search_releases_by_artist_title_singles_json(
     return json.dumps(
         search_releases_by_artist_title_singles(artist, title, limit=limit)
     )
+
+
+def _fetch_artist_search_candidates(
+    artist_norm: str,
+    span: Dict[str, Any],
+) -> List[sqlite3.Row]:
+    """
+    Prefilter MARKETSHARE_SEARCH_ARTISTS only. Tokens must all match the
+    normalized artist name (AND). Prefer prefix / token-boundary matches so
+    the ARTIST_SEARCH index can help; fall back to contains if that is empty.
+    """
+    tokens = _search_tokens(artist_norm)
+    fetch_sql = (
+        "SELECT LUMINATE_ARTIST_ID, ARTIST, ARTIST_SEARCH, "
+        "DAILY_GLOBAL_STREAMS, RELEASE_COUNT, HAS_ARTWORK "
+        f"FROM {MARKETSHARE_SEARCH_ARTISTS_TABLE}"
+    )
+    try:
+        with sqlite3.connect(DATABASE_NAME) as conn:
+            conn.row_factory = sqlite3.Row
+            ensure_marketshare_search_artists_table(conn)
+            conn.commit()
+            cur = conn.cursor()
+            if not tokens:
+                with _perf_phase(
+                    span, "db_fetch", endpoint="search_artists", mode="empty_query"
+                ) as info:
+                    info["rows"] = 0
+                return []
+
+            prefix_clauses: List[str] = []
+            prefix_params: List[Any] = []
+            contains_clauses: List[str] = []
+            contains_params: List[Any] = []
+            for tok in tokens:
+                prefix_clauses.append("(ARTIST_SEARCH LIKE ? OR ARTIST_SEARCH LIKE ?)")
+                prefix_params.extend([f"{tok}%", f"% {tok}%"])
+                contains_clauses.append("ARTIST_SEARCH LIKE ?")
+                contains_params.append(f"%{tok}%")
+
+            def _run(where_sql: str, params: List[Any], mode: str) -> List[sqlite3.Row]:
+                sql = (
+                    f"{fetch_sql} WHERE {where_sql} "
+                    "ORDER BY DAILY_GLOBAL_STREAMS DESC LIMIT ?"
+                )
+                run_params = list(params) + [_ARTIST_SEARCH_CANDIDATE_LIMIT]
+                with _perf_phase(
+                    span, "db_fetch", endpoint="search_artists", mode=mode
+                ) as info:
+                    info["tokens"] = len(tokens)
+                    cur.execute(sql, run_params)
+                    rows = cur.fetchall()
+                    info["rows"] = len(rows)
+                return rows
+
+            rows = _run(" AND ".join(prefix_clauses), prefix_params, "prefix")
+            if rows:
+                return rows
+            return _run(" AND ".join(contains_clauses), contains_params, "contains")
+    except sqlite3.Error as e:
+        raise sqlite3.Error(
+            f"Error querying {MARKETSHARE_SEARCH_ARTISTS_TABLE}: {e}"
+        ) from e
+
+
+def search_artists(
+    q: str,
+    limit: int = _SEARCH_DEFAULT_LIMIT,
+) -> List[Dict[str, Any]]:
+    """
+    Typeahead over MARKETSHARE_SEARCH_ARTISTS (one row per LUMINATE_ARTIST_ID).
+
+    Does not scan album/single/EP snapshot tables. Ranking is the same
+    text-dominant blend as release search, on artist name only.
+    """
+    if not isinstance(q, str):
+        q = "" if q is None else str(q)
+    q = q.strip()
+    if not q:
+        raise ValueError("q is required.")
+    if limit is None:
+        limit = _SEARCH_DEFAULT_LIMIT
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError) as e:
+        raise ValueError("limit must be a positive integer.") from e
+    if limit < 1:
+        raise ValueError("limit must be a positive integer.")
+    limit = min(limit, 100)
+
+    span: Dict[str, Any] = {}
+    t_start = _now()
+    artist_norm = _normalize_search_text(q)
+    rows = _fetch_artist_search_candidates(artist_norm, span)
+
+    if not rows:
+        _perf_summary(
+            span,
+            endpoint="search_artists",
+            t_start=t_start,
+            results=0,
+            candidates=0,
+        )
+        return []
+
+    candidates: List[Dict[str, Any]] = []
+    with _perf_phase(span, "score", endpoint="search_artists") as info:
+        info["pool"] = len(rows)
+        for row in rows:
+            row_norm = (
+                row["ARTIST_SEARCH"]
+                if "ARTIST_SEARCH" in row.keys() and row["ARTIST_SEARCH"]
+                else _normalize_search_text(row["ARTIST"])
+            )
+            artist_score = _text_similarity(artist_norm, row_norm)
+            if artist_score < _SEARCH_TEXT_FLOOR:
+                continue
+            try:
+                daily_streams = float(row["DAILY_GLOBAL_STREAMS"] or 0)
+            except (TypeError, ValueError):
+                daily_streams = 0.0
+            try:
+                release_count = int(row["RELEASE_COUNT"] or 0)
+            except (TypeError, ValueError):
+                release_count = 0
+            has_art = False
+            if "HAS_ARTWORK" in row.keys() and row["HAS_ARTWORK"] is not None:
+                has_art = bool(int(row["HAS_ARTWORK"]))
+            candidates.append(
+                {
+                    "luminate_artist_id": _row_luminate_artist_id(row),
+                    "artist": row["ARTIST"],
+                    "daily_global_streams": int(daily_streams),
+                    "release_count": release_count,
+                    "has_artwork": has_art,
+                    "artist_score": round(float(artist_score), 4),
+                    "_raw_streams": daily_streams,
+                }
+            )
+        info["matched"] = len(candidates)
+
+    if not candidates:
+        _perf_summary(
+            span,
+            endpoint="search_artists",
+            t_start=t_start,
+            results=0,
+            candidates=len(rows),
+        )
+        return []
+
+    with _perf_phase(span, "rank", endpoint="search_artists") as info:
+        max_log_streams = max(math.log1p(c["_raw_streams"]) for c in candidates)
+        if max_log_streams <= 0:
+            max_log_streams = 1.0
+        for c in candidates:
+            stream_score = math.log1p(c["_raw_streams"]) / max_log_streams
+            c["stream_score"] = round(float(stream_score), 4)
+            c["combined_score"] = round(
+                float(
+                    _SEARCH_TEXT_WEIGHT * c["artist_score"]
+                    + _SEARCH_STREAM_WEIGHT * stream_score
+                ),
+                4,
+            )
+            c.pop("_raw_streams", None)
+        candidates.sort(
+            key=lambda x: (
+                x["combined_score"],
+                x["artist_score"],
+                x["daily_global_streams"],
+            ),
+            reverse=True,
+        )
+        info["matched"] = len(candidates)
+
+    results = [c for c in candidates if c.get("luminate_artist_id")][:limit]
+    _perf_summary(
+        span,
+        endpoint="search_artists",
+        t_start=t_start,
+        results=len(results),
+        candidates=len(rows),
+    )
+    return results
+
+
+def search_artists_json(q: str, limit: int = _SEARCH_DEFAULT_LIMIT) -> str:
+    """JSON-serialized artist typeahead for the API layer."""
+    return json.dumps(search_artists(q, limit=limit))
+
+
+def get_releases_by_artist(luminate_artist_id: str) -> List[Dict[str, Any]]:
+    """
+    Artist-page discography from the search snapshots (albums, EPs, singles).
+
+    Does not read STREAMING_ROSTER_2026. Empty list when the artist id is
+    unknown or the snapshots have not been refreshed with LUMINATE_ARTIST_ID.
+    """
+    if not isinstance(luminate_artist_id, str):
+        luminate_artist_id = "" if luminate_artist_id is None else str(luminate_artist_id)
+    artist_id = luminate_artist_id.strip()
+    if not artist_id:
+        raise ValueError("luminate_artist_id is required.")
+
+    span: Dict[str, Any] = {}
+    t_start = _now()
+    try:
+        with sqlite3.connect(DATABASE_NAME) as conn:
+            conn.row_factory = sqlite3.Row
+            ensure_marketshare_search_summary_columns(conn)
+            ensure_marketshare_search_summary_singles_columns(conn)
+            conn.commit()
+            cur = conn.cursor()
+            with _perf_phase(
+                span, "db_fetch", endpoint="releases_by_artist"
+            ) as info:
+                cur.execute(
+                    load_sql(RELEASES_BY_ARTIST_QUERY),
+                    (artist_id, artist_id),
+                )
+                rows = cur.fetchall()
+                info["rows"] = len(rows)
+    except sqlite3.Error as e:
+        raise sqlite3.Error(
+            f"Error querying releases for artist {artist_id}: {e}"
+        ) from e
+
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        product_type = row["PRODUCT_TYPE"]
+        try:
+            daily_streams = int(row["DAILY_GLOBAL_STREAMS"] or 0)
+        except (TypeError, ValueError):
+            daily_streams = 0
+        release_date = row["RELEASE_DATE"]
+        if release_date is not None:
+            release_date = str(release_date).split(" ")[0]
+        out.append(
+            {
+                "mrelg_id": row["MRELG_ID"],
+                "title": row["TITLE"],
+                "artist": row["ARTIST"],
+                "product_type": product_type,
+                "release_date": release_date,
+                "daily_global_streams": daily_streams,
+                "forecast_route": streaming_forecast_route(product_type),
+            }
+        )
+
+    _perf_summary(
+        span,
+        endpoint="releases_by_artist",
+        t_start=t_start,
+        results=len(out),
+        luminate_artist_id=artist_id,
+    )
+    return out
+
+
+def get_releases_by_artist_json(luminate_artist_id: str) -> str:
+    """JSON-serialized discography for the API layer."""
+    return json.dumps(get_releases_by_artist(luminate_artist_id), default=str)
 
 
 def get_known_vols(
@@ -4119,10 +4407,15 @@ def _resolve_mrelg_metadata_local(
     try:
         with sqlite3.connect(DATABASE_NAME) as conn:
             conn.row_factory = sqlite3.Row
+            if search_table == MARKETSHARE_SEARCH_SUMMARY_SINGLES_TABLE:
+                ensure_marketshare_search_summary_singles_columns(conn)
+            else:
+                ensure_marketshare_search_summary_columns(conn)
+            conn.commit()
             cur = conn.cursor()
             cur.execute(
-                f"SELECT MRELG_ID, TITLE, ARTIST, LABEL_NAME, RELEASE_DATE, GENRE "
-                f"FROM {search_table} WHERE MRELG_ID = ? LIMIT 1",
+                f"SELECT MRELG_ID, TITLE, ARTIST, LUMINATE_ARTIST_ID, LABEL_NAME, "
+                f"RELEASE_DATE, GENRE FROM {search_table} WHERE MRELG_ID = ? LIMIT 1",
                 (mrelg_id,),
             )
             row = cur.fetchone()
@@ -4132,6 +4425,7 @@ def _resolve_mrelg_metadata_local(
                 "mrelg_id": row["MRELG_ID"],
                 "title": row["TITLE"],
                 "artist": row["ARTIST"],
+                "luminate_artist_id": _row_luminate_artist_id(row),
                 "label_name": row["LABEL_NAME"],
                 "release_date": row["RELEASE_DATE"],
                 "genre": row["GENRE"],

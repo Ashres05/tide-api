@@ -153,6 +153,11 @@ def fetch_bytes(luminate_artist_id: str) -> Optional[tuple[bytes, str]]:
         return None
 
 
+def known_artist_ids() -> set[str]:
+    """Uppercased LUMINATE_ARTIST_IDs that have an image under artist_art/."""
+    return set(_get_index().keys())
+
+
 def _guess_content_type(key: str) -> str:
     ext = key.rsplit(".", 1)[-1].lower()
     return {
