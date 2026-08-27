@@ -1,0 +1,38 @@
+-- Paged discography for one IC level-2 distributor (exact LABEL_NAME match).
+-- Placeholders: label, label, limit, offset.
+-- Null/blank dates sort last; then RELEASE_DATE DESC (ISO text), then MRELG_ID.
+SELECT
+    MRELG_ID,
+    TITLE,
+    ARTIST,
+    PRODUCT_TYPE,
+    RELEASE_DATE,
+    DAILY_GLOBAL_STREAMS,
+    LEVEL_2_DISTRIBUTOR
+FROM (
+    SELECT
+        MRELG_ID,
+        TITLE,
+        ARTIST,
+        COALESCE(NULLIF(TRIM(RELEASE_TYPE), ''), 'Album') AS PRODUCT_TYPE,
+        RELEASE_DATE,
+        DAILY_GLOBAL_STREAMS,
+        LABEL_NAME AS LEVEL_2_DISTRIBUTOR
+    FROM MARKETSHARE_SEARCH_SUMMARY
+    WHERE LABEL_NAME = ?
+    UNION ALL
+    SELECT
+        MRELG_ID,
+        TITLE,
+        ARTIST,
+        COALESCE(NULLIF(TRIM(RELEASE_TYPE), ''), 'Single') AS PRODUCT_TYPE,
+        RELEASE_DATE,
+        DAILY_GLOBAL_STREAMS,
+        LABEL_NAME AS LEVEL_2_DISTRIBUTOR
+    FROM MARKETSHARE_SEARCH_SUMMARY_SINGLES
+    WHERE LABEL_NAME = ?
+)
+ORDER BY RELEASE_DATE DESC NULLS LAST, MRELG_ID
+LIMIT ?
+OFFSET ?
+;

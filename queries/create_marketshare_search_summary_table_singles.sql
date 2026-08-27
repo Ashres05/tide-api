@@ -4,7 +4,7 @@
 -- ensure_marketshare_search_summary_singles_columns() in sqlite_handler.py, which
 -- runs immediately after this CREATE TABLE.
 CREATE TABLE IF NOT EXISTS MARKETSHARE_SEARCH_SUMMARY_SINGLES (
-    MRELG_ID TEXT PRIMARY KEY,
+    MRELG_ID TEXT PRIMARY KEY NOT NULL,
     TITLE TEXT,
     ARTIST TEXT,
     LUMINATE_ARTIST_ID TEXT,
@@ -19,4 +19,4 @@ CREATE TABLE IF NOT EXISTS MARKETSHARE_SEARCH_SUMMARY_SINGLES (
     -- request, and makes LIKE-based prefilters case- and accent-insensitive.
     ARTIST_SEARCH TEXT,
     TITLE_SEARCH TEXT
-);
+) WITHOUT ROWID;

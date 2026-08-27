@@ -26,6 +26,9 @@ CREATE_MARKETSHARE_SEARCH_SUMMARY_SINGLES_TABLE = (
     'create_marketshare_search_summary_table_singles.sql'
 )
 CREATE_MARKETSHARE_SEARCH_ARTISTS_TABLE = 'create_marketshare_search_artists_table.sql'
+CREATE_MARKETSHARE_SEARCH_DISTRIBUTORS_TABLE = (
+    'create_marketshare_search_distributors_table.sql'
+)
 CREATE_DAILY_GLOBAL_STREAMS_TABLE = 'create_daily_global_streams_table.sql'
 CREATE_WEEKLY_GLOBAL_STREAMS_TABLE = 'create_weekly_global_streams_table.sql'
 CREATE_MARKETSHARE_REVENUE_2025_TABLE = 'create_marketshare_revenue_2025_table.sql'
@@ -39,6 +42,9 @@ EXPECTED_RELEASES_QUERY = 'release_get_all.sql'
 MARKETSHARE_SEARCH_SUMMARY_QUERY = 'query_marketshare_search_summary.sql'
 MARKETSHARE_SEARCH_SUMMARY_SINGLES_QUERY = 'query_marketshare_search_summary_singles.sql'
 MARKETSHARE_SEARCH_ARTISTS_ROLLUP_QUERY = 'query_marketshare_search_artists_rollup.sql'
+MARKETSHARE_SEARCH_DISTRIBUTORS_ROLLUP_QUERY = (
+    'query_marketshare_search_distributors_rollup.sql'
+)
 DAILY_GLOBAL_STREAMING_SF_QUERY = 'query_daily_global_streaming.sql'
 DAILY_GLOBAL_STREAMS_SQLITE_QUERY = 'query_daily_global_streams_sqlite.sql'
 WEEKLY_GLOBAL_STREAMING_SF_QUERY = 'query_release_global_streaming.sql'
@@ -52,6 +58,7 @@ INSERT_MARKETSHARE_RELEASE_METRICS = 'insert_marketshare_release_metrics.sql'
 INSERT_MARKETSHARE_SEARCH_SUMMARY = 'insert_marketshare_search_summary.sql'
 INSERT_MARKETSHARE_SEARCH_SUMMARY_SINGLES = 'insert_marketshare_search_summary_singles.sql'
 INSERT_MARKETSHARE_SEARCH_ARTISTS = 'insert_marketshare_search_artists.sql'
+INSERT_MARKETSHARE_SEARCH_DISTRIBUTORS = 'insert_marketshare_search_distributors.sql'
 INSERT_DAILY_GLOBAL_STREAMS = 'insert_daily_global_streams.sql'
 INSERT_WEEKLY_GLOBAL_STREAMS = 'insert_weekly_global_streams.sql'
 INSERT_MARKETSHARE_REVENUE_2025 = 'insert_marketshare_revenue_2025.sql'
@@ -60,6 +67,7 @@ INSERT_MARKETSHARE_REVENUE_2025 = 'insert_marketshare_revenue_2025.sql'
 DELETE_MARKETSHARE_SEARCH_SUMMARY = 'delete_marketshare_search_summary.sql'
 DELETE_MARKETSHARE_SEARCH_SUMMARY_SINGLES = 'delete_marketshare_search_summary_singles.sql'
 DELETE_MARKETSHARE_SEARCH_ARTISTS = 'delete_marketshare_search_artists.sql'
+DELETE_MARKETSHARE_SEARCH_DISTRIBUTORS = 'delete_marketshare_search_distributors.sql'
 DELETE_MARKETSHARE_REVENUE_2025 = 'delete_marketshare_revenue_2025.sql'
 
 def ensure_streaming_roster_2026_table(conn: sqlite3.Connection) -> None:
@@ -331,6 +339,10 @@ def ensure_marketshare_search_summary_columns(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS IDX_MARKETSHARE_SEARCH_SUMMARY_ARTIST_ID "
         "ON MARKETSHARE_SEARCH_SUMMARY (LUMINATE_ARTIST_ID)"
     )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS IDX_MARKETSHARE_SEARCH_SUMMARY_LABEL_DATE "
+        "ON MARKETSHARE_SEARCH_SUMMARY (LABEL_NAME, RELEASE_DATE DESC, MRELG_ID)"
+    )
 
 
 def ensure_marketshare_search_summary_singles_columns(conn: sqlite3.Connection) -> None:
@@ -367,6 +379,10 @@ def ensure_marketshare_search_summary_singles_columns(conn: sqlite3.Connection) 
         "CREATE INDEX IF NOT EXISTS IDX_MARKETSHARE_SEARCH_SUMMARY_SINGLES_ARTIST_ID "
         "ON MARKETSHARE_SEARCH_SUMMARY_SINGLES (LUMINATE_ARTIST_ID)"
     )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS IDX_MARKETSHARE_SEARCH_SUMMARY_SINGLES_LABEL_DATE "
+        "ON MARKETSHARE_SEARCH_SUMMARY_SINGLES (LABEL_NAME, RELEASE_DATE DESC, MRELG_ID)"
+    )
 
 
 def ensure_marketshare_search_artists_table(conn: sqlite3.Connection) -> None:
@@ -402,6 +418,95 @@ def ensure_marketshare_search_artists_table(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS IDX_MARKETSHARE_SEARCH_ARTISTS_STREAMS "
         "ON MARKETSHARE_SEARCH_ARTISTS (DAILY_GLOBAL_STREAMS DESC)"
     )
+
+
+def ensure_marketshare_search_distributors_table(conn: sqlite3.Connection) -> None:
+    """Create MARKETSHARE_SEARCH_DISTRIBUTORS and typeahead indexes."""
+    conn.execute(load_sql(CREATE_MARKETSHARE_SEARCH_DISTRIBUTORS_TABLE))
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(MARKETSHARE_SEARCH_DISTRIBUTORS)")
+    existing = {row[1] for row in cur.fetchall()}
+    for col, ddl in (
+        ("LABEL_SEARCH", "TEXT"),
+        ("DAILY_GLOBAL_STREAMS", "INTEGER"),
+        ("RELEASE_COUNT", "INTEGER"),
+    ):
+        if col in existing:
+            continue
+        try:
+            cur.execute(
+                f"ALTER TABLE MARKETSHARE_SEARCH_DISTRIBUTORS ADD COLUMN {col} {ddl}"
+            )
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                raise
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS IDX_MARKETSHARE_SEARCH_DISTRIBUTORS_SEARCH "
+        "ON MARKETSHARE_SEARCH_DISTRIBUTORS (LABEL_SEARCH)"
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS IDX_MARKETSHARE_SEARCH_DISTRIBUTORS_STREAMS "
+        "ON MARKETSHARE_SEARCH_DISTRIBUTORS (DAILY_GLOBAL_STREAMS DESC)"
+    )
+
+
+def refresh_marketshare_search_distributors(*, persist: bool = True) -> int:
+    """
+    Rebuild MARKETSHARE_SEARCH_DISTRIBUTORS from local search snapshots.
+    One row per LABEL_NAME. Does not query Snowflake.
+    """
+    logger.info(
+        "sqlite_handler: refreshing MARKETSHARE_SEARCH_DISTRIBUTORS (db=%s)",
+        DATABASE_NAME,
+    )
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        ensure_marketshare_search_summary_columns(conn)
+        ensure_marketshare_search_summary_singles_columns(conn)
+        ensure_marketshare_search_distributors_table(conn)
+        cur = conn.cursor()
+        try:
+            cur.execute(load_sql(MARKETSHARE_SEARCH_DISTRIBUTORS_ROLLUP_QUERY))
+            rollup = cur.fetchall()
+        except sqlite3.Error:
+            logger.exception(
+                "sqlite_handler: distributor rollup failed; leaving existing index"
+            )
+            raise
+
+        rows = []
+        for label, streams, release_count in rollup:
+            name = str(label).strip() if label is not None else ""
+            if not name:
+                continue
+            try:
+                stream_val = int(streams or 0)
+            except (TypeError, ValueError):
+                stream_val = 0
+            try:
+                n_releases = int(release_count or 0)
+            except (TypeError, ValueError):
+                n_releases = 0
+            rows.append(
+                (
+                    name,
+                    normalize_search_text(name),
+                    stream_val,
+                    n_releases,
+                )
+            )
+
+        cur.execute(load_sql(DELETE_MARKETSHARE_SEARCH_DISTRIBUTORS))
+        if rows:
+            cur.executemany(load_sql(INSERT_MARKETSHARE_SEARCH_DISTRIBUTORS), rows)
+        conn.commit()
+
+    logger.info(
+        "sqlite_handler: MARKETSHARE_SEARCH_DISTRIBUTORS rebuilt (rows=%d)",
+        len(rows),
+    )
+    if persist and rows:
+        _persist_marketshare_db_to_s3()
+    return len(rows)
 
 
 def refresh_marketshare_search_artists() -> int:
@@ -676,6 +781,7 @@ def refresh_marketshare_search_snapshots() -> dict:
     albums = refresh_marketshare_search_summary(rebuild_artists=False)
     singles = refresh_marketshare_search_summary_singles(rebuild_artists=False)
     _refresh_search_artists_best_effort()
+    _refresh_search_distributors_best_effort()
     return {"albums": albums, "singles": singles}
 
 
@@ -692,6 +798,16 @@ def _search_summary_has_artist_id(cur: sqlite3.Cursor, table: str) -> bool:
 
 
 _SEARCH_SNAPSHOT_CHUNKSIZE = 25000
+_SEARCH_SNAPSHOT_SECONDARY_INDEXES = {
+    "MARKETSHARE_SEARCH_SUMMARY": (
+        "IDX_MARKETSHARE_SEARCH_SUMMARY_STREAMS",
+        "IDX_MARKETSHARE_SEARCH_SUMMARY_ARTIST_ID",
+    ),
+    "MARKETSHARE_SEARCH_SUMMARY_SINGLES": (
+        "IDX_MARKETSHARE_SEARCH_SUMMARY_SINGLES_STREAMS",
+        "IDX_MARKETSHARE_SEARCH_SUMMARY_SINGLES_ARTIST_ID",
+    ),
+}
 _SEARCH_SNAPSHOT_TEXT_COLS = (
     "ARTIST_SEARCH",
     "TITLE_SEARCH",
@@ -773,6 +889,21 @@ def _prepare_search_snapshot_rows(
     return list(df[target_cols].itertuples(index=False, name=None))
 
 
+def _drop_search_snapshot_secondary_indexes(
+    conn: sqlite3.Connection, table_name: str
+) -> None:
+    for index_name in _SEARCH_SNAPSHOT_SECONDARY_INDEXES.get(table_name, ()):
+        conn.execute(f"DROP INDEX IF EXISTS {index_name}")
+
+
+def _search_snapshot_use_stage_swap() -> bool:
+    return os.environ.get("TIDE_SEARCH_SNAPSHOT_STAGE_SWAP", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
 def _refresh_search_snapshot_table(
     *,
     query_file: str,
@@ -785,32 +916,46 @@ def _refresh_search_snapshot_table(
     ensure_live_fn,
 ) -> int:
     """
-    Stream a Snowflake search snapshot into SQLite via a staging table so a
-    killed load cannot wipe the live snapshot. Chunks avoid holding millions
-    of rows in a single pandas frame (OOM on the widened Album/EP extract).
+    Stream a Snowflake search snapshot into SQLite in chunks (avoids OOM on
+    the widened Album/EP extract).
+
+    Default path upserts into the live table so peak disk is live growing in
+    place. A leftover `{table}_STAGE` is dropped first (DROP does not shrink
+    the file until VACUUM). A killed load leaves a mix of old and new rows.
+
+    Set TIDE_SEARCH_SNAPSHOT_STAGE_SWAP=1 to rebuild via a staging table and
+    atomic rename (kill-safe, needs ~2x table free space). Use that once to
+    convert an existing rowid table to WITHOUT ROWID.
     """
     stage_name = f"{table_name}_STAGE"
+    use_stage = _search_snapshot_use_stage_swap()
     create_live = load_sql(create_file)
-    create_stage = create_live.replace(
-        f"CREATE TABLE IF NOT EXISTS {table_name}",
-        f"CREATE TABLE IF NOT EXISTS {stage_name}",
-        1,
-    )
-    insert_stage = load_sql(insert_file).replace(
-        f"INSERT INTO {table_name}",
-        f"INSERT INTO {stage_name}",
-        1,
-    )
+    insert_sql = load_sql(insert_file)
+    if use_stage:
+        insert_sql = insert_sql.replace(
+            f"INSERT INTO {table_name}",
+            f"INSERT INTO {stage_name}",
+            1,
+        )
 
     total_rows = 0
     with get_snowflake_connection() as sf, sqlite3.connect(DATABASE_NAME) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute(create_live)
-        ensure_live_fn(conn)
         conn.execute(f"DROP TABLE IF EXISTS {stage_name}")
-        conn.execute(create_stage)
-        _ensure_search_snapshot_text_columns(conn, stage_name)
+        if use_stage:
+            ensure_live_fn(conn)
+            create_stage = create_live.replace(
+                f"CREATE TABLE IF NOT EXISTS {table_name}",
+                f"CREATE TABLE IF NOT EXISTS {stage_name}",
+                1,
+            )
+            conn.execute(create_stage)
+            _ensure_search_snapshot_text_columns(conn, stage_name)
+        else:
+            _ensure_search_snapshot_text_columns(conn, table_name)
+            _drop_search_snapshot_secondary_indexes(conn, table_name)
         conn.commit()
 
         for i, chunk in enumerate(
@@ -824,31 +969,39 @@ def _refresh_search_snapshot_table(
                 default_release_type=default_release_type,
             )
             if rows:
-                conn.executemany(insert_stage, rows)
+                conn.executemany(insert_sql, rows)
                 total_rows += len(rows)
             if i == 1 or i % 20 == 0:
                 logger.info(
-                    "sqlite_handler: %s stage chunk=%d rows_so_far=%d",
+                    "sqlite_handler: %s %s chunk=%d rows_so_far=%d",
                     table_name,
+                    "stage" if use_stage else "upsert",
                     i,
                     total_rows,
                 )
             conn.commit()
 
-        conn.execute(f"DROP TABLE IF EXISTS {table_name}")
-        conn.execute(f"ALTER TABLE {stage_name} RENAME TO {table_name}")
+        if use_stage:
+            conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+            conn.execute(f"ALTER TABLE {stage_name} RENAME TO {table_name}")
         ensure_live_fn(conn)
+        conn.execute(f"DROP TABLE IF EXISTS {stage_name}")
         conn.commit()
 
-    logger.info("sqlite_handler: %s rebuilt (rows=%d)", table_name, total_rows)
+    logger.info(
+        "sqlite_handler: %s rebuilt (rows=%d, stage_swap=%s)",
+        table_name,
+        total_rows,
+        use_stage,
+    )
     return total_rows
 
 
 def refresh_marketshare_search_summary(*, rebuild_artists: bool = True) -> int:
     """
     Rebuild MARKETSHARE_SEARCH_SUMMARY from Snowflake in streamed chunks.
-    Live table is swapped from a staging table so a killed load keeps the
-    previous snapshot. Returns the number of rows written.
+    Upserts into the live table by default (see
+    _refresh_search_snapshot_table). Returns the number of rows written.
     """
     logger.info("sqlite_handler: refreshing MARKETSHARE_SEARCH_SUMMARY (db=%s)", DATABASE_NAME)
     column_map = {
@@ -887,13 +1040,14 @@ def refresh_marketshare_search_summary(*, rebuild_artists: bool = True) -> int:
     )
     if rebuild_artists:
         _refresh_search_artists_best_effort()
+        _refresh_search_distributors_best_effort()
     return n
 
 
 def refresh_marketshare_search_summary_singles(*, rebuild_artists: bool = True) -> int:
     """
     Rebuild MARKETSHARE_SEARCH_SUMMARY_SINGLES from Snowflake in streamed
-    chunks. Same staging swap as the album snapshot.
+    chunks. Same live upsert as the album snapshot.
     """
     logger.info(
         "sqlite_handler: refreshing MARKETSHARE_SEARCH_SUMMARY_SINGLES (db=%s)",
@@ -935,6 +1089,7 @@ def refresh_marketshare_search_summary_singles(*, rebuild_artists: bool = True) 
     )
     if rebuild_artists:
         _refresh_search_artists_best_effort()
+        _refresh_search_distributors_best_effort()
     return n
 
 
@@ -944,6 +1099,16 @@ def _refresh_search_artists_best_effort() -> None:
         refresh_marketshare_search_artists()
     except Exception:
         logger.exception("sqlite_handler: MARKETSHARE_SEARCH_ARTISTS rebuild failed")
+
+
+def _refresh_search_distributors_best_effort() -> None:
+    """Rebuild the distributor typeahead index; snapshot refresh still succeeds if this fails."""
+    try:
+        refresh_marketshare_search_distributors()
+    except Exception:
+        logger.exception(
+            "sqlite_handler: MARKETSHARE_SEARCH_DISTRIBUTORS rebuild failed"
+        )
 
 
 def _persist_marketshare_db_to_s3() -> None:
@@ -996,6 +1161,45 @@ def ensure_marketshare_search_artists_index() -> int:
         "sqlite_handler: MARKETSHARE_SEARCH_ARTISTS empty with snapshot ids; rebuilding"
     )
     return refresh_marketshare_search_artists()
+
+
+def ensure_marketshare_search_distributors_index() -> int:
+    """
+    If MARKETSHARE_SEARCH_DISTRIBUTORS is empty but snapshots have LABEL_NAME,
+    rebuild the typeahead locally (no Snowflake).
+    """
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        ensure_marketshare_search_summary_columns(conn)
+        ensure_marketshare_search_summary_singles_columns(conn)
+        ensure_marketshare_search_distributors_table(conn)
+        conn.commit()
+        cur = conn.cursor()
+        n = cur.execute(
+            "SELECT COUNT(*) FROM MARKETSHARE_SEARCH_DISTRIBUTORS"
+        ).fetchone()[0]
+        if n:
+            return int(n)
+        has_labels = False
+        for table in (
+            "MARKETSHARE_SEARCH_SUMMARY",
+            "MARKETSHARE_SEARCH_SUMMARY_SINGLES",
+        ):
+            cur.execute(
+                f"""
+                SELECT 1 FROM {table}
+                WHERE LABEL_NAME IS NOT NULL AND TRIM(LABEL_NAME) != ''
+                LIMIT 1
+                """
+            )
+            if cur.fetchone() is not None:
+                has_labels = True
+                break
+    if not has_labels:
+        return 0
+    logger.info(
+        "sqlite_handler: MARKETSHARE_SEARCH_DISTRIBUTORS empty; rebuilding"
+    )
+    return refresh_marketshare_search_distributors()
 
 
 def recompute_ytd_share_from_current_data(data_path: Path) -> pd.DataFrame:

@@ -32,7 +32,10 @@ except ModuleNotFoundError:
 async def lifespan(_app: FastAPI):
     """Pull from S3: db, model/data/*.csv (e.g. current_data_all), artifacts_75k, archetypes."""
     from api.s3_pull import sync_serving_inputs_from_s3
-    from sqlite_handler import ensure_marketshare_search_artists_index
+    from sqlite_handler import (
+        ensure_marketshare_search_artists_index,
+        ensure_marketshare_search_distributors_index,
+    )
 
     sync_serving_inputs_from_s3()
     try:
@@ -40,6 +43,12 @@ async def lifespan(_app: FastAPI):
     except Exception:
         logging.getLogger(__name__).exception(
             "startup: artist search index rebuild failed"
+        )
+    try:
+        ensure_marketshare_search_distributors_index()
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "startup: distributor search index rebuild failed"
         )
     yield
 
@@ -750,6 +759,30 @@ def artist_art(luminate_artist_id: str):
     )
 
 
+@app.get("/v1/label_art/{filename}")
+def label_art(filename: str):
+    """
+    Stream a label logo from ``s3://<bucket>/label_art/{filename}``.
+
+    Use the S3 filename as-is, e.g. ``GET /v1/label_art/atlantic.jpg``.
+    404 when missing — frontend should use a placeholder. Cached at the
+    edge for one day.
+    """
+    import label_art as _label_art
+
+    result = _label_art.fetch_bytes(filename)
+    if result is None:
+        raise HTTPException(status_code=404, detail="label art not found")
+    body, content_type = result
+    return Response(
+        content=body,
+        media_type=content_type,
+        headers={
+            "Cache-Control": "public, max-age=86400, immutable",
+        },
+    )
+
+
 @app.get("/v1/marketshare/actuals")
 def actuals_marketshare():
     try:
@@ -801,8 +834,9 @@ def releases_by_artist(luminate_artist_id: str):
     for this LUMINATE_ARTIST_ID. Does not use STREAMING_ROSTER_2026.
 
     Each row: mrelg_id, title, artist, product_type, release_date,
-    daily_global_streams, forecast_route (``album`` vs ``singles`` for the
-    weekly-stream endpoints). Ordered by daily worldwide streams descending.
+    daily_global_streams, level_2_distributor (IC map; null if unmapped),
+    forecast_route (``album`` vs ``singles`` for the weekly-stream
+    endpoints). Ordered by daily worldwide streams descending.
     """
     try:
         payload = model_handler.get_releases_by_artist_json(luminate_artist_id)
@@ -813,34 +847,20 @@ def releases_by_artist(luminate_artist_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/v1/revenue/search_global_streaming")
-def search_global_streaming(
-    artist: str = "",
-    title: str = "",
+@app.get("/v1/revenue/search_distributors")
+def search_distributors(
+    q: str = "",
     limit: int = 20,
 ):
     """
-    Search the local MARKETSHARE_SEARCH_SUMMARY table for the best-matching
-    Luminate releases given a free-text artist and album title. Returns a
-    ranked list of candidates (each carrying its `mrelg_id` and
-    `luminate_artist_id` when the snapshot has been refreshed) so the front
-    end can open an artist page or call
-    /v1/releases/global_streaming_by_mrelg/{mrelg_id} without ever exposing
-    the MRELG lookup to the user.
+    Typeahead over distinct IC level-2 distributors (snapshot LABEL_NAME).
 
-    Ranking: weighted blend of fuzzy text match and log-scaled daily streams
-    (text-dominant by default) so popular releases bubble up but never drown
-    out close text matches on smaller releases.
-
-    Note: this static route is intentionally registered before the
-    /v1/releases/{release_id} parameterized routes so FastAPI matches it as
-    a literal path instead of trying to coerce 'search_global_streaming'
-    into an int release_id.
+    Pair a result's ``level_2_distributor`` with
+    ``GET /v1/revenue/releases_by_distributor`` (query param, not path —
+    names contain slashes).
     """
     try:
-        payload = model_handler.search_releases_by_artist_title_json(
-            artist=artist, title=title, limit=limit
-        )
+        payload = model_handler.search_distributors_json(q=q, limit=limit)
         return Response(content=payload, media_type="application/json")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -848,21 +868,22 @@ def search_global_streaming(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/v1/revenue/search_global_streaming_singles")
-def search_global_streaming_singles(
-    artist: str = "",
-    title: str = "",
-    limit: int = 20,
+@app.get("/v1/revenue/releases_by_distributor")
+def releases_by_distributor(
+    level_2_distributor: str,
+    limit: int = 50,
+    offset: int = 0,
 ):
     """
-    Search MARKETSHARE_SEARCH_SUMMARY_SINGLES for singles release groups given
-    free-text artist and title. Same response shape as
-    GET /v1/revenue/search_global_streaming. Pair with
-    GET /v1/revenue/global_streaming_singles_by_mrelg/{mrelg_id}.
+    Paged discography for one IC level-2 distributor. Newest
+    ``release_date`` first (null dates last). Default ``limit=50``.
+
+    Use the exact ``level_2_distributor`` string from search_distributors.
+    Encode it as a query parameter (do not put it in the path).
     """
     try:
-        payload = model_handler.search_releases_by_artist_title_singles_json(
-            artist=artist, title=title, limit=limit
+        payload = model_handler.get_releases_by_distributor_json(
+            level_2_distributor, limit=limit, offset=offset
         )
         return Response(content=payload, media_type="application/json")
     except ValueError as e:
@@ -878,8 +899,8 @@ def global_streaming_by_mrelg(mrelg_id: str, scenario: str = "Base"):
     release group. Metadata (artist/title/release_date/genre) is resolved
     from the local MARKETSHARE_SEARCH_SUMMARY table when present and falls
     back to a direct Snowflake lookup. Pair with
-    GET /v1/releases/search_global_streaming so the front end never has to
-    resolve MRELG IDs by hand.
+    GET /v1/revenue/releases_by_artist/{luminate_artist_id} so the front end
+    never has to resolve MRELG IDs by hand.
 
     ``scenario`` query param ("Base" / "Bear" / "Bull"; default Base) routes
     through to the worldwide_streams archetype simulation. The asymptotic
@@ -905,7 +926,7 @@ def global_streaming_singles_by_mrelg(mrelg_id: str, scenario: str = "Base"):
     Observed + forecasted global weekly streams for a singles MRELG release group.
     Uses worldwide_streams_singles archetype artifacts. Same JSON array shape as
     GET /v1/revenue/global_streaming_by_mrelg/{mrelg_id}. Pair with
-    GET /v1/revenue/search_global_streaming_singles.
+    GET /v1/revenue/releases_by_artist/{luminate_artist_id}.
 
     ``scenario`` ("Base" / "Bear" / "Bull"; default Base) applies the learned
     post-fit shock from the singles archetype bundle.

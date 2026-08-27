@@ -27,7 +27,7 @@ WITH mrelg_map AS (
         COALESCE(mrelg.first_sale_date, mrelg.release_date) AS release_date,
         ROW_NUMBER() OVER (
             PARTITION BY mrelg.mrelg_id
-            ORDER BY mrelg.release_date DESC
+            ORDER BY i.percent_owned DESC NULLS LAST
         ) AS rn
     FROM
         current_dev.data.marketshare_map_icpns i

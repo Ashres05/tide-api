@@ -20,6 +20,7 @@ from sqlite_handler import (
     DATABASE_NAME,
     ensure_expected_releases_fw_columns,
     ensure_marketshare_search_artists_table,
+    ensure_marketshare_search_distributors_table,
     ensure_marketshare_search_summary_columns,
     ensure_marketshare_search_summary_singles_columns,
     ensure_streaming_roster_2026_table,
@@ -30,6 +31,7 @@ from search_text import normalize_search_text
 import marketshare_from_csv
 import album_art
 import artist_art
+import label_art
 from model.marketshare_75k_simulation import DISTRIBUTIONS, NUM_WEEKS
 from model.marketshare_labels import TARGET_LABELS
 from model.train_catalog_decay import (
@@ -110,6 +112,8 @@ MARKETSHARE_WEEKLY_ACTUALS_QUERY = "select_marketshare_weekly_actuals.sql"
 MRELG_METADATA_QUERY = "query_mrelg_id.sql"
 RELEASE_BACKFILL_QUERY = "query_release_backfill.sql"
 RELEASES_BY_ARTIST_QUERY = "query_releases_by_artist.sql"
+SEARCH_DISTRIBUTORS_QUERY = "query_search_distributors.sql"
+RELEASES_BY_DISTRIBUTOR_QUERY = "query_releases_by_distributor.sql"
 STREAMING_ROSTER_YTD_QUERY = "query_streaming_roster_ytd.sql"
 ROSTER_MAIN_ARTIST_IDS_QUERY = "query_roster_main_artist_ids.sql"
 GLOBAL_STREAMING_QUERY = "query_release_global_streaming.sql"
@@ -1075,7 +1079,7 @@ def get_eoy_search_forecast(
 # Lightweight timing helper. Logs INFO with a stable structured prefix so the
 # timings are easy to grep in api_refresh / FastAPI logs:
 #
-#     PERF endpoint=search_global_streaming phase=db_fetch ms=412.1 rows=403211
+#     PERF endpoint=search_artists phase=db_fetch ms=12.4 rows=500
 #
 # Each top-level endpoint creates a span dict, then writes a final aggregated
 # line at the end summarising every phase + total wall time. Phase timers also
@@ -2450,28 +2454,21 @@ def get_all_releases_series_json() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Search: artist+title -> ranked MRELG candidates
+# Search: artist typeahead + discography
 #
-# Powered by the local MARKETSHARE_SEARCH_SUMMARY table (rebuilt every
-# refresh_data call). Ranks rows with a weighted blend of fuzzy text match
-# and log-scaled daily streams so popular releases bubble up *without*
-# drowning out close text matches on smaller releases.
+# Typeahead hits MARKETSHARE_SEARCH_ARTISTS only. Discography is
+# GET releases_by_artist. Title/artist free-text over snapshot rows was
+# removed; TITLE on the snapshot tables is still used for display.
 # ---------------------------------------------------------------------------
 
 _SEARCH_TEXT_WEIGHT = 0.75
 _SEARCH_STREAM_WEIGHT = 0.25
 _SEARCH_DEFAULT_LIMIT = 20
 _SEARCH_TEXT_FLOOR = 0.30  # rows with text similarity below this are dropped
-
-# Two-stage retrieval tuning: SQL prefilter shrinks the candidate pool that
-# the Python fuzzy scorer iterates over. Tokens shorter than MIN_TOKEN_LEN
-# generate too many false positives in LIKE scans, so we drop them. The
-# candidate pool is capped by CANDIDATE_LIMIT (taking the most-streamed
-# matches first) so even worst-case queries stay below ~10k Python iterations.
 _SEARCH_MIN_TOKEN_LEN = 2
-_SEARCH_CANDIDATE_LIMIT = 8000
-_SEARCH_FALLBACK_TOPK = 2000  # used when no usable tokens exist (e.g. all 1-char)
 _ARTIST_SEARCH_CANDIDATE_LIMIT = 500
+_DISTRIBUTOR_PAGE_DEFAULT = 50
+_DISTRIBUTOR_PAGE_MAX = 100
 
 
 def _normalize_search_text(value: Any) -> str:
@@ -2528,355 +2525,6 @@ def _search_tokens(*texts: str) -> List[str]:
             seen.add(tok)
             tokens.append(tok)
     return tokens
-
-
-def _fetch_search_candidates(
-    *,
-    artist_norm: str,
-    title_norm: str,
-    span: Dict[str, Any],
-    search_table: str = MARKETSHARE_SEARCH_SUMMARY_TABLE,
-    endpoint: str = "search_global_streaming",
-) -> List[sqlite3.Row]:
-    """
-    Two-stage retrieval: SQL prefilter on indexed normalized text columns to
-    shrink the pool we feed to the Python fuzzy scorer. Falls back to the
-    most-streamed releases when the query has no usable tokens (e.g. all
-    1-char tokens) so we still return *something* and the result quality
-    matches the legacy behaviour for those edge cases.
-
-    Always selects ARTIST_SEARCH/TITLE_SEARCH so the caller can avoid
-    re-normalizing every row at request time. Older databases that predate
-    the columns are detected once and a graceful fallback path is used.
-    """
-    tokens = _search_tokens(artist_norm, title_norm)
-
-    fetch_sql = (
-        "SELECT MRELG_ID, TITLE, ARTIST, LUMINATE_ARTIST_ID, LABEL_NAME, "
-        "RELEASE_DATE, GENRE, DAILY_GLOBAL_STREAMS, ARTIST_SEARCH, TITLE_SEARCH "
-        f"FROM {search_table}"
-    )
-
-    try:
-        with sqlite3.connect(DATABASE_NAME) as conn:
-            conn.row_factory = sqlite3.Row
-            if search_table == MARKETSHARE_SEARCH_SUMMARY_SINGLES_TABLE:
-                ensure_marketshare_search_summary_singles_columns(conn)
-            else:
-                ensure_marketshare_search_summary_columns(conn)
-            conn.commit()
-            cur = conn.cursor()
-
-            normalized_columns_present = _has_normalized_search_columns(
-                cur, search_table
-            )
-
-            if not normalized_columns_present:
-                # Legacy schema: fall back to the original full-table fetch so
-                # the function still works after a deploy that hasn't run the
-                # refresh job yet.
-                with _perf_phase(
-                    span,
-                    "db_fetch",
-                    endpoint=endpoint,
-                    mode="full_scan_legacy",
-                ) as info:
-                    cur.execute(
-                        f"SELECT MRELG_ID, TITLE, ARTIST, LABEL_NAME, RELEASE_DATE, "
-                        f"GENRE, DAILY_GLOBAL_STREAMS FROM {search_table}"
-                    )
-                    rows = cur.fetchall()
-                    info["rows"] = len(rows)
-                return rows
-
-            if tokens:
-                like_clauses: List[str] = []
-                params: List[Any] = []
-                for tok in tokens:
-                    like_clauses.append("ARTIST_SEARCH LIKE ?")
-                    params.append(f"%{tok}%")
-                    like_clauses.append("TITLE_SEARCH LIKE ?")
-                    params.append(f"%{tok}%")
-
-                sql = (
-                    f"{fetch_sql} WHERE ({' OR '.join(like_clauses)}) "
-                    "ORDER BY DAILY_GLOBAL_STREAMS DESC LIMIT ?"
-                )
-                params.append(_SEARCH_CANDIDATE_LIMIT)
-                with _perf_phase(
-                    span,
-                    "db_fetch",
-                    endpoint=endpoint,
-                    mode="prefilter",
-                ) as info:
-                    info["tokens"] = len(tokens)
-                    cur.execute(sql, params)
-                    rows = cur.fetchall()
-                    info["rows"] = len(rows)
-                return rows
-
-            # No usable tokens: return top-K by streams so we don't fall back
-            # to a full scan but the Python scorer still has *something* to
-            # rank. This matches what the user typically wants (popular
-            # releases) when the query is too short to filter on.
-            with _perf_phase(
-                span,
-                "db_fetch",
-                endpoint=endpoint,
-                mode="topk_no_tokens",
-            ) as info:
-                cur.execute(
-                    f"{fetch_sql} ORDER BY DAILY_GLOBAL_STREAMS DESC LIMIT ?",
-                    (_SEARCH_FALLBACK_TOPK,),
-                )
-                rows = cur.fetchall()
-                info["rows"] = len(rows)
-            return rows
-    except sqlite3.Error as e:
-        raise sqlite3.Error(f"Error querying {search_table}: {e}") from e
-
-
-_HAS_NORMALIZED_SEARCH_COLUMNS: Optional[bool] = None
-_HAS_NORMALIZED_SEARCH_COLUMNS_BY_TABLE: Dict[str, bool] = {}
-
-
-def _has_normalized_search_columns(
-    cur: sqlite3.Cursor,
-    table: str = MARKETSHARE_SEARCH_SUMMARY_TABLE,
-) -> bool:
-    """
-    Cache whether the local SQLite schema has the persisted search columns
-    AND whether they have been populated. The column check runs once per
-    process; the value is only flipped to ``True`` after a refresh has
-    written non-NULL values, so the migration window between an online
-    schema-only ALTER and the next refresh still falls back to the legacy
-    full-scan path (rather than running a LIKE prefilter against all-NULL
-    columns and returning empty results).
-    """
-    global _HAS_NORMALIZED_SEARCH_COLUMNS
-    cached = _HAS_NORMALIZED_SEARCH_COLUMNS_BY_TABLE.get(table)
-    if cached is True:
-        return True
-    if table == MARKETSHARE_SEARCH_SUMMARY_TABLE and _HAS_NORMALIZED_SEARCH_COLUMNS is True:
-        return True
-    cur.execute(f"PRAGMA table_info({table})")
-    cols = {row[1] for row in cur.fetchall()}
-    if "ARTIST_SEARCH" not in cols or "TITLE_SEARCH" not in cols:
-        _HAS_NORMALIZED_SEARCH_COLUMNS_BY_TABLE[table] = False
-        if table == MARKETSHARE_SEARCH_SUMMARY_TABLE:
-            _HAS_NORMALIZED_SEARCH_COLUMNS = False
-        return False
-    cur.execute(
-        f"SELECT 1 FROM {table} "
-        "WHERE ARTIST_SEARCH IS NOT NULL OR TITLE_SEARCH IS NOT NULL LIMIT 1"
-    )
-    populated = cur.fetchone() is not None
-    _HAS_NORMALIZED_SEARCH_COLUMNS_BY_TABLE[table] = populated
-    if populated and table == MARKETSHARE_SEARCH_SUMMARY_TABLE:
-        _HAS_NORMALIZED_SEARCH_COLUMNS = True
-    return populated
-
-
-def search_releases_by_artist_title(
-    artist: str,
-    title: str,
-    limit: int = _SEARCH_DEFAULT_LIMIT,
-    *,
-    search_table: str = MARKETSHARE_SEARCH_SUMMARY_TABLE,
-    endpoint: str = "search_global_streaming",
-) -> List[Dict[str, Any]]:
-    """
-    Search a MARKETSHARE_SEARCH_SUMMARY* table for the best-matching
-    Luminate release groups given a free-text artist and title.
-
-    Ranking: combined_score = TEXT_WEIGHT * text_score + STREAM_WEIGHT *
-    popularity_score, where text_score is a fuzzy match on artist+title
-    (50/50 average) and popularity_score is log1p(daily_global_streams)
-    normalized to [0, 1] across the candidate pool. The streaming weight is
-    intentionally bounded so popular releases bubble up only when text
-    relevance is comparable; smaller releases with stronger text matches
-    still surface near the top.
-
-    Returns up to `limit` results sorted by combined_score (desc), each with
-    metadata + component scores so the front end can debug / display reasons.
-    """
-    if not isinstance(artist, str):
-        artist = "" if artist is None else str(artist)
-    if not isinstance(title, str):
-        title = "" if title is None else str(title)
-    artist = artist.strip()
-    title = title.strip()
-    if not artist and not title:
-        raise ValueError("At least one of `artist` or `title` is required.")
-    if limit is None:
-        limit = _SEARCH_DEFAULT_LIMIT
-    try:
-        limit = int(limit)
-    except (TypeError, ValueError) as e:
-        raise ValueError("limit must be a positive integer.") from e
-    if limit < 1:
-        raise ValueError("limit must be a positive integer.")
-    limit = min(limit, 100)
-
-    span: Dict[str, Any] = {}
-    t_start = _now()
-
-    artist_norm = _normalize_search_text(artist)
-    title_norm = _normalize_search_text(title)
-
-    rows = _fetch_search_candidates(
-        artist_norm=artist_norm,
-        title_norm=title_norm,
-        span=span,
-        search_table=search_table,
-        endpoint=endpoint,
-    )
-
-    if not rows:
-        logger.info("search: candidate set is empty; returning no matches")
-        _perf_summary(
-            span,
-            endpoint=endpoint,
-            t_start=t_start,
-            results=0,
-            candidates=0,
-        )
-        return []
-
-    candidates: List[Dict[str, Any]] = []
-    with _perf_phase(span, "score", endpoint=endpoint) as info:
-        info["pool"] = len(rows)
-        for row in rows:
-            # Refresh writes pre-normalized columns; legacy rows are normalized
-            # on the fly so a stale DB still works.
-            row_artist_norm = (
-                row["ARTIST_SEARCH"] if "ARTIST_SEARCH" in row.keys() and row["ARTIST_SEARCH"]
-                else _normalize_search_text(row["ARTIST"])
-            )
-            row_title_norm = (
-                row["TITLE_SEARCH"] if "TITLE_SEARCH" in row.keys() and row["TITLE_SEARCH"]
-                else _normalize_search_text(row["TITLE"])
-            )
-
-            if artist_norm and title_norm:
-                artist_score = _text_similarity(artist_norm, row_artist_norm)
-                title_score = _text_similarity(title_norm, row_title_norm)
-                text_score = 0.5 * artist_score + 0.5 * title_score
-            elif artist_norm:
-                artist_score = _text_similarity(artist_norm, row_artist_norm)
-                title_score = 0.0
-                text_score = artist_score
-            else:
-                artist_score = 0.0
-                title_score = _text_similarity(title_norm, row_title_norm)
-                text_score = title_score
-
-            if text_score < _SEARCH_TEXT_FLOOR:
-                continue
-
-            try:
-                daily_streams = float(row["DAILY_GLOBAL_STREAMS"] or 0)
-            except (TypeError, ValueError):
-                daily_streams = 0.0
-
-            candidates.append(
-                {
-                    "mrelg_id": row["MRELG_ID"],
-                    "title": row["TITLE"],
-                    "artist": row["ARTIST"],
-                    "luminate_artist_id": _row_luminate_artist_id(row),
-                    "label_name": row["LABEL_NAME"],
-                    "release_date": row["RELEASE_DATE"],
-                    "genre": row["GENRE"],
-                    "daily_global_streams": int(daily_streams),
-                    "artist_score": round(float(artist_score), 4),
-                    "title_score": round(float(title_score), 4),
-                    "text_score": round(float(text_score), 4),
-                    "_raw_streams": daily_streams,
-                }
-            )
-        info["matched"] = len(candidates)
-
-    if not candidates:
-        _perf_summary(
-            span,
-            endpoint=endpoint,
-            t_start=t_start,
-            results=0,
-            candidates=len(rows),
-        )
-        return []
-
-    with _perf_phase(span, "rank", endpoint=endpoint) as info:
-        max_log_streams = max(math.log1p(c["_raw_streams"]) for c in candidates)
-        if max_log_streams <= 0:
-            max_log_streams = 1.0  # avoid divide-by-zero when nothing has streams
-
-        for c in candidates:
-            stream_score = math.log1p(c["_raw_streams"]) / max_log_streams
-            c["stream_score"] = round(float(stream_score), 4)
-            c["combined_score"] = round(
-                float(_SEARCH_TEXT_WEIGHT * c["text_score"] + _SEARCH_STREAM_WEIGHT * stream_score),
-                4,
-            )
-            c.pop("_raw_streams", None)
-
-        candidates.sort(
-            key=lambda x: (x["combined_score"], x["text_score"], x["daily_global_streams"]),
-            reverse=True,
-        )
-        info["matched"] = len(candidates)
-
-    results = candidates[:limit]
-    for row in results:
-        mid = row.get("mrelg_id")
-        row["catalog_revenue_2025"] = catalog_revenue_2025_for_mrelg(
-            str(mid) if mid is not None else None
-        )
-
-    _perf_summary(
-        span,
-        endpoint=endpoint,
-        t_start=t_start,
-        results=len(results),
-        candidates=len(rows),
-    )
-    return results
-
-
-def search_releases_by_artist_title_singles(
-    artist: str,
-    title: str,
-    limit: int = _SEARCH_DEFAULT_LIMIT,
-) -> List[Dict[str, Any]]:
-    """Search MARKETSHARE_SEARCH_SUMMARY_SINGLES for singles release groups."""
-    return search_releases_by_artist_title(
-        artist,
-        title,
-        limit=limit,
-        search_table=MARKETSHARE_SEARCH_SUMMARY_SINGLES_TABLE,
-        endpoint="search_global_streaming_singles",
-    )
-
-
-def search_releases_by_artist_title_json(
-    artist: str,
-    title: str,
-    limit: int = _SEARCH_DEFAULT_LIMIT,
-) -> str:
-    """JSON-serialized form of search_releases_by_artist_title for the API layer."""
-    return json.dumps(search_releases_by_artist_title(artist, title, limit=limit))
-
-
-def search_releases_by_artist_title_singles_json(
-    artist: str,
-    title: str,
-    limit: int = _SEARCH_DEFAULT_LIMIT,
-) -> str:
-    """JSON-serialized singles search for the API layer."""
-    return json.dumps(
-        search_releases_by_artist_title_singles(artist, title, limit=limit)
-    )
 
 
 def _fetch_artist_search_candidates(
@@ -2949,8 +2597,8 @@ def search_artists(
     """
     Typeahead over MARKETSHARE_SEARCH_ARTISTS (one row per LUMINATE_ARTIST_ID).
 
-    Does not scan album/single/EP snapshot tables. Ranking is the same
-    text-dominant blend as release search, on artist name only.
+    Does not scan album/single/EP snapshot tables. Ranking is a
+    text-dominant blend of fuzzy artist-name match and log-scaled streams.
     """
     if not isinstance(q, str):
         q = "" if q is None else str(q)
@@ -3069,6 +2717,41 @@ def search_artists_json(q: str, limit: int = _SEARCH_DEFAULT_LIMIT) -> str:
     return json.dumps(search_artists(q, limit=limit))
 
 
+def _snapshot_release_dict(row: sqlite3.Row) -> Dict[str, Any]:
+    product_type = row["PRODUCT_TYPE"]
+    try:
+        daily_streams = int(row["DAILY_GLOBAL_STREAMS"] or 0)
+    except (TypeError, ValueError):
+        daily_streams = 0
+    release_date = row["RELEASE_DATE"]
+    if release_date is not None:
+        release_date = str(release_date).split(" ")[0]
+        if release_date.lower() in {"none", "nan", "nat", ""}:
+            release_date = None
+    level_2 = None
+    if "LEVEL_2_DISTRIBUTOR" in row.keys() and row["LEVEL_2_DISTRIBUTOR"] is not None:
+        level_2 = str(row["LEVEL_2_DISTRIBUTOR"]).strip() or None
+    return {
+        "mrelg_id": row["MRELG_ID"],
+        "title": row["TITLE"],
+        "artist": row["ARTIST"],
+        "product_type": product_type,
+        "release_date": release_date,
+        "daily_global_streams": daily_streams,
+        "level_2_distributor": level_2,
+        "forecast_route": streaming_forecast_route(product_type),
+    }
+
+
+def _like_pattern(raw: str, *, contains: bool) -> str:
+    escaped = (
+        raw.replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
+    return f"%{escaped}%" if contains else f"{escaped}%"
+
+
 def get_releases_by_artist(luminate_artist_id: str) -> List[Dict[str, Any]]:
     """
     Artist-page discography from the search snapshots (albums, EPs, singles).
@@ -3105,27 +2788,7 @@ def get_releases_by_artist(luminate_artist_id: str) -> List[Dict[str, Any]]:
             f"Error querying releases for artist {artist_id}: {e}"
         ) from e
 
-    out: List[Dict[str, Any]] = []
-    for row in rows:
-        product_type = row["PRODUCT_TYPE"]
-        try:
-            daily_streams = int(row["DAILY_GLOBAL_STREAMS"] or 0)
-        except (TypeError, ValueError):
-            daily_streams = 0
-        release_date = row["RELEASE_DATE"]
-        if release_date is not None:
-            release_date = str(release_date).split(" ")[0]
-        out.append(
-            {
-                "mrelg_id": row["MRELG_ID"],
-                "title": row["TITLE"],
-                "artist": row["ARTIST"],
-                "product_type": product_type,
-                "release_date": release_date,
-                "daily_global_streams": daily_streams,
-                "forecast_route": streaming_forecast_route(product_type),
-            }
-        )
+    out = [_snapshot_release_dict(row) for row in rows]
 
     _perf_summary(
         span,
@@ -3140,6 +2803,170 @@ def get_releases_by_artist(luminate_artist_id: str) -> List[Dict[str, Any]]:
 def get_releases_by_artist_json(luminate_artist_id: str) -> str:
     """JSON-serialized discography for the API layer."""
     return json.dumps(get_releases_by_artist(luminate_artist_id), default=str)
+
+
+def search_distributors(
+    q: str,
+    limit: int = _SEARCH_DEFAULT_LIMIT,
+) -> List[Dict[str, Any]]:
+    """
+    Typeahead over MARKETSHARE_SEARCH_DISTRIBUTORS (one row per
+    LABEL_NAME, rebuilt when search snapshots refresh).
+    """
+    if not isinstance(q, str):
+        q = "" if q is None else str(q)
+    q = q.strip()
+    if not q:
+        raise ValueError("q is required.")
+    if limit is None:
+        limit = _SEARCH_DEFAULT_LIMIT
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError) as e:
+        raise ValueError("limit must be a positive integer.") from e
+    if limit < 1:
+        raise ValueError("limit must be a positive integer.")
+    limit = min(limit, 100)
+
+    q_norm = _normalize_search_text(q)
+    if not q_norm:
+        q_norm = q.lower()
+    sql = load_sql(SEARCH_DISTRIBUTORS_QUERY)
+
+    def _run(pattern: str) -> List[sqlite3.Row]:
+        with sqlite3.connect(DATABASE_NAME) as conn:
+            conn.row_factory = sqlite3.Row
+            ensure_marketshare_search_distributors_table(conn)
+            conn.commit()
+            cur = conn.cursor()
+            cur.execute(sql, (pattern, limit))
+            return cur.fetchall()
+
+    rows = _run(_like_pattern(q_norm, contains=False))
+    if not rows:
+        rows = _run(_like_pattern(q_norm, contains=True))
+
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        name = str(row["LEVEL_2_DISTRIBUTOR"] or "").strip()
+        if not name:
+            continue
+        try:
+            n_releases = int(row["RELEASE_COUNT"] or 0)
+        except (TypeError, ValueError):
+            n_releases = 0
+        try:
+            streams = int(row["DAILY_GLOBAL_STREAMS"] or 0)
+        except (TypeError, ValueError):
+            streams = 0
+        out.append(
+            {
+                "level_2_distributor": name,
+                "release_count": n_releases,
+                "daily_global_streams": streams,
+            }
+        )
+    return out
+
+
+def search_distributors_json(q: str, limit: int = _SEARCH_DEFAULT_LIMIT) -> str:
+    return json.dumps(search_distributors(q, limit=limit))
+
+
+def get_releases_by_distributor(
+    level_2_distributor: str,
+    *,
+    limit: int = _DISTRIBUTOR_PAGE_DEFAULT,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    """
+    Paged discography for one IC level-2 distributor. Ordered by release
+    date descending (null dates last). Default page size 50.
+    """
+    if not isinstance(level_2_distributor, str):
+        level_2_distributor = (
+            "" if level_2_distributor is None else str(level_2_distributor)
+        )
+    label = level_2_distributor.strip()
+    if not label:
+        raise ValueError("level_2_distributor is required.")
+    if limit is None:
+        limit = _DISTRIBUTOR_PAGE_DEFAULT
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError) as e:
+        raise ValueError("limit must be a positive integer.") from e
+    if limit < 1:
+        raise ValueError("limit must be a positive integer.")
+    limit = min(limit, _DISTRIBUTOR_PAGE_MAX)
+    if offset is None:
+        offset = 0
+    try:
+        offset = int(offset)
+    except (TypeError, ValueError) as e:
+        raise ValueError("offset must be a non-negative integer.") from e
+    if offset < 0:
+        raise ValueError("offset must be a non-negative integer.")
+
+    span: Dict[str, Any] = {}
+    t_start = _now()
+    fetch_n = limit + 1
+    try:
+        with sqlite3.connect(DATABASE_NAME) as conn:
+            conn.row_factory = sqlite3.Row
+            ensure_marketshare_search_summary_columns(conn)
+            ensure_marketshare_search_summary_singles_columns(conn)
+            conn.commit()
+            cur = conn.cursor()
+            with _perf_phase(
+                span, "db_fetch", endpoint="releases_by_distributor"
+            ) as info:
+                cur.execute(
+                    load_sql(RELEASES_BY_DISTRIBUTOR_QUERY),
+                    (label, label, fetch_n, offset),
+                )
+                rows = cur.fetchall()
+                info["rows"] = len(rows)
+    except sqlite3.Error as e:
+        raise sqlite3.Error(
+            f"Error querying releases for distributor {label}: {e}"
+        ) from e
+
+    has_more = len(rows) > limit
+    page = rows[:limit]
+    releases = [_snapshot_release_dict(row) for row in page]
+    _perf_summary(
+        span,
+        endpoint="releases_by_distributor",
+        t_start=t_start,
+        results=len(releases),
+        has_more=has_more,
+        offset=offset,
+        limit=limit,
+    )
+    return {
+        "level_2_distributor": label,
+        "sort": "release_date",
+        "limit": limit,
+        "offset": offset,
+        "next_offset": offset + len(releases),
+        "has_more": has_more,
+        "releases": releases,
+    }
+
+
+def get_releases_by_distributor_json(
+    level_2_distributor: str,
+    *,
+    limit: int = _DISTRIBUTOR_PAGE_DEFAULT,
+    offset: int = 0,
+) -> str:
+    return json.dumps(
+        get_releases_by_distributor(
+            level_2_distributor, limit=limit, offset=offset
+        ),
+        default=str,
+    )
 
 
 def get_known_vols(
@@ -3433,10 +3260,8 @@ def train_model() -> None:
     """
     Trains the model.
 
-    Also rebuilds the MARKETSHARE_SEARCH_SUMMARY SQLite table so the search
-    endpoint always reflects the latest daily Snowflake snapshot. The table
-    is fully overwritten (delete + insert) because daily-stream snapshots
-    are not additive across runs.
+    Also rebuilds the search snapshot tables so artist typeahead and
+    discography reflect the latest daily Snowflake snapshot.
     """
     # Full refresh trains every scope, so pull all canonical inputs from S3
     # (csv + parquets + artifacts_75k + archetypes + db) before training.
@@ -3787,6 +3612,7 @@ def reload_artifacts() -> None:
     platform_marketshare_from_csv.clear_cache()
     album_art.clear_cache()
     artist_art.clear_cache()
+    label_art.clear_cache()
 
 
 def df_to_json(

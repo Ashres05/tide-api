@@ -6,25 +6,40 @@
 -- Label (IC map) and day-2 worldwide OnDemand streams are LEFT JOINed:
 -- missing distributor or a quiet day must not drop the release from the
 -- artist page. Rows without a Main Artist are excluded.
+--
+-- Label pick matches the roster: current ICPNs only. IGA/CMG at level 3;
+-- everything else stays level 2. Do not alias Interscope-Capitol (only L3
+-- tells IGA from CMG). Do not promote imprint L3 (e.g. Def Jam) into
+-- LABEL_NAME — that stays on Republic / UME as L2.
+-- Prefer a mapped label when several ICPNs are tied at 100% owned (null L2
+-- rows must not win over Republic).
+--
+-- RELEASE_DATE: street date when Luminate release_date is on or before
+-- 2014-01-05; otherwise first sale, then street.
 WITH mrelg_labels AS (
     SELECT
-        *,
-        ROW_NUMBER() OVER (
-            PARTITION BY mrelg_id
-            ORDER BY
-                percent_owned DESC
-        ) AS rn
+        mrel.mrelg_id,
+        CASE
+            WHEN i.level_3_distributor IN ('IGA', 'CMG') THEN i.level_3_distributor
+            WHEN i.level_2_distributor = 'Interscope/Geffen/A&M' THEN 'IGA'
+            ELSE i.level_2_distributor
+        END AS label
     FROM
-        (
-            SELECT
-                DISTINCT mrel.mrelg_id,
-                i.level_2_distributor,
-                i.percent_owned
-            FROM
-                current_dev.data.marketshare_map_icpns i
-                JOIN luminate_prod.extract_s.vw_mp_mrel_map_ds mp ON mp.mp_id = i.mp_id
-                JOIN luminate_prod.extract_s.vw_mrel_mrelg_map_ds mrel ON mrel.mrel_id = mp.mrel_id
-        ) QUALIFY rn = 1
+        current_dev.data.marketshare_map_icpns i
+        JOIN luminate_prod.extract_s.vw_mp_mrel_map_ds mp ON mp.mp_id = i.mp_id
+        JOIN luminate_prod.extract_s.vw_mrel_mrelg_map_ds mrel ON mrel.mrel_id = mp.mrel_id
+    WHERE
+        i.is_current = TRUE
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY mrel.mrelg_id
+        ORDER BY
+            CASE
+                WHEN i.level_3_distributor IN ('IGA', 'CMG') THEN 0
+                WHEN i.level_2_distributor IS NOT NULL THEN 0
+                ELSE 1
+            END,
+            i.percent_owned DESC NULLS LAST
+    ) = 1
 ),
 mrelg_base AS (
     SELECT
@@ -33,8 +48,13 @@ mrelg_base AS (
         s.display_artist AS artist,
         s.artists,
         s.release_type,
-        l.level_2_distributor AS label,
-        COALESCE(s.first_sale_date, s.release_date) AS release_date,
+        l.label AS label,
+        CASE
+            WHEN s.release_date IS NOT NULL
+                 AND s.release_date <= DATE '2014-01-05'
+                THEN s.release_date
+            ELSE COALESCE(s.first_sale_date, s.release_date)
+        END AS release_date,
         GET(
             FILTER(genres, x -> x:CLIENT_DOMAIN = 'Billboard'),
             0

@@ -3,10 +3,10 @@
 -- table only — never albums/singles/EPs. Supporting indexes are created in
 -- ensure_marketshare_search_artists_table() in sqlite_handler.py.
 CREATE TABLE IF NOT EXISTS MARKETSHARE_SEARCH_ARTISTS (
-    LUMINATE_ARTIST_ID TEXT PRIMARY KEY,
+    LUMINATE_ARTIST_ID TEXT PRIMARY KEY NOT NULL,
     ARTIST TEXT,
     ARTIST_SEARCH TEXT,
     DAILY_GLOBAL_STREAMS INTEGER,
     RELEASE_COUNT INTEGER,
     HAS_ARTWORK INTEGER DEFAULT 0
-);
+) WITHOUT ROWID;
