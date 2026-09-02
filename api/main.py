@@ -50,6 +50,12 @@ async def lifespan(_app: FastAPI):
         logging.getLogger(__name__).exception(
             "startup: distributor search index rebuild failed"
         )
+    try:
+        from sqlite_handler import wal_checkpoint
+
+        wal_checkpoint("TRUNCATE")
+    except Exception:
+        logging.getLogger(__name__).exception("startup: wal_checkpoint failed")
     yield
 
 
@@ -1002,6 +1008,67 @@ def daily_streams_by_mrelg(mrelg_id: str):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v1/revenue/mrelg_isrc_report/{mrelg_id}")
+def mrelg_isrc_report(
+    mrelg_id: str,
+    format: str = "csv",
+    year: int | None = None,
+):
+    """
+    MRELG popup — generate a US OnDemand ISRC stream-share report and let the
+    browser download it. ``mrelg_id`` comes from the popup (same id as
+    ``GET /v1/revenue/releases_by_artist/{id}`` / streaming roster). Users
+    never type an id.
+
+    Runs Snowflake live. Does not write SQLite, S3, or a local file.
+
+    Query params:
+      ``format``  ``csv`` (default, attachment) or ``json``
+      ``year``    calendar year (default: current year — 2026 today)
+
+    FE: ``GET /v1/revenue/mrelg_isrc_report/{mrelg_id}?format=csv`` then
+    save the body as a CSV (or use ``<a download>``). Empty result is a
+    header-only CSV, not 404.
+    """
+    fmt = (format or "csv").strip().lower()
+    if fmt not in {"csv", "json"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="format must be csv or json.",
+        )
+    try:
+        df = model_handler.get_mrelg_isrc_report(mrelg_id, year=year)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    report_year = year
+    if report_year is None:
+        from datetime import date as _date
+
+        report_year = _date.today().year
+
+    if fmt == "json":
+        return Response(
+            content=model_handler.df_to_json(df),
+            media_type="application/json",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    filename = f"{mrelg_id.strip()}_{int(report_year)}_isrc_report.csv"
+    body = model_handler.mrelg_isrc_report_csv_bytes(df)
+    return Response(
+        content=body,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Access-Control-Expose-Headers": "Content-Disposition",
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @app.get("/v1/revenue/catalog_revenue_2025/{mrelg_id}")

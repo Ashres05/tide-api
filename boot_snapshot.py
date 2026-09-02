@@ -46,6 +46,8 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
+from sqlite_handler import sqlite_connect
+
 logger = logging.getLogger(__name__)
 
 BOOT_VERSION = 2
@@ -142,7 +144,7 @@ def _weekly_rows_from_metrics(release_id: int) -> List[dict]:
         "FROM MARKETSHARE_RELEASE_METRICS WHERE RELEASE_ID = ? "
         "ORDER BY date(WEEK_ENDING_DATE) ASC"
     )
-    with sqlite3.connect(_database_name()) as conn:
+    with sqlite_connect() as conn:
         for week, streams, sales, songs in conn.execute(sql, (int(release_id),)):
             week_s = str(week).split(" ")[0][:10] if week is not None else ""
             se, ps, ss = _num_int(streams), _num_int(sales), _num_int(songs)
@@ -243,7 +245,7 @@ def release_boot_item_by_id(release_id: int) -> dict:
 
     model_handler._verify_id(release_id)
     query = load_sql(model_handler.RELEASE_GET_QUERY)
-    with sqlite3.connect(_database_name()) as conn:
+    with sqlite_connect() as conn:
         ensure_expected_releases_fw_columns(conn)
         conn.row_factory = sqlite3.Row
         row = conn.execute(query, (int(release_id),)).fetchone()
@@ -274,7 +276,7 @@ def build_streaming_section() -> dict:
             f"WHERE MRELG_ID IN ({placeholders}) "
             "ORDER BY MRELG_ID, date(WEEK_ENDING_DATE) ASC"
         )
-        with sqlite3.connect(_database_name()) as conn:
+        with sqlite_connect() as conn:
             cur = conn.execute(sql, mrelg_ids)
             for mid, week, streams in cur.fetchall():
                 key = str(mid or "").strip()
@@ -398,7 +400,25 @@ def export_boot_json_snapshot() -> dict:
 
     Returns a summary dict for job / refresh_weekly stage reporting.
     """
+    import gc
+    import os
     from api.s3_pull import upload_boot_json
+
+    # Reclaim leaked sqlite FDs from prewarm (`with sqlite3.connect` does not
+    # close on 3.14) before we open query files / write boot.json.
+    gc.collect()
+    try:
+        nfd = len(os.listdir(f"/proc/{os.getpid()}/fd"))
+    except Exception:
+        nfd = -1
+    logger.info("export_boot_json_snapshot: open_fds=%s after gc", nfd)
+
+    try:
+        from sqlite_handler import wal_checkpoint
+
+        wal_checkpoint("TRUNCATE")
+    except Exception:
+        logger.warning("export_boot_json_snapshot: wal_checkpoint failed", exc_info=True)
 
     t0 = datetime.now(timezone.utc)
     payload = build_boot_payload()
@@ -407,7 +427,21 @@ def export_boot_json_snapshot() -> dict:
 
     local_path = boot_json_local_path()
     local_path.parent.mkdir(parents=True, exist_ok=True)
-    local_path.write_bytes(body_bytes)
+    # Write to a sibling temp then rename so ENOSPC cannot truncate the live file
+    # the frontend is already serving.
+    tmp_path = local_path.with_name(local_path.name + ".tmp")
+    try:
+        with open(tmp_path, "wb") as fh:
+            fh.write(body_bytes)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, local_path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
     s3_uri = upload_boot_json(body_bytes)
 

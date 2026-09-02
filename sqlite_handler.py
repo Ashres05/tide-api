@@ -1,5 +1,6 @@
 from snowflake_conn import get_snowflake_connection, load_sql
 from search_text import normalize_search_text
+import contextlib
 import sqlite3
 import pandas as pd
 import numpy as np
@@ -14,6 +15,54 @@ import logging
 DATABASE_NAME = str(Path(__file__).resolve().parent / 'marketshare_data.db')
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def sqlite_connect(database: str | None = None, **kwargs):
+    """
+    Open SQLite and always close the connection.
+
+    CPython 3.14 ``with sqlite3.connect()`` only commit/rollback on exit; it
+    does not close. Weekly roster prewarm opened one connection per title and
+    leaked FDs until boot.json hit EMFILE (Aug 17, soft ulimit 1024).
+    """
+    conn = sqlite3.connect(database or DATABASE_NAME, **kwargs)
+    try:
+        conn.execute("PRAGMA busy_timeout=30000")
+        # After a checkpoint, keep the WAL file from retaining multi-GB of
+        # already-checkpointed frames when other connections are still open.
+        conn.execute("PRAGMA journal_size_limit=67108864")
+        yield conn
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def wal_checkpoint(mode: str = "TRUNCATE") -> tuple:
+    """
+    Merge WAL frames into the main DB and optionally truncate the WAL file.
+
+    Call after batch writes (prewarm, backfill) and before boot.json export so
+    a leaked connection cannot pin multi-GB of already-checkpointed frames.
+    Returns the SQLite triple (busy, log, checkpointed).
+    """
+    allowed = {"PASSIVE", "FULL", "RESTART", "TRUNCATE"}
+    mode_u = (mode or "TRUNCATE").upper()
+    if mode_u not in allowed:
+        mode_u = "TRUNCATE"
+    with sqlite_connect() as conn:
+        row = conn.execute(f"PRAGMA wal_checkpoint({mode_u})").fetchone()
+    logger.info("wal_checkpoint(%s)=%s", mode_u, row)
+    return tuple(row) if row else (0, 0, 0)
 
 
 # Create table queries
@@ -224,7 +273,7 @@ def persist_expected_release_fw_vols(release_id: int | None = None) -> dict:
     usable metrics. Returns counts for logging.
     """
     stats = {"updated": 0, "skipped_no_metrics": 0, "skipped_stub": 0, "errors": 0}
-    with sqlite3.connect(DATABASE_NAME) as conn:
+    with sqlite_connect() as conn:
         ensure_expected_releases_fw_columns(conn)
         cur = conn.cursor()
         if release_id is not None:
@@ -459,7 +508,7 @@ def refresh_marketshare_search_distributors(*, persist: bool = True) -> int:
         "sqlite_handler: refreshing MARKETSHARE_SEARCH_DISTRIBUTORS (db=%s)",
         DATABASE_NAME,
     )
-    with sqlite3.connect(DATABASE_NAME) as conn:
+    with sqlite_connect() as conn:
         ensure_marketshare_search_summary_columns(conn)
         ensure_marketshare_search_summary_singles_columns(conn)
         ensure_marketshare_search_distributors_table(conn)
@@ -522,7 +571,7 @@ def refresh_marketshare_search_artists() -> int:
     """
     logger.info("sqlite_handler: refreshing MARKETSHARE_SEARCH_ARTISTS (db=%s)", DATABASE_NAME)
 
-    with sqlite3.connect(DATABASE_NAME) as conn:
+    with sqlite_connect() as conn:
         ensure_marketshare_search_summary_columns(conn)
         ensure_marketshare_search_summary_singles_columns(conn)
         ensure_marketshare_search_artists_table(conn)
@@ -617,7 +666,7 @@ def fill_missing_search_snapshot_artist_ids(*, batch_size: int = 8000) -> dict:
     if batch_size < 1:
         raise ValueError("batch_size must be a positive integer.")
 
-    with sqlite3.connect(DATABASE_NAME) as conn:
+    with sqlite_connect() as conn:
         ensure_marketshare_search_summary_columns(conn)
         ensure_marketshare_search_summary_singles_columns(conn)
         conn.commit()
@@ -730,7 +779,7 @@ def fill_missing_search_snapshot_artist_ids(*, batch_size: int = 8000) -> dict:
 
     updates = [(aid, mid) for mid, aid in mapping.items()]
     try:
-        with sqlite3.connect(DATABASE_NAME) as conn:
+        with sqlite_connect() as conn:
             ensure_marketshare_search_summary_columns(conn)
             ensure_marketshare_search_summary_singles_columns(conn)
             cur = conn.cursor()
@@ -939,7 +988,7 @@ def _refresh_search_snapshot_table(
         )
 
     total_rows = 0
-    with get_snowflake_connection() as sf, sqlite3.connect(DATABASE_NAME) as conn:
+    with get_snowflake_connection() as sf, sqlite_connect() as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute(create_live)
@@ -1128,7 +1177,7 @@ def ensure_marketshare_search_artists_index() -> int:
     If MARKETSHARE_SEARCH_ARTISTS is empty but the snapshots already have
     LUMINATE_ARTIST_ID, rebuild the typeahead locally (no Snowflake).
     """
-    with sqlite3.connect(DATABASE_NAME) as conn:
+    with sqlite_connect() as conn:
         ensure_marketshare_search_summary_columns(conn)
         ensure_marketshare_search_summary_singles_columns(conn)
         ensure_marketshare_search_artists_table(conn)
@@ -1168,7 +1217,7 @@ def ensure_marketshare_search_distributors_index() -> int:
     If MARKETSHARE_SEARCH_DISTRIBUTORS is empty but snapshots have LABEL_NAME,
     rebuild the typeahead locally (no Snowflake).
     """
-    with sqlite3.connect(DATABASE_NAME) as conn:
+    with sqlite_connect() as conn:
         ensure_marketshare_search_summary_columns(conn)
         ensure_marketshare_search_summary_singles_columns(conn)
         ensure_marketshare_search_distributors_table(conn)
@@ -1617,7 +1666,7 @@ def refresh_daily_global_streams_for_mrelg(
         return 0
     max_cached = None
     if not force_full:
-        with sqlite3.connect(DATABASE_NAME) as conn:
+        with sqlite_connect() as conn:
             cur = conn.cursor()
             _ensure_daily_global_streams_table(cur)
             max_cached = _max_daily_streams_report_date(cur, mrelg_id)
@@ -1657,7 +1706,7 @@ def refresh_daily_global_streams_for_mrelg(
     df = df.dropna(subset=["GLOBAL_STREAMS"])
 
     rows = [(mrelg_id, str(d), float(v)) for d, v in zip(df["REPORT_DATE"], df["GLOBAL_STREAMS"])]
-    with sqlite3.connect(DATABASE_NAME) as conn:
+    with sqlite_connect() as conn:
         cur = conn.cursor()
         _ensure_daily_global_streams_table(cur)
         cur.executemany(load_sql(INSERT_DAILY_GLOBAL_STREAMS), rows)
@@ -1685,7 +1734,7 @@ def get_daily_global_streams_for_mrelg(
     if not mrelg_id:
         return pd.DataFrame(columns=["REPORT_DATE", "GLOBAL_STREAMS"])
 
-    with sqlite3.connect(DATABASE_NAME) as conn:
+    with sqlite_connect() as conn:
         cur = conn.cursor()
         _ensure_daily_global_streams_table(cur)
         fresh = _daily_streams_is_fresh(cur, mrelg_id)
@@ -1700,7 +1749,7 @@ def get_daily_global_streams_for_mrelg(
                 e,
             )
 
-    with sqlite3.connect(DATABASE_NAME) as conn:
+    with sqlite_connect() as conn:
         df = pd.read_sql_query(
             load_sql(DAILY_GLOBAL_STREAMS_SQLITE_QUERY),
             conn,
@@ -1727,7 +1776,7 @@ def refresh_weekly_global_streams_for_mrelg(
 
     max_cached = None
     if not force_full:
-        with sqlite3.connect(DATABASE_NAME) as conn:
+        with sqlite_connect() as conn:
             cur = conn.cursor()
             _ensure_weekly_global_streams_table(cur)
             cur.execute(
@@ -1773,7 +1822,7 @@ def refresh_weekly_global_streams_for_mrelg(
         wk_str = wk.strftime("%Y-%m-%d") if hasattr(wk, "strftime") else str(wk).split(" ")[0][:10]
         rows.append((mrelg_id, wk_str, float(val)))
 
-    with sqlite3.connect(DATABASE_NAME) as conn:
+    with sqlite_connect() as conn:
         cur = conn.cursor()
         _ensure_weekly_global_streams_table(cur)
         cur.executemany(load_sql(INSERT_WEEKLY_GLOBAL_STREAMS), rows)
@@ -1801,7 +1850,7 @@ def get_weekly_global_streams_for_mrelg(
     if not mrelg_id:
         return pd.DataFrame(columns=["week_ending_date", "global_streams"])
 
-    with sqlite3.connect(DATABASE_NAME) as conn:
+    with sqlite_connect() as conn:
         cur = conn.cursor()
         _ensure_weekly_global_streams_table(cur)
         fresh = _weekly_streams_is_fresh(cur, mrelg_id)
@@ -1818,7 +1867,7 @@ def get_weekly_global_streams_for_mrelg(
                 e,
             )
 
-    with sqlite3.connect(DATABASE_NAME) as conn:
+    with sqlite_connect() as conn:
         df = pd.read_sql_query(
             load_sql(WEEKLY_GLOBAL_STREAMS_SQLITE_QUERY),
             conn,
@@ -1895,7 +1944,7 @@ def refresh_marketshare_revenue_2025() -> int:
     total_rows = 0
     insert_sql = load_sql(INSERT_MARKETSHARE_REVENUE_2025)
 
-    with sqlite3.connect(DATABASE_NAME) as conn:
+    with sqlite_connect() as conn:
         cursor = conn.cursor()
         cursor.execute(load_sql(CREATE_MARKETSHARE_REVENUE_2025_TABLE))
         cursor.execute(load_sql(DELETE_MARKETSHARE_REVENUE_2025))
@@ -1928,7 +1977,7 @@ def get_catalog_revenue_2025_for_mrelg(mrelg_id: str) -> float | None:
         return None
     mrelg_id = mrelg_id.strip()
     try:
-        with sqlite3.connect(DATABASE_NAME) as conn:
+        with sqlite_connect() as conn:
             cur = conn.cursor()
             cur.execute(load_sql(MARKETSHARE_REVENUE_2025_BY_MRELG_QUERY), (mrelg_id,))
             row = cur.fetchone()
@@ -1951,7 +2000,7 @@ def drop_table(table_name: str) -> None:
     Drops a table from the SQLite database.
     """
     try:
-        with sqlite3.connect(DATABASE_NAME) as conn:
+        with sqlite_connect() as conn:
             cursor = conn.cursor()
             cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
             conn.commit()

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # WEEKLY (Mon 15:00 UTC via crontab): hit /v1/data/refresh_weekly and poll until done.
 #
-# Pipeline (server-side):
-#   CSV-only refresh+train → release backfill → weekly stream prewarm →
-#   export_boot_json_snapshot (FULL boot.json) → S3 sync.
+# Pipeline (server-side), boot first so a CSV timeout cannot leave FE stale:
+#   streaming prewarm → export_boot_json → CSV-only train → release backfill →
+#   S3 sync → second boot export (fresh marketshare / expected releases).
 #
 # Full boot.json includes:
 #   streaming.releases (+ weekly stream actuals)
@@ -11,23 +11,30 @@
 #   releases.items[].weekly  = Actual + Forecast album units
 #     (same path as GET /v1/releases/{id}/weekly; boot version >= 2)
 #
+# Search snapshots (12M) are NOT part of this job.
 # Heavy parquets are skipped by default — call /v1/data/refresh_model when
 # those need rebuilding. Quarterly-share CSVs (bi_sandbox) are best-effort.
 set -euo pipefail
 API_URL="${API_URL:-http://127.0.0.1:8000}"
 POLL_SEC="${POLL_SEC:-30}"
-# Train + backfill + ~1m release-forecast bake into boot; leave headroom.
-MAX_WAIT="${MAX_WAIT:-5400}"
+# Train + backfill + prewarm + boot. 90m timed out 2026-08-24 during prewarm;
+# 3h (18:00 UTC if the job starts at 15:00) covers a slow prewarm.
+# Override with MAX_WAIT=. Set JOB_ID= to resume polling without a new POST.
+MAX_WAIT="${MAX_WAIT:-10800}"
 HDR=()
 [[ -n "${API_KEY:-}" ]] && HDR=(-H "X-API-Key: ${API_KEY}")
 ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 log() { echo "[$(ts)] $*"; }
 
-log "POST $API_URL/v1/data/refresh_weekly"
-RESP=$(curl -sS -X POST "${HDR[@]}" "$API_URL/v1/data/refresh_weekly")
-JOB_ID=$(printf '%s' "$RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("job_id",""))')
-[[ -n "$JOB_ID" ]] || { log "ERROR no job_id: $RESP"; exit 1; }
-log "accepted job_id=$JOB_ID"
+if [[ -z "${JOB_ID:-}" ]]; then
+  log "POST $API_URL/v1/data/refresh_weekly"
+  RESP=$(curl -sS -X POST "${HDR[@]}" "$API_URL/v1/data/refresh_weekly")
+  JOB_ID=$(printf '%s' "$RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("job_id",""))')
+  [[ -n "$JOB_ID" ]] || { log "ERROR no job_id: $RESP"; exit 1; }
+  log "accepted job_id=$JOB_ID"
+else
+  log "resume poll job_id=$JOB_ID MAX_WAIT=${MAX_WAIT}s"
+fi
 
 START=$(date +%s); LAST_STEP=""
 while :; do

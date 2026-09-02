@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 from sqlite_handler import (
     DATABASE_NAME,
+    sqlite_connect,
     ensure_expected_releases_fw_columns,
     ensure_marketshare_search_artists_table,
     ensure_marketshare_search_distributors_table,
@@ -120,6 +121,7 @@ GLOBAL_STREAMING_QUERY = "query_release_global_streaming.sql"
 CREATE_STREAMING_ROSTER_2026_TABLE = "create_streaming_roster_2026_table.sql"
 INSERT_STREAMING_ROSTER_2026 = "insert_streaming_roster_2026.sql"
 STREAMING_ROSTER_2026_LIST_QUERY = "streaming_roster_2026_list.sql"
+MRELG_ISRC_STREAM_SHARE_QUERY = "query_mrelg_isrc_stream_share.sql"
 
 _RELEASE_FIELD_KEYS = frozenset(
     {
@@ -1552,7 +1554,7 @@ def create_release(
     )
     try:
         query = load_sql(RELEASE_CREATE_QUERY)
-        with sqlite3.connect(DATABASE_NAME) as conn:
+        with sqlite_connect() as conn:
             ensure_expected_releases_fw_columns(conn)
             cursor = conn.cursor()
             id = cursor.execute(query, params).fetchone()[0]
@@ -1820,7 +1822,7 @@ def streaming_forecast_route(product_type: str | None) -> str:
 
 def _max_streaming_roster_release_date() -> str | None:
     """Latest RELEASE_DATE in STREAMING_ROSTER_2026, or None if empty/null."""
-    with sqlite3.connect(DATABASE_NAME) as conn:
+    with sqlite_connect() as conn:
         ensure_streaming_roster_2026_table(conn)
         cur = conn.cursor()
         cur.execute("SELECT MAX(RELEASE_DATE) FROM STREAMING_ROSTER_2026")
@@ -1832,7 +1834,7 @@ def _max_streaming_roster_release_date() -> str | None:
 
 
 def _streaming_roster_mrelg_ids() -> set[str]:
-    with sqlite3.connect(DATABASE_NAME) as conn:
+    with sqlite_connect() as conn:
         ensure_streaming_roster_2026_table(conn)
         cur = conn.cursor()
         cur.execute("SELECT MRELG_ID FROM STREAMING_ROSTER_2026")
@@ -1892,7 +1894,7 @@ def _streaming_roster_rows_from_df(df: pd.DataFrame) -> List[tuple]:
 
 def _streaming_roster_mrelgs_missing_artist_id() -> list[str]:
     """Roster MRELG IDs with no LUMINATE_ARTIST_ID yet."""
-    with sqlite3.connect(DATABASE_NAME) as conn:
+    with sqlite_connect() as conn:
         ensure_streaming_roster_2026_table(conn)
         cur = conn.cursor()
         cur.execute(
@@ -1956,7 +1958,7 @@ def _fill_missing_roster_artist_ids(*, batch_size: int = 500) -> dict:
         return stats
 
     try:
-        with sqlite3.connect(DATABASE_NAME) as conn:
+        with sqlite_connect() as conn:
             ensure_streaming_roster_2026_table(conn)
             cur = conn.cursor()
             cur.executemany(
@@ -2072,7 +2074,7 @@ def backfill_streaming_roster() -> dict:
     upserted = 0
 
     try:
-        with sqlite3.connect(DATABASE_NAME) as conn:
+        with sqlite_connect() as conn:
             ensure_streaming_roster_2026_table(conn)
             cur = conn.cursor()
             if full_refresh or not existing:
@@ -2117,7 +2119,7 @@ def backfill_streaming_roster() -> dict:
 
 def get_streaming_roster_2026() -> List[dict]:
     """All rows in STREAMING_ROSTER_2026 for the streaming revenue board."""
-    with sqlite3.connect(DATABASE_NAME) as conn:
+    with sqlite_connect() as conn:
         ensure_streaming_roster_2026_table(conn)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
@@ -2374,7 +2376,7 @@ def update_release(
     )
     try:
         query = load_sql(RELEASE_UPDATE_QUERY)
-        with sqlite3.connect(DATABASE_NAME) as conn:
+        with sqlite_connect() as conn:
             ensure_expected_releases_fw_columns(conn)
             cursor = conn.cursor()
             cursor.execute(query, params)
@@ -2391,7 +2393,7 @@ def delete_release(id: int) -> None:
     _verify_id(id)
     try:
         query = load_sql(RELEASE_DELETE_QUERY)
-        with sqlite3.connect(DATABASE_NAME) as conn:
+        with sqlite_connect() as conn:
             cursor = conn.cursor()
             cursor.execute(query, (id,))
             conn.commit()
@@ -2407,7 +2409,7 @@ def get_release(id: int) -> dict:
     _verify_id(id)
     query = load_sql(RELEASE_GET_QUERY)
     try:
-        with sqlite3.connect(DATABASE_NAME) as conn:
+        with sqlite_connect() as conn:
             ensure_expected_releases_fw_columns(conn)
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
@@ -2543,7 +2545,7 @@ def _fetch_artist_search_candidates(
         f"FROM {MARKETSHARE_SEARCH_ARTISTS_TABLE}"
     )
     try:
-        with sqlite3.connect(DATABASE_NAME) as conn:
+        with sqlite_connect() as conn:
             conn.row_factory = sqlite3.Row
             ensure_marketshare_search_artists_table(conn)
             conn.commit()
@@ -2768,7 +2770,7 @@ def get_releases_by_artist(luminate_artist_id: str) -> List[Dict[str, Any]]:
     span: Dict[str, Any] = {}
     t_start = _now()
     try:
-        with sqlite3.connect(DATABASE_NAME) as conn:
+        with sqlite_connect() as conn:
             conn.row_factory = sqlite3.Row
             ensure_marketshare_search_summary_columns(conn)
             ensure_marketshare_search_summary_singles_columns(conn)
@@ -2834,7 +2836,7 @@ def search_distributors(
     sql = load_sql(SEARCH_DISTRIBUTORS_QUERY)
 
     def _run(pattern: str) -> List[sqlite3.Row]:
-        with sqlite3.connect(DATABASE_NAME) as conn:
+        with sqlite_connect() as conn:
             conn.row_factory = sqlite3.Row
             ensure_marketshare_search_distributors_table(conn)
             conn.commit()
@@ -2912,7 +2914,7 @@ def get_releases_by_distributor(
     t_start = _now()
     fetch_n = limit + 1
     try:
-        with sqlite3.connect(DATABASE_NAME) as conn:
+        with sqlite_connect() as conn:
             conn.row_factory = sqlite3.Row
             ensure_marketshare_search_summary_columns(conn)
             ensure_marketshare_search_summary_singles_columns(conn)
@@ -2997,7 +2999,7 @@ def get_known_vols_with_dates(
         f"ORDER BY date(WEEK_ENDING_DATE) ASC;"
     )
 
-    with sqlite3.connect(DATABASE_NAME) as conn:
+    with sqlite_connect() as conn:
         df = pd.read_sql_query(sql, conn, params=(int(release_id),))
     if df.empty:
         return [], []
@@ -3026,7 +3028,7 @@ def get_known_component_vols(
         f"ORDER BY date(WEEK_ENDING_DATE) ASC;"
     )
 
-    with sqlite3.connect(DATABASE_NAME) as conn:
+    with sqlite_connect() as conn:
         df = pd.read_sql_query(sql, conn, params=(int(release_id),))
 
     result: Dict[str, List[float]] = {"streams": [], "sales": [], "songs": []}
@@ -3327,47 +3329,76 @@ def _resolved_required_parquet_names() -> list[str]:
     return out
 
 
+def _weekly_export_boot(
+    summary: Dict[str, Any],
+    *,
+    step: str,
+    stage_key: str,
+) -> None:
+    """Build/upload boot.json and record the stage. Re-raises on failure."""
+    from api.jobs import set_step
+
+    set_step(step)
+    t0 = _now()
+    try:
+        boot_summary = export_boot_json_snapshot()
+        payload = {
+            "ok": True,
+            "elapsed_sec": _elapsed(t0),
+            **{k: v for k, v in boot_summary.items() if k != "ok"},
+        }
+        summary["stages"][stage_key] = payload
+        # Cron poller reads stages.boot_json — always keep the latest export there.
+        summary["stages"]["boot_json"] = payload
+    except Exception as e:
+        logger.exception("refresh_weekly: export_boot_json_snapshot failed (%s)", step)
+        err = {
+            "ok": False,
+            "error": str(e),
+            "elapsed_sec": _elapsed(t0),
+        }
+        summary["stages"][stage_key] = err
+        summary["stages"]["boot_json"] = err
+        raise
+
+
 def refresh_weekly(force_refresh_parquets: bool = False) -> dict:
     """
     Single weekly orchestration designed around the canonical S3 pattern:
       - Pull only weekly inputs (db + csvs + artifacts_75k) to local disk.
-      - Train CSV-only (skips heavy parquet KMeans/archetype decay).
-      - Push weekly outputs (db + csvs + artifacts_75k) back to S3.
+      - Publish streaming boot first so Monday cron cannot time out before
+        the frontend board updates.
+      - Then pull marketshare CSVs, retrain, backfill expected releases.
+      - Push weekly outputs (db + csvs + artifacts_75k) back to S3 and
+        re-export boot so marketshare / expected-release curves are current.
 
-    Heavy steps (parquet rebuild, full backfill) are intentionally separated
-    so the weekly path stays fast, low-memory, and reliable. Use the dedicated
-    endpoints when those need to run:
+    Heavy steps (parquet rebuild, full search-snapshot extract, full roster
+    YTD) stay off this path. Use dedicated endpoints when those need to run:
       - /v1/data/refresh_model  — rebuild AE + worldwide parquets
       - /v1/data/refresh_data   — full retrain (parquets + archetypes + csvs)
       - /v1/releases/backfill   — full release backfill
 
     Stage order:
-      1. (optional) refresh_parquets — only when force_refresh_parquets=True.
-         Pulls the parquets scope from S3 first so the rebuild starts from
-         the canonical state; pushes them back when done.
-      2. refresh_data(csv_only=True) — pulls 3 CSVs incrementally from
-         Snowflake and retrains LGBM / Prophet / spike / df_full from CSVs
-         only. Skips AE parquet KMeans/DNA and all archetype decay.
-      3. backfill_releases — inserts new mrelg_ids and refreshes per-release
-         historical metrics. Skipped when TIDE_WEEKLY_SKIP_BACKFILL=1.
-      4. (optional) backfill_streaming_roster — skipped by default
-         (TIDE_WEEKLY_SKIP_STREAMING_ROSTER_BACKFILL=1).
-      5. prewarm_streaming_roster_caches(weekly only) + export_boot_json_snapshot
-         (FULL boot.json: streaming actuals, marketshare, expected releases with
-         Actual+Forecast album units via get_release_forecasts). Boot export
-         failure fails the weekly job so Monday cron cannot silently ship a
-         stale/partial boot.
+      1. (optional) backfill_streaming_roster — off by default
+         (TIDE_WEEKLY_SKIP_STREAMING_ROSTER_BACKFILL=1). Daily cron already
+         incrementally updates the roster.
+      2. prewarm_streaming_roster_caches (weekly streams) + export_boot_json
+         (streaming board + last week's marketshare/releases baked in).
+         Boot export failure fails the job.
+      3. (optional) refresh_parquets — only when force_refresh_parquets=True.
+      4. refresh_data(csv_only=True) — marketshare CSVs + LGBM / Prophet /
+         spike / df_full. Skips AE parquet KMeans/DNA and archetype decay.
+      5. backfill_releases — new Luminate titles. Skipped when
+         TIDE_WEEKLY_SKIP_BACKFILL=1.
+      6. S3 push + second boot export (fresh marketshare + expected releases).
 
-    Returns a per-stage summary. Stage 1 failures are non-fatal (archetype)
-    training falls back to whatever parquets are already on disk); stages 2
-    and 3 re-raise so the job is marked failed. Stage 5 boot export also
-    re-raises on failure.
+    Search snapshots (12M Snowflake extract) are not part of this job.
+
+    Returns a per-stage summary. CSV train, release backfill, and both boot
+    exports re-raise on failure. Optional parquet rebuild is non-fatal.
 
     Progress: each stage calls api.jobs.set_step() so the caller can
-    diagnose which phase is slow by polling GET /v1/jobs/{id}.steps. The
-    import is local to avoid a hard dependency on the api package when this
-    module is imported outside FastAPI (e.g. by a script). set_step() is a
-    no-op when not running under a JobManager.
+    diagnose which phase is slow by polling GET /v1/jobs/{id}.steps.
     """
     from api.jobs import set_step
 
@@ -3386,8 +3417,62 @@ def refresh_weekly(force_refresh_parquets: bool = False) -> dict:
     sync_weekly_inputs_from_s3()
     set_step("sync_from_s3:done")
 
-    # Stage 1: parquet rebuild (opt-in only). Pull parquet scope first so the
-    # rebuild has the latest canonical state, then push the new ones back.
+    if skip_streaming_roster:
+        logger.info(
+            "refresh_weekly: skipping backfill_streaming_roster "
+            "(TIDE_WEEKLY_SKIP_STREAMING_ROSTER_BACKFILL=1). "
+            "Run POST /v1/revenue/backfill_streaming_roster for YTD or incremental roster."
+        )
+        summary["stages"]["backfill_streaming_roster"] = {
+            "ok": True,
+            "skipped": True,
+            "reason": "TIDE_WEEKLY_SKIP_STREAMING_ROSTER_BACKFILL=1",
+        }
+    else:
+        set_step("backfill_streaming_roster:start")
+        t0 = _now()
+        try:
+            streaming_result = backfill_streaming_roster()
+            summary["stages"]["backfill_streaming_roster"] = {
+                "ok": True,
+                "elapsed_sec": _elapsed(t0),
+                **streaming_result,
+            }
+        except Exception as e:
+            logger.exception("refresh_weekly: backfill_streaming_roster failed")
+            summary["stages"]["backfill_streaming_roster"] = {
+                "ok": False,
+                "error": str(e),
+                "elapsed_sec": _elapsed(t0),
+            }
+
+    # Streaming board first so a later CSV/train timeout cannot leave boot stale.
+    set_step("prewarm_streaming_roster:start")
+    t0 = _now()
+    try:
+        prewarm_stats = prewarm_streaming_roster_caches(
+            daily=False, weekly=True, only_stale=True
+        )
+        summary["stages"]["prewarm_streaming_roster"] = {
+            "ok": True,
+            "elapsed_sec": _elapsed(t0),
+            **prewarm_stats,
+        }
+    except Exception as e:
+        logger.exception("refresh_weekly: prewarm_streaming_roster_caches failed")
+        summary["stages"]["prewarm_streaming_roster"] = {
+            "ok": False,
+            "error": str(e),
+            "elapsed_sec": _elapsed(t0),
+        }
+
+    _weekly_export_boot(
+        summary,
+        step="export_boot_json:start",
+        stage_key="boot_json_early",
+    )
+
+    # Opt-in parquet rebuild after boot so Monday FE is not blocked on it.
     if force_refresh_parquets:
         set_step("refresh_parquets:start")
         t0 = _now()
@@ -3419,7 +3504,7 @@ def refresh_weekly(force_refresh_parquets: bool = False) -> dict:
             "reason": "weekly path is CSV-only by design",
         }
 
-    # Stage 2: CSV-only training. Quarterly-share CSVs (bi_sandbox) are
+    # Marketshare CSVs + train. Quarterly-share CSVs (bi_sandbox) are
     # best-effort inside refresh_data; core CSVs + train still run when they fail.
     set_step("refresh_data:start")
     t0 = _now()
@@ -3448,7 +3533,6 @@ def refresh_weekly(force_refresh_parquets: bool = False) -> dict:
         reload_artifacts()
         raise
 
-    # Stage 3: backfill (skippable for fast weekly runs).
     if skip_backfill:
         logger.info(
             "refresh_weekly: skipping backfill_releases (TIDE_WEEKLY_SKIP_BACKFILL=1). "
@@ -3476,63 +3560,10 @@ def refresh_weekly(force_refresh_parquets: bool = False) -> dict:
             reload_artifacts()
             raise
 
-    if skip_streaming_roster:
-        logger.info(
-            "refresh_weekly: skipping backfill_streaming_roster "
-            "(TIDE_WEEKLY_SKIP_STREAMING_ROSTER_BACKFILL=1). "
-            "Run POST /v1/revenue/backfill_streaming_roster for YTD or incremental roster."
-        )
-        summary["stages"]["backfill_streaming_roster"] = {
-            "ok": True,
-            "skipped": True,
-            "reason": "TIDE_WEEKLY_SKIP_STREAMING_ROSTER_BACKFILL=1",
-        }
-    else:
-        set_step("backfill_streaming_roster:start")
-        t0 = _now()
-        try:
-            streaming_result = backfill_streaming_roster()
-            summary["stages"]["backfill_streaming_roster"] = {
-                "ok": True,
-                "elapsed_sec": _elapsed(t0),
-                **streaming_result,
-            }
-        except Exception as e:
-            logger.exception("refresh_weekly: backfill_streaming_roster failed")
-            summary["stages"]["backfill_streaming_roster"] = {
-                "ok": False,
-                "error": str(e),
-                "elapsed_sec": _elapsed(t0),
-            }
-
     set_step("reload_artifacts")
     reload_artifacts()
 
-    # Ensure weekly worldwide streams exist for roster titles, then export the
-    # FULL boot.json (streaming actuals + marketshare + expected-release
-    # Actual+Forecast album units) for Monday cron / FE cold start.
-    set_step("prewarm_streaming_roster:start")
-    t0 = _now()
-    try:
-        prewarm_stats = prewarm_streaming_roster_caches(
-            daily=False, weekly=True, only_stale=True
-        )
-        summary["stages"]["prewarm_streaming_roster"] = {
-            "ok": True,
-            "elapsed_sec": _elapsed(t0),
-            **prewarm_stats,
-        }
-    except Exception as e:
-        logger.exception("refresh_weekly: prewarm_streaming_roster_caches failed")
-        summary["stages"]["prewarm_streaming_roster"] = {
-            "ok": False,
-            "error": str(e),
-            "elapsed_sec": _elapsed(t0),
-        }
-
-    # Push CSVs / DB / artifacts even if boot export fails. Monday 2026-08-17
-    # trained successfully then died at boot.json (EMFILE); S3 stayed on the
-    # prior week's snapshot because this sync lived after the raise.
+    # Push CSVs / DB / artifacts even if the second boot export fails.
     set_step("sync_to_s3")
     t0 = _now()
     try:
@@ -3547,24 +3578,11 @@ def refresh_weekly(force_refresh_parquets: bool = False) -> dict:
         }
         raise
 
-    set_step("export_boot_json:start")
-    t0 = _now()
-    try:
-        boot_summary = export_boot_json_snapshot()
-        summary["stages"]["boot_json"] = {
-            "ok": True,
-            "elapsed_sec": _elapsed(t0),
-            **{k: v for k, v in boot_summary.items() if k != "ok"},
-        }
-    except Exception as e:
-        logger.exception("refresh_weekly: export_boot_json_snapshot failed")
-        summary["stages"]["boot_json"] = {
-            "ok": False,
-            "error": str(e),
-            "elapsed_sec": _elapsed(t0),
-        }
-        # Monday cron must publish full boot (incl. expected-release forecasts).
-        raise
+    _weekly_export_boot(
+        summary,
+        step="export_boot_json_after_marketshare:start",
+        stage_key="boot_json_after_marketshare",
+    )
 
     set_step("done")
     return summary
@@ -3648,7 +3666,7 @@ def df_to_json(
 
 def _get_all_release_rows() -> List[sqlite3.Row]:
     query = load_sql(RELEASE_GET_ALL_QUERY)
-    with sqlite3.connect(DATABASE_NAME) as conn:
+    with sqlite_connect() as conn:
         ensure_expected_releases_fw_columns(conn)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
@@ -3992,7 +4010,7 @@ def _sqlite_fw_peak_for_mrelg(mrelg_id: str) -> float:
     if not key:
         return 0.0
     try:
-        with sqlite3.connect(DATABASE_NAME) as conn:
+        with sqlite_connect() as conn:
             ensure_expected_releases_fw_columns(conn)
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
@@ -4185,6 +4203,109 @@ def get_daily_global_streams_by_mrelg(mrelg_id: str) -> pd.DataFrame:
     return df[["report_date", "global_streams"]]
 
 
+def get_mrelg_isrc_report(
+    mrelg_id: str,
+    *,
+    year: Optional[int] = None,
+) -> pd.DataFrame:
+    """
+    Live MRELG popup — US OnDemand stream share by ISRC for one release group.
+
+    Hits Snowflake and returns a DataFrame. Does not write SQLite, S3, or disk.
+    Duplicate ISRCs from split attribution are expected; us_stream_share is
+    quantity * (percent_owned / 100).
+
+    ``year`` defaults to the current calendar year (the FE "2026 ISRC report"
+    button). Window is Jan 1 of that year through yesterday (or Dec 31 if
+    the year is already closed).
+    """
+    import re
+
+    from sqlite_handler import _snowflake_str
+
+    if not isinstance(mrelg_id, str) or not mrelg_id.strip():
+        raise ValueError("mrelg_id is required.")
+    mrelg_id = mrelg_id.strip()
+    if not re.fullmatch(r"MRELG[0-9A-Fa-f]{32}", mrelg_id):
+        raise ValueError("mrelg_id is not a valid Luminate release-group id.")
+
+    this_year = date.today().year
+    if year is None:
+        year = this_year
+    try:
+        year_i = int(year)
+    except (TypeError, ValueError) as e:
+        raise ValueError("year must be an integer.") from e
+    if year_i < 2018 or year_i > this_year:
+        raise ValueError(f"year must be between 2018 and {this_year}.")
+
+    date_predicate = (
+        f"AND mrd.report_date >= DATE '{year_i:04d}-01-01'\n"
+        f"    AND mrd.report_date < LEAST(DATE '{year_i + 1:04d}-01-01', CURRENT_DATE())"
+    )
+    # Replace tokens in the full file. Comments must not contain the brace
+    # token names — a multi-line DATE_PREDICATE would leak out of -- lines.
+    sql = (
+        load_sql(MRELG_ISRC_STREAM_SHARE_QUERY)
+        .replace("{MRELG_ID}", _snowflake_str(mrelg_id))
+        .replace("{MR_ID_FILTER}", "")
+        .replace("{DATE_PREDICATE}", date_predicate)
+    )
+
+    with get_snowflake_connection() as sf:
+        if sf.conn is not None:
+            cur = sf.conn.cursor()
+            try:
+                cur.execute("ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 120")
+            finally:
+                cur.close()
+        df = sf.query(sql)
+
+    if df is None or df.empty:
+        return pd.DataFrame(
+            columns=[
+                "mr_id",
+                "isrc",
+                "title",
+                "display_artist",
+                "release_date",
+                "is_current",
+                "country_code",
+                "level_1_distributor",
+                "level_2_distributor",
+                "level_3_distributor",
+                "percent_owned",
+                "yearid",
+                "us_stream_share",
+            ]
+        )
+
+    df = df.rename(columns=str.lower)
+    if "release_date" in df.columns:
+        df["release_date"] = df["release_date"].apply(
+            lambda v: str(v).split(" ")[0][:10] if v is not None and not pd.isna(v) else ""
+        )
+    if "percent_owned" in df.columns:
+        df["percent_owned"] = pd.to_numeric(df["percent_owned"], errors="coerce")
+    if "us_stream_share" in df.columns:
+        df["us_stream_share"] = pd.to_numeric(df["us_stream_share"], errors="coerce")
+    if "yearid" in df.columns:
+        df["yearid"] = pd.to_numeric(df["yearid"], errors="coerce")
+    return df
+
+
+def mrelg_isrc_report_csv_bytes(df: pd.DataFrame) -> bytes:
+    """UTF-8 CSV for the FE download button. In-memory only."""
+    out = df.copy() if df is not None else pd.DataFrame()
+    if "percent_owned" in out.columns:
+        out["percent_owned"] = pd.to_numeric(out["percent_owned"], errors="coerce").round(2)
+    if "us_stream_share" in out.columns:
+        out["us_stream_share"] = pd.to_numeric(out["us_stream_share"], errors="coerce").round(2)
+    buf = io.StringIO()
+    out.to_csv(buf, index=False)
+    return buf.getvalue().encode("utf-8")
+
+
 def get_catalog_revenue_2025_by_mrelg(mrelg_id: str) -> Dict[str, Any]:
     """
     Live Revenue board — 2025 catalog revenue for a single MRELG release
@@ -4231,7 +4352,7 @@ def _resolve_mrelg_metadata_local(
     back to Snowflake (and reuse an existing session if it has one).
     """
     try:
-        with sqlite3.connect(DATABASE_NAME) as conn:
+        with sqlite_connect() as conn:
             conn.row_factory = sqlite3.Row
             if search_table == MARKETSHARE_SEARCH_SUMMARY_SINGLES_TABLE:
                 ensure_marketshare_search_summary_singles_columns(conn)
@@ -4591,7 +4712,7 @@ def _get_known_vols_global_streaming(
 def _resolve_mrelg_metadata_from_streaming_roster(mrelg_id: str) -> Optional[Dict[str, Any]]:
     """Metadata from STREAMING_ROSTER_2026 when search tables lack the row."""
     try:
-        with sqlite3.connect(DATABASE_NAME) as conn:
+        with sqlite_connect() as conn:
             ensure_streaming_roster_2026_table(conn)
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
@@ -4674,7 +4795,7 @@ def prewarm_streaming_roster_caches(
                 continue
 
             try:
-                with sqlite3.connect(DATABASE_NAME) as conn:
+                with sqlite_connect() as conn:
                     cur = conn.cursor()
                     do_daily = False
                     do_weekly = False
@@ -4700,6 +4821,18 @@ def prewarm_streaming_roster_caches(
                         mrelg_id, release_date, sf_conn=sf
                     )
                     stats["weekly_refreshed"] += 1
+                refreshed = stats["daily_refreshed"] + stats["weekly_refreshed"]
+                if (do_daily or do_weekly) and refreshed % 25 == 0:
+                    try:
+                        from sqlite_handler import wal_checkpoint
+
+                        wal_checkpoint("TRUNCATE")
+                    except Exception:
+                        logger.warning(
+                            "prewarm_streaming_roster: wal_checkpoint failed at %d refreshes",
+                            refreshed,
+                            exc_info=True,
+                        )
             except Exception as e:
                 stats["errors"].append({"mrelg_id": mrelg_id, "error": str(e)})
                 logger.exception(
@@ -4717,6 +4850,13 @@ def prewarm_streaming_roster_caches(
                     stats["daily_refreshed"],
                     stats["weekly_refreshed"],
                 )
+
+    try:
+        from sqlite_handler import wal_checkpoint
+
+        wal_checkpoint("TRUNCATE")
+    except Exception:
+        logger.warning("prewarm_streaming_roster: final wal_checkpoint failed", exc_info=True)
 
     if stats["daily_refreshed"] or stats["weekly_refreshed"]:
         sync_db_to_s3()

@@ -21,3 +21,4 @@ data/
 *.log
 
 cloudflared.deb
+marketshare_data.db-wal

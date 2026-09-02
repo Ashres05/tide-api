@@ -36,14 +36,19 @@ curl -s http://127.0.0.1:8000/v1/jobs/<job_id>
 
 `refresh_weekly` runs, in order:
 
-1. (optional) parquet refresh — only with `force_refresh_parquets=true`
-2. `refresh_data` (CSV-only) — pulls CSVs and retrains LGBM / Prophet / spike /
-   `df_full`
-3. `backfill_releases` — new Luminate releases into SQLite + metrics
-4. (optional) streaming roster backfill — off by default
-5. weekly stream prewarm + **`export_boot_json_snapshot`** — publishes the
-   **full** `boot.json` (streaming actuals, marketshare, expected releases with
-   **Actual + Forecast** album units). Boot export failure fails the job.
+1. (optional) streaming roster backfill — off by default
+2. weekly stream prewarm + **first `export_boot_json_snapshot`** — publishes
+   `boot.json` so the streaming board is not stuck behind CSV train. Boot
+   export failure fails the job.
+3. (optional) parquet refresh — only with `force_refresh_parquets=true`
+4. `refresh_data` (CSV-only) — pulls marketshare CSVs and retrains LGBM /
+   Prophet / spike / `df_full`
+5. `backfill_releases` — new Luminate releases into SQLite + metrics
+6. S3 push + **second boot export** — marketshare and expected-release
+   curves in `boot.json` match the new CSVs
+
+Search snapshots (catalog artist/distributor index, ~12M Snowflake rows) are
+not on this cron. They are a separate multi-hour extract.
 
 Crontab (this host): `0 15 * * 1 …/api_refresh_s3.sh` → Monday 15:00 UTC.
 

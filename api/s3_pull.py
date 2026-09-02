@@ -409,8 +409,10 @@ def sync_artifacts_to_s3_if_configured(
         if not path.is_file():
             return
         try:
-            with sqlite3.connect(str(path)) as conn:
-                conn.execute("PRAGMA wal_checkpoint(FULL)")
+            from sqlite_handler import sqlite_connect
+
+            with sqlite_connect(str(path)) as conn:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except sqlite3.Error:
             logger.warning(
                 "S3 push: wal_checkpoint failed for %s; uploading anyway",
