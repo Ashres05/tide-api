@@ -13,6 +13,9 @@ archetypes_artifacts/
 
 # Ignore data
 *.db
+*.db-wal
+*.db-shm
+*.db-journal
 *.csv
 *.parquet
 data/
@@ -21,4 +24,3 @@ data/
 *.log
 
 cloudflared.deb
-marketshare_data.db-wal
