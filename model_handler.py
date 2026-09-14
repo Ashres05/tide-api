@@ -1802,7 +1802,9 @@ def backfill_releases(
         )
         try:
             from sqlite_handler import update_sqlite_main
-            update_sqlite_main()
+            # Weekly cron cannot absorb the multi-hour search snapshot rebuild;
+            # metrics + fw_vol still refresh. Search is a separate job / opt-in.
+            update_sqlite_main(refresh_search=False)
         except Exception as e:
             errors.append(
                 {

@@ -18,9 +18,11 @@ set -euo pipefail
 API_URL="${API_URL:-http://127.0.0.1:8000}"
 POLL_SEC="${POLL_SEC:-30}"
 # Train + backfill + prewarm + boot. 90m timed out 2026-08-24 during prewarm;
-# 3h (18:00 UTC if the job starts at 15:00) covers a slow prewarm.
+# 3h timed out 2026-09-14 while backfill→update_sqlite was still rebuilding
+# search (now skipped on that path). 5h is a safety net for a cold prewarm of
+# ~550 roster MRELGs on XS warehouse (~1–2 min each when all stale).
 # Override with MAX_WAIT=. Set JOB_ID= to resume polling without a new POST.
-MAX_WAIT="${MAX_WAIT:-10800}"
+MAX_WAIT="${MAX_WAIT:-18000}"
 HDR=()
 [[ -n "${API_KEY:-}" ]] && HDR=(-H "X-API-Key: ${API_KEY}")
 ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }

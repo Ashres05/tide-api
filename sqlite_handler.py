@@ -1312,13 +1312,27 @@ def recompute_ytd_share_from_current_data(data_path: Path) -> pd.DataFrame:
     return out[["YEAR", "WEEK_ENDING_DATE", "LABEL_NAME", "ALBUM_EQUIVALENT_SHARE"]]
 
 
-def update_sqlite_main() -> None:
+def update_sqlite_main(*, refresh_search: bool | None = None) -> None:
     """
     Loads the weekly and ytd marketshare data from Snowflake and saves it to SQLite database.
     The SQLite database is located in the data folder.
     Other SQLite database tables are currently not being updated by this script.
+
+    refresh_search:
+      Rebuild MARKETSHARE_SEARCH_SUMMARY(+_SINGLES). Default True, unless
+      TIDE_SQLITE_SKIP_SEARCH=1. Weekly release backfill passes False — those
+      5M+ row upserts are multi-hour and are not part of the weekly cron budget
+      (see api_refresh_s3.sh). Run search refresh via a dedicated job when needed.
     """
-    logger.info("sqlite_handler: starting refresh (db=%s)", DATABASE_NAME)
+    if refresh_search is None:
+        refresh_search = os.environ.get("TIDE_SQLITE_SKIP_SEARCH", "").strip().lower() not in (
+            "1", "true", "yes",
+        )
+    logger.info(
+        "sqlite_handler: starting refresh (db=%s, refresh_search=%s)",
+        DATABASE_NAME,
+        refresh_search,
+    )
     # Connect to SQLite database
     sqlite_conn = sqlite3.connect(DATABASE_NAME)
     cursor = sqlite_conn.cursor()
@@ -1531,18 +1545,22 @@ def update_sqlite_main() -> None:
     except Exception:
         logger.exception("sqlite_handler: persist_expected_release_fw_vols failed")
 
-    # Rebuild the search-summary table from Snowflake. Daily-stream snapshot
-    # data is fully replaced rather than merged so search results never carry
-    # stale popularity numbers between refreshes.
-    try:
-        refresh_marketshare_search_summary()
-    except Exception as e:
-        logger.exception("sqlite_handler: search summary refresh failed: %s", e)
+    # Search snapshots are optional here — multi-hour full rebuilds.
+    if refresh_search:
+        try:
+            refresh_marketshare_search_summary()
+        except Exception as e:
+            logger.exception("sqlite_handler: search summary refresh failed: %s", e)
 
-    try:
-        refresh_marketshare_search_summary_singles()
-    except Exception as e:
-        logger.exception("sqlite_handler: singles search summary refresh failed: %s", e)
+        try:
+            refresh_marketshare_search_summary_singles()
+        except Exception as e:
+            logger.exception("sqlite_handler: singles search summary refresh failed: %s", e)
+    else:
+        logger.info(
+            "sqlite_handler: skipping MARKETSHARE_SEARCH_SUMMARY rebuild "
+            "(refresh_search=False / TIDE_SQLITE_SKIP_SEARCH)"
+        )
 
     logger.info("sqlite_handler: refresh complete")
 
@@ -1556,10 +1574,13 @@ def update_sqlite_main() -> None:
 # ---------------------------------------------------------------------------
 
 DAILY_STREAMS_STALE_DAYS = 2
+# Fallback only; prefer chart-week freshness in _weekly_streams_is_fresh.
 WEEKLY_STREAMS_STALE_DAYS = 6
 DAILY_STREAMS_INCREMENTAL_OVERLAP_DAYS = 3
 WEEKLY_STREAMS_INCREMENTAL_OVERLAP_WEEKS = 2
 STREAMING_ROSTER_TABLE = "STREAMING_ROSTER_2026"
+# Luminate / Billboard chart weeks end on Thursday (weekday=3).
+_CHART_WEEK_END_WEEKDAY = 3
 
 
 def _ensure_daily_global_streams_table(cursor: sqlite3.Cursor) -> None:
@@ -1632,7 +1653,36 @@ def _daily_streams_is_fresh(cursor: sqlite3.Cursor, mrelg_id: str) -> bool:
     return (today - max_dt).days <= DAILY_STREAMS_STALE_DAYS
 
 
+def _expected_latest_chart_week_ending(today: pd.Timestamp | None = None) -> pd.Timestamp:
+    """
+    Most recent completed chart week-ending (Thursday) we expect in cache.
+
+    Allow one day of Luminate publish lag: on Thursday itself, still expect
+    the prior Thursday until Friday UTC.
+    """
+    if today is None:
+        today = pd.Timestamp.utcnow().normalize().tz_localize(None)
+    else:
+        today = pd.Timestamp(today).normalize()
+    # Days since last Thursday (0 if today is Thursday).
+    since_thu = (today.weekday() - _CHART_WEEK_END_WEEKDAY) % 7
+    last_thu = today - pd.Timedelta(days=since_thu)
+    if since_thu == 0:
+        # Chart week just closed; facts usually land next day.
+        last_thu = last_thu - pd.Timedelta(days=7)
+    return last_thu
+
+
 def _weekly_streams_is_fresh(cursor: sqlite3.Cursor, mrelg_id: str) -> bool:
+    """
+    True when cache already has the latest expected chart week.
+
+    Calendar-day thresholds (WEEKLY_STREAMS_STALE_DAYS=6) marked the whole
+    roster stale every Monday even after last week's prewarm, because the
+    cached Thursday was ~11 days old — forcing ~550 Snowflake round-trips
+    of tiny incremental pulls (~85 min). Chart-week freshness skips when
+    max WEEK_ENDING_DATE >= expected latest Thursday.
+    """
     _ensure_weekly_global_streams_table(cursor)
     cursor.execute(
         "SELECT MAX(WEEK_ENDING_DATE) FROM MARKETSHARE_WEEKLY_GLOBAL_STREAMS WHERE MRELG_ID = ?",
@@ -1645,6 +1695,11 @@ def _weekly_streams_is_fresh(cursor: sqlite3.Cursor, mrelg_id: str) -> bool:
     max_dt = pd.to_datetime(max_week, errors="coerce")
     if pd.isna(max_dt):
         return False
+    max_dt = max_dt.normalize()
+    expected = _expected_latest_chart_week_ending()
+    if max_dt >= expected:
+        return True
+    # Safety fallback for odd calendars / missing Thursdays in data.
     today = pd.Timestamp.utcnow().normalize().tz_localize(None)
     return (today - max_dt).days <= WEEKLY_STREAMS_STALE_DAYS
 
