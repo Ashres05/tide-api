@@ -44,7 +44,7 @@ WHERE
     s.country_code = 'US'
     AND s.mrelg_id IN ({RELEASE_IDS})
     AND da.week_end_date >= '{MIN_WEEK_END_DATE}'
-    AND s.report_date >= m.first_sale_date
+    AND s.report_date >= COALESCE(m.first_sale_date, m.release_date)
     -- Intentionally no upper bound on week_end_date: include the partial
     -- in-progress week so AE YTD totals match Atlantic's expected numbers
     -- (Luminate Connect dashboards include the partial week too). The

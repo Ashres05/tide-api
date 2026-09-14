@@ -1,16 +1,19 @@
--- Release backfill roster: one row per mrelg_id that cleared 75k AE.
+-- Release backfill roster: one row per mrelg_id that cleared 75k AE
+-- on or after street (COALESCE(first_sale_date, release_date)).
 -- label_name is level_2 for most TARGET_LABELS; IGA / CMG use level_3.
 -- Legacy level_2 Interscope/Geffen/A&M maps to IGA. Do not alias
 -- Interscope-Capitol (ambiguous IGA vs CMG).
 -- {TARGET_LABELS} is injected from model.marketshare_labels.TARGET_LABELS.
 -- {RELEASE_DATE_FILTER} is optional (full vs incremental backfill).
 -- Excludes Various Artists (same artist set as query_streaming_roster_ytd.sql).
+-- Requires a non-null street date so remapped MRELG history cannot admit a title.
 -- Fact window is WEEK -78 to match archetype NUM_WEEKS / FE pull−78w logic
 -- (replaces MONTH -19 ≈ 82 weeks).
 WITH mrelg_map AS (
     SELECT
         DISTINCT mrelg.mrelg_id,
         mrelg.release_type,
+        COALESCE(mrelg.first_sale_date, mrelg.release_date) AS street_date,
         CASE
             WHEN i.level_3_distributor IN ('IGA', 'CMG') THEN i.level_3_distributor
             WHEN i.level_2_distributor = 'Interscope/Geffen/A&M' THEN 'IGA'
@@ -28,6 +31,7 @@ WITH mrelg_map AS (
         JOIN luminate_prod.extract_s.vw_musical_release_group_ds mrelg ON mrelg.mrelg_id = mm.mrelg_id
         AND mrelg.compilation_type != 'Compilation'
         AND mrelg.display_artist NOT IN ('VARIOUS', 'VARIOUS ARTISTS', 'Various Artists', 'various')
+        AND COALESCE(mrelg.first_sale_date, mrelg.release_date) IS NOT NULL
     WHERE
         (
             i.level_2_distributor IN ({TARGET_LABELS})
@@ -55,6 +59,7 @@ mrelg_metrics AS (
         JOIN luminate_prod.extract_s.vw_daily_fact_mrelg_summary_ds s ON s.mrelg_id = m.mrelg_id
         AND s.country_code = 'US'
         AND s.report_date >= DATEADD(WEEK, -78, CURRENT_DATE())
+        AND s.report_date >= m.street_date
         JOIN luminate_prod.extract_s.vw_date_ds da ON da.datename = s.report_date
     GROUP BY
         ALL

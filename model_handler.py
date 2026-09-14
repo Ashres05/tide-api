@@ -1571,7 +1571,9 @@ def _create_backfilled_release(
     label_name: str,
     product_type: str | None = None,
     scenario: str = "Base",
-    fw_vol: float = 0.0,  # Filled from street-week metrics after sqlite refresh.
+    # Placeholder until persist_expected_release_fw_vols overwrites from metrics.
+    # Must be >0: create_release rejects fw_vol=0 when known_vols is empty.
+    fw_vol: float = 100_000.0,
     _sf: "Snowflake | None" = None,
 ) -> int:
     """
@@ -1597,6 +1599,18 @@ def _create_backfilled_release(
     artist = mrelg_metadata["DISPLAY_ARTIST"].iloc[0]
     release_date = _validate_date(mrelg_metadata["RELEASE_DATE"].iloc[0])
     genre = mrelg_metadata["GENRE"].iloc[0]
+
+    # Guardrails matching query_release_backfill.sql (VA / missing street).
+    _va_artists = {"VARIOUS", "VARIOUS ARTISTS"}
+    if (str(artist or "").strip().upper() in _va_artists):
+        raise ValueError(
+            f"MRELG ID {mrelg_id} is Various Artists; refusing backfill insert."
+        )
+    if release_date is None:
+        raise ValueError(
+            f"MRELG ID {mrelg_id} has no street date "
+            "(COALESCE(first_sale_date, release_date)); refusing backfill insert."
+        )
 
     # Temporary adjustment to genres to ensure they are in the distribution.
     # TODO: Remove this once the right genres are in query_mrelg_id.sql
@@ -1763,6 +1777,9 @@ def backfill_releases(
                 inserted += 1
                 existing_mrelg_ids.add(mrelg_id)
             except Exception as e:
+                logger.exception(
+                    "backfill_releases: failed to insert mrelg_id=%s", mrelg_id
+                )
                 errors.append({"mrelg_id": mrelg_id, "error": str(e)})
 
     # Always refresh per-release weekly metrics from Snowflake, even when 0

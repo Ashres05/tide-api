@@ -558,12 +558,13 @@ def refresh_marketshare_search_distributors(*, persist: bool = True) -> int:
     return len(rows)
 
 
-def refresh_marketshare_search_artists() -> int:
+def refresh_marketshare_search_artists(*, persist: bool = True) -> int:
     """
     Rebuild MARKETSHARE_SEARCH_ARTISTS from the local album + singles
     search snapshots. One row per LUMINATE_ARTIST_ID; display name is the
-    most-streamed ARTIST string for that id. Does not query Snowflake or
-    scan releases at request time.
+    case-folded ARTIST string that appears on the most titles for that id
+    (not the billing line on the single most-streamed release). Does not
+    query Snowflake or scan releases at request time.
 
     Rows with a missing artist id are skipped. Returns the number of
     artist rows written. HAS_ARTWORK is set from the S3 artist_art/ index
@@ -649,7 +650,7 @@ def refresh_marketshare_search_artists() -> int:
         conn.commit()
 
     logger.info("sqlite_handler: MARKETSHARE_SEARCH_ARTISTS rebuilt (rows=%d)", len(rows))
-    if rows:
+    if persist and rows:
         _persist_marketshare_db_to_s3()
     return len(rows)
 
