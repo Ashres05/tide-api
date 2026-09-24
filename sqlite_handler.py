@@ -91,6 +91,7 @@ EXPECTED_RELEASES_QUERY = 'release_get_all.sql'
 MARKETSHARE_SEARCH_SUMMARY_QUERY = 'query_marketshare_search_summary.sql'
 MARKETSHARE_SEARCH_SUMMARY_SINGLES_QUERY = 'query_marketshare_search_summary_singles.sql'
 MARKETSHARE_SEARCH_ARTISTS_ROLLUP_QUERY = 'query_marketshare_search_artists_rollup.sql'
+LUMINATE_ARTIST_NAMES_QUERY = 'query_luminate_artist_names.sql'
 MARKETSHARE_SEARCH_DISTRIBUTORS_ROLLUP_QUERY = (
     'query_marketshare_search_distributors_rollup.sql'
 )
@@ -558,13 +559,57 @@ def refresh_marketshare_search_distributors(*, persist: bool = True) -> int:
     return len(rows)
 
 
+def _luminate_artist_name_lookup() -> dict[str, str]:
+    """
+    Map LUMINATE_ARTIST_ID -> VW_ARTIST_DS.artist_name.
+
+    Failures return {} so the billing-line rollup still rebuilds. Keys are
+    stored uppercased so snapshot ids match regardless of case.
+    """
+    try:
+        with get_snowflake_connection() as sf:
+            df = sf.query(load_sql(LUMINATE_ARTIST_NAMES_QUERY))
+    except Exception:
+        logger.exception(
+            "sqlite_handler: Luminate artist-name pull failed; "
+            "using billing-line rollup names"
+        )
+        return {}
+
+    if df is None or df.empty:
+        logger.warning("sqlite_handler: VW_ARTIST_DS name pull returned 0 rows")
+        return {}
+
+    cols = {str(c).strip().lower(): c for c in df.columns}
+    id_col = cols.get("artist_id")
+    name_col = cols.get("artist_name")
+    if id_col is None or name_col is None:
+        logger.warning(
+            "sqlite_handler: VW_ARTIST_DS name pull missing columns %s",
+            list(df.columns),
+        )
+        return {}
+
+    lookup: dict[str, str] = {}
+    for artist_id, artist_name in zip(df[id_col], df[name_col]):
+        aid = str(artist_id or "").strip().upper()
+        name = str(artist_name or "").strip()
+        if aid and name:
+            lookup[aid] = name
+    logger.info(
+        "sqlite_handler: loaded %d Luminate canonical artist names", len(lookup)
+    )
+    return lookup
+
+
 def refresh_marketshare_search_artists(*, persist: bool = True) -> int:
     """
     Rebuild MARKETSHARE_SEARCH_ARTISTS from the local album + singles
-    search snapshots. One row per LUMINATE_ARTIST_ID; display name is the
-    case-folded ARTIST string that appears on the most titles for that id
-    (not the billing line on the single most-streamed release). Does not
-    query Snowflake or scan releases at request time.
+    search snapshots. One row per LUMINATE_ARTIST_ID.
+
+    Ranking (streams / release count) still comes from the snapshots.
+    Display ARTIST prefers Luminate VW_ARTIST_DS.artist_name, then falls
+    back to the majority billing-line string for that id.
 
     Rows with a missing artist id are skipped. Returns the number of
     artist rows written. HAS_ARTWORK is set from the S3 artist_art/ index
@@ -619,12 +664,17 @@ def refresh_marketshare_search_artists(*, persist: bool = True) -> int:
                 exc_info=True,
             )
 
+        canonical_names = _luminate_artist_name_lookup()
+        canonical_hits = 0
         rows = []
         for artist_id, artist, streams, release_count in rollup:
             aid = str(artist_id).strip() if artist_id is not None else ""
             if not aid:
                 continue
-            name = artist if artist is not None else ""
+            fallback = artist if artist is not None else ""
+            name = canonical_names.get(aid.upper()) or fallback
+            if canonical_names.get(aid.upper()):
+                canonical_hits += 1
             try:
                 stream_val = int(streams or 0)
             except (TypeError, ValueError):
@@ -649,7 +699,13 @@ def refresh_marketshare_search_artists(*, persist: bool = True) -> int:
             cur.executemany(load_sql(INSERT_MARKETSHARE_SEARCH_ARTISTS), rows)
         conn.commit()
 
-    logger.info("sqlite_handler: MARKETSHARE_SEARCH_ARTISTS rebuilt (rows=%d)", len(rows))
+    logger.info(
+        "sqlite_handler: MARKETSHARE_SEARCH_ARTISTS rebuilt (rows=%d, "
+        "luminate_names=%d, canonical_hits=%d)",
+        len(rows),
+        len(canonical_names),
+        canonical_hits,
+    )
     if persist and rows:
         _persist_marketshare_db_to_s3()
     return len(rows)
@@ -1176,7 +1232,8 @@ def _persist_marketshare_db_to_s3() -> None:
 def ensure_marketshare_search_artists_index() -> int:
     """
     If MARKETSHARE_SEARCH_ARTISTS is empty but the snapshots already have
-    LUMINATE_ARTIST_ID, rebuild the typeahead locally (no Snowflake).
+    LUMINATE_ARTIST_ID, rebuild the typeahead (snapshots locally; names
+    from Luminate VW_ARTIST_DS when Snowflake is available).
     """
     with sqlite_connect() as conn:
         ensure_marketshare_search_summary_columns(conn)

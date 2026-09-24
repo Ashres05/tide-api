@@ -169,11 +169,15 @@ def get_snowflake_connection():
 
     private_key_der = _private_key_der_for(private_key_str)
 
+    warehouse = (
+        os.environ.get("SNOWFLAKE_WAREHOUSE") or "APP_STAT_WH_M"
+    ).strip() or "APP_STAT_WH_M"
+
     creds = {
         "user": os.environ.get("SNOWFLAKE_USER"),
         "role": os.environ.get("SNOWFLAKE_ROLE"),
         "private_key": private_key_der,
-        "warehouse": os.environ.get("SNOWFLAKE_WAREHOUSE"),
+        "warehouse": warehouse,
         "account":os.environ.get("SNOWFLAKE_ACCOUNT"),
         # "password":os.environ.get("PASSWORD")
     }

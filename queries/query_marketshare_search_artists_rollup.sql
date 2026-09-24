@@ -1,11 +1,10 @@
 -- Roll up album + singles search snapshots to one row per LUMINATE_ARTIST_ID.
 --
--- Display name is the canonical artist string for that id, NOT the billing
--- line on the single most-streamed release (that is how "Shakira & Burna Boy"
--- replaced Burna Boy). Fold case, pick the LOWER(ARTIST) with the most titles
--- (then the most day-2 streams), then pick a mixed-case spelling of that key.
+-- Display name fallback is the majority billing-line ARTIST for that id
+-- (case-folded title count, then streams) — not the billing line on the
+-- single most-streamed release. refresh_marketshare_search_artists() overlays
+-- Luminate VW_ARTIST_DS.artist_name when present.
 -- DAILY_GLOBAL_STREAMS remains the sum across all of that id's snapshot rows.
--- Called from refresh_marketshare_search_artists().
 WITH combined AS (
     SELECT
         TRIM(LUMINATE_ARTIST_ID) AS LUMINATE_ARTIST_ID,
