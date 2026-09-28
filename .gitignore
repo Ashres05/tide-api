@@ -4,8 +4,13 @@ __pycache__/
 
 # Ignore all secrets
 secrets/
+# **/.env* only matches names that start with ".env" (.env, .env.local).
+# amg_research.env does not match that, and was previously committed.
+amg_research.env
+*.env
 **/.env*
 **/.pem*
+*.p8
 
 # Ignore updated artifacts
 artifacts_75k/
