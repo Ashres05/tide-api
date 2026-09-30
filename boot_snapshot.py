@@ -9,6 +9,9 @@ Cold start (almost instantaneous — one fetch):
   GET /v1/boot.json   OR   s3://parquetgarage/boot.json
   Use:
     streaming.releases[]     — roster board + weekly_streams (SQLite actuals only)
+                              + ppr_value / ppr_calculation_date on each title
+    ppr.artists              — current PPR by LUMINATE_ARTIST_ID (nightly)
+    ppr.by_release           — collab rows (MRELG_ID + each Main Artist)
     marketshare.actuals      — same shape as GET /v1/marketshare/actuals
     marketshare.weekly       — same shape as GET /v1/marketshare/weekly (full year)
     releases.items[]         — expected/backfill drops + weekly Actual + Forecast
@@ -60,7 +63,8 @@ UI_CONTRACT: Dict[str, Any] = {
         "endpoint": "GET /v1/boot.json",
         "s3": "s3://parquetgarage/boot.json",
         "use": [
-            "streaming.releases (+ weekly_streams actuals)",
+            "streaming.releases (+ weekly_streams actuals, ppr_value)",
+            "ppr.artists / ppr.by_release (current artist PPR)",
             "marketshare.actuals",
             "marketshare.weekly",
             "releases.items (+ weekly Actual + Forecast album units)",
@@ -82,6 +86,15 @@ UI_CONTRACT: Dict[str, Any] = {
         "note": (
             "Expected-release album-unit curves are baked at export time. "
             "Live weekly remains available after mutations or if boot is stale."
+        ),
+    },
+    "ppr": {
+        "boot": "ppr.artists[luminate_artist_id] and streaming.releases[].ppr_value",
+        "live": "GET /v1/revenue/artist_ppr/{luminate_artist_id}",
+        "note": (
+            "Nightly job rewrites SQLite then patches boot.ppr without rebuilding "
+            "forecast curves. Search/artist-page should call the live endpoint "
+            "for ids not in boot (cache then Snowflake)."
         ),
     },
 }
@@ -134,6 +147,44 @@ def _row_get(row: sqlite3.Row, key: str, default: Any = None) -> Any:
     except Exception:
         pass
     return default
+
+
+def _ppr_lookup_maps() -> tuple[Dict[str, dict], Dict[str, List[dict]]]:
+    try:
+        from artist_ppr import artist_ppr_map, ppr_by_release_rows
+
+        by_artist = artist_ppr_map()
+        by_mrelg: Dict[str, List[dict]] = {}
+        for row in ppr_by_release_rows():
+            mid = str(row.get("mrelg_id") or "").strip()
+            if mid:
+                by_mrelg.setdefault(mid, []).append(row)
+        return by_artist, by_mrelg
+    except Exception:
+        logger.warning("boot ppr lookup failed", exc_info=True)
+        return {}, {}
+
+
+def _stamp_release_ppr(
+    rel: dict,
+    *,
+    by_artist: Dict[str, dict],
+    by_mrelg: Dict[str, List[dict]],
+) -> None:
+    aid = str(rel.get("LUMINATE_ARTIST_ID") or "").strip()
+    rec = by_artist.get(aid.upper()) if aid else None
+    if rec:
+        rel["ppr_value"] = rec.get("ppr_value")
+        rel["ppr_calculation_date"] = rec.get("calculation_date")
+    else:
+        rel.pop("ppr_value", None)
+        rel.pop("ppr_calculation_date", None)
+    mid = str(rel.get("MRELG_ID") or "").strip()
+    extras = by_mrelg.get(mid) if mid else None
+    if extras:
+        rel["ppr_artists"] = extras
+    else:
+        rel.pop("ppr_artists", None)
 
 
 def _weekly_rows_from_metrics(release_id: int) -> List[dict]:
@@ -291,29 +342,30 @@ def build_streaming_section() -> dict:
                 )
 
     releases: List[dict] = []
+    by_artist, by_mrelg_ppr = _ppr_lookup_maps()
     for row in roster:
         mid = str(row.get("MRELG_ID") or "").strip()
         if not mid:
             continue
-        releases.append(
-            {
-                "MRELG_ID": mid,
-                "PRODUCT_TYPE": row.get("PRODUCT_TYPE"),
-                "TITLE": row.get("TITLE"),
-                "ARTIST": row.get("ARTIST"),
-                "LUMINATE_ARTIST_ID": row.get("LUMINATE_ARTIST_ID"),
-                "LABEL_NAME": row.get("LABEL_NAME"),
-                "PARENT_GROUP": row.get("PARENT_GROUP"),
-                "RELEASE_DATE": (
-                    str(row.get("RELEASE_DATE") or "").split(" ")[0][:10]
-                    if row.get("RELEASE_DATE") is not None
-                    else ""
-                ),
-                "forecast_route": row.get("forecast_route")
-                or model_handler.streaming_forecast_route(row.get("PRODUCT_TYPE")),
-                "weekly_streams": by_mrelg.get(mid, []),
-            }
-        )
+        item = {
+            "MRELG_ID": mid,
+            "PRODUCT_TYPE": row.get("PRODUCT_TYPE"),
+            "TITLE": row.get("TITLE"),
+            "ARTIST": row.get("ARTIST"),
+            "LUMINATE_ARTIST_ID": row.get("LUMINATE_ARTIST_ID"),
+            "LABEL_NAME": row.get("LABEL_NAME"),
+            "PARENT_GROUP": row.get("PARENT_GROUP"),
+            "RELEASE_DATE": (
+                str(row.get("RELEASE_DATE") or "").split(" ")[0][:10]
+                if row.get("RELEASE_DATE") is not None
+                else ""
+            ),
+            "forecast_route": row.get("forecast_route")
+            or model_handler.streaming_forecast_route(row.get("PRODUCT_TYPE")),
+            "weekly_streams": by_mrelg.get(mid, []),
+        }
+        _stamp_release_ppr(item, by_artist=by_artist, by_mrelg=by_mrelg_ppr)
+        releases.append(item)
 
     return {"count": len(releases), "releases": releases}
 
@@ -383,6 +435,22 @@ def build_releases_section() -> dict:
     }
 
 
+def build_ppr_section() -> dict:
+    try:
+        from artist_ppr import build_boot_ppr_section
+
+        return build_boot_ppr_section()
+    except Exception:
+        logger.warning("boot ppr section failed", exc_info=True)
+        return {
+            "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "count": 0,
+            "artists": {},
+            "by_release": [],
+            "by_release_count": 0,
+        }
+
+
 def build_boot_payload() -> dict:
     return {
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -391,44 +459,22 @@ def build_boot_payload() -> dict:
         "streaming": build_streaming_section(),
         "marketshare": build_marketshare_section(),
         "releases": build_releases_section(),
+        "ppr": build_ppr_section(),
     }
 
 
-def export_boot_json_snapshot() -> dict:
-    """
-    Build boot.json, write model/data/boot.json, upload to S3 root boot.json.
-
-    Returns a summary dict for job / refresh_weekly stage reporting.
-    """
+def _write_boot_payload(payload: dict) -> dict:
+    """Serialize payload to local boot.json and upload to S3. Returns summary extras."""
     import gc
     import os
     from api.s3_pull import upload_boot_json
 
-    # Reclaim leaked sqlite FDs from prewarm (`with sqlite3.connect` does not
-    # close on 3.14) before we open query files / write boot.json.
     gc.collect()
-    try:
-        nfd = len(os.listdir(f"/proc/{os.getpid()}/fd"))
-    except Exception:
-        nfd = -1
-    logger.info("export_boot_json_snapshot: open_fds=%s after gc", nfd)
-
-    try:
-        from sqlite_handler import wal_checkpoint
-
-        wal_checkpoint("TRUNCATE")
-    except Exception:
-        logger.warning("export_boot_json_snapshot: wal_checkpoint failed", exc_info=True)
-
-    t0 = datetime.now(timezone.utc)
-    payload = build_boot_payload()
     body = json.dumps(payload, separators=(",", ":"), default=str)
     body_bytes = body.encode("utf-8")
 
     local_path = boot_json_local_path()
     local_path.parent.mkdir(parents=True, exist_ok=True)
-    # Write to a sibling temp then rename so ENOSPC cannot truncate the live file
-    # the frontend is already serving.
     tmp_path = local_path.with_name(local_path.name + ".tmp")
     try:
         with open(tmp_path, "wb") as fh:
@@ -444,15 +490,95 @@ def export_boot_json_snapshot() -> dict:
         raise
 
     s3_uri = upload_boot_json(body_bytes)
+    return {
+        "path": str(local_path),
+        "s3_uri": s3_uri,
+        "bytes": len(body_bytes),
+    }
+
+
+def patch_boot_json_ppr() -> dict:
+    """
+    Replace boot.ppr (and stamp streaming.releases PPR fields) without rebuilding
+    forecast curves. No-op if boot.json is missing.
+    """
+    path = boot_json_local_path()
+    if not path.is_file():
+        logger.warning("patch_boot_json_ppr: boot.json missing; skip")
+        return {"ok": False, "patched": False, "reason": "boot.json missing"}
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.exception("patch_boot_json_ppr: failed to read boot.json")
+        return {"ok": False, "patched": False, "reason": str(e)}
+
+    section = build_ppr_section()
+    payload["ppr"] = section
+    payload["ppr_patched_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    by_artist: Dict[str, dict] = {}
+    for aid, rec in (section.get("artists") or {}).items():
+        key = str(aid or "").strip()
+        if key:
+            by_artist[key.upper()] = rec
+    by_mrelg: Dict[str, List[dict]] = {}
+    for row in section.get("by_release") or []:
+        mid = str((row or {}).get("mrelg_id") or "").strip()
+        if mid:
+            by_mrelg.setdefault(mid, []).append(row)
+
+    streaming = payload.get("streaming") or {}
+    for rel in streaming.get("releases") or []:
+        if isinstance(rel, dict):
+            _stamp_release_ppr(rel, by_artist=by_artist, by_mrelg=by_mrelg)
+
+    written = _write_boot_payload(payload)
+    summary = {
+        "ok": True,
+        "patched": True,
+        "ppr_count": section.get("count", 0),
+        "by_release_count": section.get("by_release_count", 0),
+        **written,
+    }
+    logger.info("patch_boot_json_ppr: %s", summary)
+    return summary
+
+
+def export_boot_json_snapshot() -> dict:
+    """
+    Build boot.json, write model/data/boot.json, upload to S3 root boot.json.
+
+    Returns a summary dict for job / refresh_weekly stage reporting.
+    """
+    import os
+
+    # Reclaim leaked sqlite FDs from prewarm (`with sqlite3.connect` does not
+    # close on 3.14) before we open query files / write boot.json.
+    try:
+        nfd = len(os.listdir(f"/proc/{os.getpid()}/fd"))
+    except Exception:
+        nfd = -1
+    logger.info("export_boot_json_snapshot: open_fds=%s after gc", nfd)
+
+    try:
+        from sqlite_handler import wal_checkpoint
+
+        wal_checkpoint("TRUNCATE")
+    except Exception:
+        logger.warning("export_boot_json_snapshot: wal_checkpoint failed", exc_info=True)
+
+    t0 = datetime.now(timezone.utc)
+    payload = build_boot_payload()
+    written = _write_boot_payload(payload)
 
     streaming = payload.get("streaming") or {}
     releases = payload.get("releases") or {}
     ms = payload.get("marketshare") or {}
+    ppr = payload.get("ppr") or {}
     summary = {
         "ok": True,
-        "path": str(local_path),
-        "s3_uri": s3_uri,
-        "bytes": len(body_bytes),
+        **written,
         "generated_at": payload.get("generated_at"),
         "streaming_count": streaming.get("count", 0),
         "releases_count": releases.get("count", 0),
@@ -460,6 +586,7 @@ def export_boot_json_snapshot() -> dict:
         "releases_actual_only_fallback": releases.get("actual_only_fallback", 0),
         "marketshare_actuals": len(ms.get("actuals") or []),
         "marketshare_weekly": len(ms.get("weekly") or []),
+        "ppr_count": ppr.get("count", 0),
         "elapsed_sec": round((datetime.now(timezone.utc) - t0).total_seconds(), 2),
     }
     logger.info("export_boot_json_snapshot: %s", summary)

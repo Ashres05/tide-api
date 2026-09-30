@@ -47,8 +47,10 @@ curl -s http://127.0.0.1:8000/v1/jobs/<job_id>
 6. S3 push + **second boot export** — marketshare and expected-release
    curves in `boot.json` match the new CSVs
 
-Search snapshots (catalog artist/distributor index, ~12M Snowflake rows) are
-not on this cron. They are a separate multi-hour extract.
+Search snapshots (catalog artist/distributor index) are **not** on this cron.
+They run as a daily street-date delta (no day-2 streams):
+`POST /v1/data/refresh_search_snapshots` via `cron_search_snapshots.sh`
+(07:00 UTC, skips Monday). Catch-up uses `since_date=YYYY-MM-DD`.
 
 Crontab (this host): `0 15 * * 1 …/api_refresh_s3.sh` → Monday 15:00 UTC.
 
@@ -60,6 +62,7 @@ On success the in-process forecast engine cache is invalidated so subsequent
 | Endpoint | Purpose |
 | --- | --- |
 | `/v1/data/refresh_weekly` | Full weekly pipeline (preferred) |
+| `/v1/data/refresh_search_snapshots` | Search catalog delta (albums/singles, no streams) |
 | `/v1/data/refresh_data` | CSV refresh + model retrain only |
 | `/v1/data/refresh_model` | Parquet refresh only |
 | `/v1/releases/backfill` | Pull new releases into SQLite |

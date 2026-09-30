@@ -25,8 +25,7 @@ from sqlite_handler import (
     ensure_marketshare_search_summary_columns,
     ensure_marketshare_search_summary_singles_columns,
     ensure_streaming_roster_2026_table,
-    refresh_marketshare_search_summary,
-    refresh_marketshare_search_summary_singles,
+    refresh_marketshare_search_snapshots_delta,
 )
 from search_text import normalize_search_text
 import marketshare_from_csv
@@ -122,6 +121,9 @@ CREATE_STREAMING_ROSTER_2026_TABLE = "create_streaming_roster_2026_table.sql"
 INSERT_STREAMING_ROSTER_2026 = "insert_streaming_roster_2026.sql"
 STREAMING_ROSTER_2026_LIST_QUERY = "streaming_roster_2026_list.sql"
 MRELG_ISRC_STREAM_SHARE_QUERY = "query_mrelg_isrc_stream_share.sql"
+MRELG_REV_2025_QUERY = "query_mrelg_rev_2025.sql"
+ARTIST_REV_2025_QUERY = "query_artist_rev_2025.sql"
+ARTIST_REV_2025_ROW_LIMIT = 500
 
 _RELEASE_FIELD_KEYS = frozenset(
     {
@@ -308,165 +310,6 @@ def _parse_s3_uri_to_bucket_key(uri: str) -> tuple[str, str]:
     if not key:
         raise ValueError(f"Invalid S3 URI (empty key): {uri!r}")
     return bucket, key
-
-
-# Optional 2025 catalog revenue by MRELG (CSV in S3). Loaded once per process.
-_CATALOG_REVENUE_2025_BY_MRELG: Optional[Dict[str, float]] = None
-_CATALOG_REVENUE_2025_LOAD_FAILED: bool = False
-
-
-def _catalog_revenue_2025_csv_s3_uri() -> str:
-    return os.environ.get(
-        "TIDE_CATALOG_REVENUE_2025_CSV_S3_URI",
-        "s3://parquetgarage/model/data/2025_revenue_catalog.csv",
-    ).strip()
-
-
-def _norm_csv_header(name: Any) -> str:
-    return str(name).strip().upper().replace(" ", "_")
-
-
-def _normalize_mrelg_id_key(raw: Any) -> str:
-    """
-    Canonical MRELG id string for CSV/API joins.
-
-    Pandas often reads numeric MRELG_ID cells as floats (``12345.0``), which
-    would not match SQLite/API string ``"12345"``. Strip Excel quirks and
-    normalize integers to a stable decimal string.
-    """
-    if raw is None:
-        return ""
-    if isinstance(raw, float) and pd.isna(raw):
-        return ""
-    if isinstance(raw, bool):
-        return ""
-    if isinstance(raw, numbers.Integral):
-        return str(int(raw))
-    if isinstance(raw, numbers.Real):
-        rf = float(raw)
-        if not math.isfinite(rf):
-            return ""
-        if rf == int(rf):
-            return str(int(rf))
-        s = str(rf).strip()
-    else:
-        s = str(raw).strip()
-    if not s or s.lower() == "nan":
-        return ""
-    # Excel-style ="id" or 'id'
-    if s.startswith("="):
-        s = s[1:].strip().strip('"').strip("'")
-    try:
-        f = float(s)
-        if math.isfinite(f) and f == int(f):
-            return str(int(f))
-    except ValueError:
-        pass
-    return s
-
-
-def _load_catalog_revenue_2025_csv_map() -> Dict[str, float]:
-    """
-    Lazy-load a map of MRELG_ID -> 2025 revenue from the configured S3 CSV.
-    Returns an empty dict if the file is missing or unreadable.
-
-    (Named distinctly from ``get_catalog_revenue_2025_by_mrelg(mrelg_id)``, which
-    reads a single id from SQLite for the Live Revenue API route.)
-    """
-    global _CATALOG_REVENUE_2025_BY_MRELG, _CATALOG_REVENUE_2025_LOAD_FAILED
-    if _CATALOG_REVENUE_2025_LOAD_FAILED:
-        return {}
-    if _CATALOG_REVENUE_2025_BY_MRELG is not None:
-        return _CATALOG_REVENUE_2025_BY_MRELG
-
-    uri = _catalog_revenue_2025_csv_s3_uri()
-    if not uri or not uri.lower().startswith("s3://"):
-        logger.info("catalog_revenue_2025: no s3:// URI configured; skipping")
-        _CATALOG_REVENUE_2025_BY_MRELG = {}
-        return {}
-
-    try:
-        import boto3
-
-        bucket, key = _parse_s3_uri_to_bucket_key(uri)
-        raw = boto3.client("s3").get_object(Bucket=bucket, Key=key)["Body"].read()
-        df = pd.read_csv(io.BytesIO(raw), encoding="utf-8-sig")
-    except Exception as e:
-        logger.warning("catalog_revenue_2025: could not load %s: %s", uri, e)
-        _CATALOG_REVENUE_2025_LOAD_FAILED = True
-        _CATALOG_REVENUE_2025_BY_MRELG = {}
-        return {}
-
-    if df.empty:
-        _CATALOG_REVENUE_2025_BY_MRELG = {}
-        return {}
-
-    col_lookup = {_norm_csv_header(c): c for c in df.columns}
-    # Prefer exact ``MRELG_ID`` (case/spacing-insensitive) to match Luminate / SQLite.
-    mrelg_col = col_lookup.get("MRELG_ID")
-    if not mrelg_col:
-        mrelg_candidates = ("MRELG", "MRELGID", "MRELGIDS", "RELEASE_GROUP_ID")
-        mrelg_col = next((col_lookup[c] for c in mrelg_candidates if c in col_lookup), None)
-    rev_candidates = (
-        "2025_REVENUE",
-        "REVENUE_2025",
-        "CATALOG_REVENUE_2025",
-        "TOTAL_REVENUE_2025",
-        "Y2025_REVENUE",
-        "REVENUE",
-        "TOTAL_REVENUE",
-    )
-    rev_col = next((col_lookup[c] for c in rev_candidates if c in col_lookup), None)
-    if not mrelg_col or not rev_col:
-        logger.warning(
-            "catalog_revenue_2025: CSV missing expected columns (mrelg=%s revenue=%s) headers=%s",
-            mrelg_col,
-            rev_col,
-            list(df.columns),
-        )
-        _CATALOG_REVENUE_2025_BY_MRELG = {}
-        return {}
-
-    out: Dict[str, float] = {}
-    for _, row in df.iterrows():
-        raw_id = row[mrelg_col] if mrelg_col in row.index else None
-        mid = _normalize_mrelg_id_key(raw_id)
-        if not mid:
-            continue
-        try:
-            val = float(row[rev_col])
-        except (TypeError, ValueError):
-            continue
-        if not math.isfinite(val):
-            continue
-        out[mid] = val
-
-    sample_keys = list(out.keys())[:3]
-    logger.info(
-        "catalog_revenue_2025: %d rows, MRELG column=%r revenue column=%r sample_mrelg_keys=%s uri=%s",
-        len(out),
-        mrelg_col,
-        rev_col,
-        sample_keys,
-        uri,
-    )
-    _CATALOG_REVENUE_2025_BY_MRELG = out
-    return out
-
-
-def catalog_revenue_2025_for_mrelg(mrelg_id: Optional[str]) -> Optional[float]:
-    """Return 2025 catalog revenue for ``mrelg_id``, or ``None`` if unknown."""
-    key = _normalize_mrelg_id_key(mrelg_id)
-    if not key:
-        return None
-    m = _load_catalog_revenue_2025_csv_map()
-    if not m:
-        return None
-    v = m.get(key)
-    if v is None and key.isdigit():
-        # Rare: map built with int str but API sent zero-padded or spaced
-        v = m.get(str(int(key)))
-    return float(v) if v is not None and math.isfinite(float(v)) else None
 
 
 def get_1m_forecaster():
@@ -2482,8 +2325,6 @@ def get_all_releases_series_json() -> str:
 # removed; TITLE on the snapshot tables is still used for display.
 # ---------------------------------------------------------------------------
 
-_SEARCH_TEXT_WEIGHT = 0.75
-_SEARCH_STREAM_WEIGHT = 0.25
 _SEARCH_DEFAULT_LIMIT = 20
 _SEARCH_TEXT_FLOOR = 0.30  # rows with text similarity below this are dropped
 _SEARCH_MIN_TOKEN_LEN = 2
@@ -2589,7 +2430,7 @@ def _fetch_artist_search_candidates(
             def _run(where_sql: str, params: List[Any], mode: str) -> List[sqlite3.Row]:
                 sql = (
                     f"{fetch_sql} WHERE {where_sql} "
-                    "ORDER BY DAILY_GLOBAL_STREAMS DESC LIMIT ?"
+                    "ORDER BY RELEASE_COUNT DESC, ARTIST COLLATE NOCASE LIMIT ?"
                 )
                 run_params = list(params) + [_ARTIST_SEARCH_CANDIDATE_LIMIT]
                 with _perf_phase(
@@ -2618,8 +2459,9 @@ def search_artists(
     """
     Typeahead over MARKETSHARE_SEARCH_ARTISTS (one row per LUMINATE_ARTIST_ID).
 
-    Does not scan album/single/EP snapshot tables. Ranking is a
-    text-dominant blend of fuzzy artist-name match and log-scaled streams.
+    Does not scan album/single/EP snapshot tables. Ranking is fuzzy
+    artist-name match, then release_count. Search snapshots no longer
+    refresh day-2 streams.
     """
     if not isinstance(q, str):
         q = "" if q is None else str(q)
@@ -2698,25 +2540,14 @@ def search_artists(
         return []
 
     with _perf_phase(span, "rank", endpoint="search_artists") as info:
-        max_log_streams = max(math.log1p(c["_raw_streams"]) for c in candidates)
-        if max_log_streams <= 0:
-            max_log_streams = 1.0
         for c in candidates:
-            stream_score = math.log1p(c["_raw_streams"]) / max_log_streams
-            c["stream_score"] = round(float(stream_score), 4)
-            c["combined_score"] = round(
-                float(
-                    _SEARCH_TEXT_WEIGHT * c["artist_score"]
-                    + _SEARCH_STREAM_WEIGHT * stream_score
-                ),
-                4,
-            )
             c.pop("_raw_streams", None)
+            c["stream_score"] = 0.0
+            c["combined_score"] = c["artist_score"]
         candidates.sort(
             key=lambda x: (
-                x["combined_score"],
                 x["artist_score"],
-                x["daily_global_streams"],
+                x["release_count"],
             ),
             reverse=True,
         )
@@ -3281,26 +3112,14 @@ def train_model() -> None:
     """
     Trains the model.
 
-    Also rebuilds the search snapshot tables so artist typeahead and
-    discography reflect the latest daily Snowflake snapshot.
+    Search snapshots are a separate daily delta job
+    (``POST /v1/data/refresh_search_snapshots``), not part of train.
     """
     # Full refresh trains every scope, so pull all canonical inputs from S3
     # (csv + parquets + artifacts_75k + archetypes + db) before training.
     sync_full_inputs_from_s3()
     refresh_data()
     reload_artifacts()
-    try:
-        refresh_marketshare_search_summary()
-    except Exception:
-        logger.exception(
-            "train_model: search summary refresh failed; search results may be stale"
-        )
-    try:
-        refresh_marketshare_search_summary_singles()
-    except Exception:
-        logger.exception(
-            "train_model: singles search summary refresh failed; search results may be stale"
-        )
     forecast_cache_clear()
     # Persist refreshed CSV + parquets + artifacts + db for future incremental runs.
     sync_full_outputs_to_s3()
@@ -3612,6 +3431,52 @@ def export_boot_json_snapshot() -> dict:
     from boot_snapshot import export_boot_json_snapshot as _export
 
     return _export()
+
+
+def refresh_artist_ppr() -> dict:
+    """
+    Nightly: pull current PPR for roster ∪ expected, rewrite SQLite, patch boot.json.
+    Does not rebuild forecast curves.
+    """
+    from artist_ppr import refresh_artist_ppr_nightly
+    from boot_snapshot import patch_boot_json_ppr
+
+    summary = refresh_artist_ppr_nightly()
+    if summary.get("ok"):
+        summary["boot"] = patch_boot_json_ppr()
+    else:
+        summary["boot"] = {
+            "ok": False,
+            "patched": False,
+            "reason": "ppr_refresh_failed",
+        }
+    return summary
+
+
+def refresh_search_snapshots_delta(
+    lookback_days: int | None = None,
+    since_date: str | None = None,
+) -> dict:
+    """
+    Daily search-index catch-up: upsert albums/EPs/singles in a street-date
+    window (no day-2 streams) and rebuild local typeahead tables.
+    """
+    return refresh_marketshare_search_snapshots_delta(
+        lookback_days=lookback_days,
+        since_date=since_date,
+        persist=False,
+    )
+
+
+def get_artist_ppr(luminate_artist_id: str) -> dict:
+    """Current PPR for one Luminate artist (SQLite then Snowflake)."""
+    from artist_ppr import get_artist_ppr as _get
+
+    return _get(luminate_artist_id, allow_live=True)
+
+
+def get_artist_ppr_json(luminate_artist_id: str) -> str:
+    return json.dumps(get_artist_ppr(luminate_artist_id), default=str)
 
 
 def _elapsed(t0: float) -> float:
@@ -4325,20 +4190,121 @@ def mrelg_isrc_report_csv_bytes(df: pd.DataFrame) -> bytes:
     return buf.getvalue().encode("utf-8")
 
 
+def _rev_2025_float(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(v):
+        return None
+    return v
+
+
+def _rev_2025_df_value(df: pd.DataFrame, *names: str) -> Any:
+    if df is None or df.empty:
+        return None
+    cols = {str(c).strip().lower(): c for c in df.columns}
+    for name in names:
+        col = cols.get(name.strip().lower())
+        if col is not None:
+            return df.iloc[0][col]
+    return None
+
+
 def get_catalog_revenue_2025_by_mrelg(mrelg_id: str) -> Dict[str, Any]:
     """
-    Live Revenue board — 2025 catalog revenue for a single MRELG release
-    group, sourced from the local MARKETSHARE_REVENUE_2025 table (loaded
-    one-shot from s3://parquetgarage/model/data/2025_revenue_catalog.csv).
-    Returns {"catalog_revenue_2025": float | None}; null when the MRELG
-    isn't in the file (frontend treats null as "not in file").
+    Live 2025 PPR revenue for one title from
+    US_LABELS_SANDBOX.RONAN_N.MRELG_REV_2025 (one row per MRELG).
+    No SQLite/CSV cache. Returns catalog_revenue_2025 null when the id
+    is not in the table.
     """
-    from sqlite_handler import get_catalog_revenue_2025_for_mrelg
+    from sqlite_handler import _snowflake_str
 
-    if not isinstance(mrelg_id, str) or not mrelg_id.strip():
+    mid = (mrelg_id or "").strip() if isinstance(mrelg_id, str) else ""
+    if not mid:
         raise ValueError("mrelg_id is required.")
-    value = get_catalog_revenue_2025_for_mrelg(mrelg_id.strip())
-    return {"catalog_revenue_2025": value}
+    sql = load_sql(MRELG_REV_2025_QUERY).replace("{MRELG_ID}", _snowflake_str(mid))
+    with get_snowflake_connection() as sf:
+        df = sf.query(sql)
+    value = _rev_2025_float(_rev_2025_df_value(df, "catalog_revenue_2025", "2025_ppr_revenue"))
+    artist_id = _rev_2025_df_value(df, "luminate_artist_id")
+    artist_s = str(artist_id).strip() if artist_id is not None else ""
+    if not artist_s or artist_s.lower() in ("none", "nan"):
+        artist_s = None
+    return {
+        "catalog_revenue_2025": value,
+        "2025_ppr_revenue": value,
+        "luminate_artist_id": artist_s,
+    }
+
+
+def get_catalog_revenue_2025_by_artist(luminate_artist_id: str) -> Dict[str, Any]:
+    """
+    One Snowflake scan: 2025 PPR revenue per title for an artist, plus the
+    full-catalog SUM (window total, even if the row list is capped).
+    No SQLite cache. Null totals / empty releases when the artist has no rows.
+    """
+    from sqlite_handler import _snowflake_str
+
+    aid = (
+        (luminate_artist_id or "").strip()
+        if isinstance(luminate_artist_id, str)
+        else ""
+    )
+    if not aid:
+        raise ValueError("luminate_artist_id is required.")
+    sql = (
+        load_sql(ARTIST_REV_2025_QUERY)
+        .replace("{LUMINATE_ARTIST_ID}", _snowflake_str(aid))
+        .replace("{LIMIT}", str(int(ARTIST_REV_2025_ROW_LIMIT)))
+    )
+    with get_snowflake_connection() as sf:
+        df = sf.query(sql)
+
+    empty = {
+        "catalog_revenue_2025": None,
+        "2025_ppr_revenue": None,
+        "count": 0,
+        "truncated": False,
+        "releases": [],
+    }
+    if df is None or df.empty:
+        return empty
+
+    cols = {str(c).strip().lower(): c for c in df.columns}
+    mid_col = cols.get("mrelg_id")
+    rev_col = cols.get("catalog_revenue_2025") or cols.get("2025_ppr_revenue")
+    tot_col = cols.get("artist_total")
+    if not mid_col or not rev_col:
+        return empty
+
+    releases: List[Dict[str, Any]] = []
+    for mid, rev in zip(df[mid_col], df[rev_col]):
+        mrelg = str(mid or "").strip()
+        if not mrelg or mrelg.lower() in ("none", "nan"):
+            continue
+        value = _rev_2025_float(rev)
+        releases.append(
+            {
+                "mrelg_id": mrelg,
+                "catalog_revenue_2025": value,
+                "2025_ppr_revenue": value,
+            }
+        )
+    total = _rev_2025_float(df.iloc[0][tot_col]) if tot_col is not None else None
+    if total is None and releases:
+        nums = [r["2025_ppr_revenue"] for r in releases if r["2025_ppr_revenue"] is not None]
+        total = float(sum(nums)) if nums else None
+    truncated = len(df) >= int(ARTIST_REV_2025_ROW_LIMIT)
+    return {
+        "catalog_revenue_2025": total,
+        "2025_ppr_revenue": total,
+        "count": len(releases),
+        "truncated": truncated,
+        "releases": releases,
+    }
 
 
 def _resolve_mrelg_metadata(mrelg_id: str) -> Dict[str, Any]:

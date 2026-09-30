@@ -1,0 +1,16 @@
+INSERT INTO MARKETSHARE_SEARCH_SUMMARY_SINGLES (
+    MRELG_ID, TITLE, ARTIST, LUMINATE_ARTIST_ID, RELEASE_TYPE, LABEL_NAME,
+    RELEASE_DATE, GENRE, DAILY_GLOBAL_STREAMS, ARTIST_SEARCH, TITLE_SEARCH
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(MRELG_ID)
+DO UPDATE SET
+    TITLE                = excluded.TITLE,
+    ARTIST               = excluded.ARTIST,
+    LUMINATE_ARTIST_ID   = excluded.LUMINATE_ARTIST_ID,
+    RELEASE_TYPE         = excluded.RELEASE_TYPE,
+    LABEL_NAME           = excluded.LABEL_NAME,
+    RELEASE_DATE         = excluded.RELEASE_DATE,
+    GENRE                = excluded.GENRE,
+    ARTIST_SEARCH        = excluded.ARTIST_SEARCH,
+    TITLE_SEARCH         = excluded.TITLE_SEARCH
+;

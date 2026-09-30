@@ -74,6 +74,8 @@ _CSV_SYNC_CORE_7LABEL: frozenset[str] = frozenset(
 )
 
 # Static / legacy — never pull/push via automated csv scope (refresh_weekly, startup sync).
+# 2025_revenue_catalog.csv stays excluded: 2025 PPR revenue is live Snowflake
+# (US_LABELS_SANDBOX.RONAN_N.MRELG_REV_2025), not this CSV.
 _CSV_SYNC_EXCLUDE: frozenset[str] = frozenset(
     {
         "2025_revenue_catalog.csv",

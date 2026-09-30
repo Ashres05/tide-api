@@ -1,6 +1,8 @@
 -- Artist-page discography: albums, EPs, and singles for one LUMINATE_ARTIST_ID.
 -- PRODUCT_TYPE comes from the snapshot RELEASE_TYPE (Album / EP / Single).
 -- Both ? placeholders are the same artist id.
+-- Newest street/first-sale date first (search snapshots no longer refresh
+-- day-2 streams).
 SELECT
     MRELG_ID,
     TITLE,
@@ -22,5 +24,5 @@ SELECT
     LABEL_NAME AS LEVEL_2_DISTRIBUTOR
 FROM MARKETSHARE_SEARCH_SUMMARY_SINGLES
 WHERE LUMINATE_ARTIST_ID = ?
-ORDER BY DAILY_GLOBAL_STREAMS DESC, RELEASE_DATE DESC, MRELG_ID
+ORDER BY RELEASE_DATE DESC NULLS LAST, MRELG_ID
 ;

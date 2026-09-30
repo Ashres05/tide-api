@@ -1,6 +1,7 @@
 from snowflake_conn import get_snowflake_connection, load_sql
 from search_text import normalize_search_text
 import contextlib
+import shutil
 import sqlite3
 import pandas as pd
 import numpy as np
@@ -90,6 +91,10 @@ MARKETSHARE_RELEASE_METRICS_QUERY = 'query_marketshare_release_metrics.sql'
 EXPECTED_RELEASES_QUERY = 'release_get_all.sql'
 MARKETSHARE_SEARCH_SUMMARY_QUERY = 'query_marketshare_search_summary.sql'
 MARKETSHARE_SEARCH_SUMMARY_SINGLES_QUERY = 'query_marketshare_search_summary_singles.sql'
+MARKETSHARE_SEARCH_SUMMARY_DELTA_QUERY = 'query_marketshare_search_summary_delta.sql'
+MARKETSHARE_SEARCH_SUMMARY_SINGLES_DELTA_QUERY = (
+    'query_marketshare_search_summary_singles_delta.sql'
+)
 MARKETSHARE_SEARCH_ARTISTS_ROLLUP_QUERY = 'query_marketshare_search_artists_rollup.sql'
 LUMINATE_ARTIST_NAMES_QUERY = 'query_luminate_artist_names.sql'
 MARKETSHARE_SEARCH_DISTRIBUTORS_ROLLUP_QUERY = (
@@ -107,6 +112,10 @@ INSERT_YTD_MARKETSHARE = 'insert_ytd_marketshare.sql'
 INSERT_MARKETSHARE_RELEASE_METRICS = 'insert_marketshare_release_metrics.sql'
 INSERT_MARKETSHARE_SEARCH_SUMMARY = 'insert_marketshare_search_summary.sql'
 INSERT_MARKETSHARE_SEARCH_SUMMARY_SINGLES = 'insert_marketshare_search_summary_singles.sql'
+INSERT_MARKETSHARE_SEARCH_SUMMARY_DELTA = 'insert_marketshare_search_summary_delta.sql'
+INSERT_MARKETSHARE_SEARCH_SUMMARY_SINGLES_DELTA = (
+    'insert_marketshare_search_summary_singles_delta.sql'
+)
 INSERT_MARKETSHARE_SEARCH_ARTISTS = 'insert_marketshare_search_artists.sql'
 INSERT_MARKETSHARE_SEARCH_DISTRIBUTORS = 'insert_marketshare_search_distributors.sql'
 INSERT_DAILY_GLOBAL_STREAMS = 'insert_daily_global_streams.sql'
@@ -891,6 +900,201 @@ def refresh_marketshare_search_snapshots() -> dict:
     return {"albums": albums, "singles": singles}
 
 
+SEARCH_DELTA_LOOKBACK_DAYS = 21
+SEARCH_DELTA_LOOKBACK_DAYS_MAX = 120
+SEARCH_DELTA_MIN_FREE_GB = 1.5
+
+
+def _search_delta_min_street_date(
+    *,
+    lookback_days: int | None = None,
+    since_date: str | None = None,
+) -> str:
+    if since_date:
+        try:
+            return date.fromisoformat(str(since_date).strip()[:10]).isoformat()
+        except ValueError as e:
+            raise ValueError(
+                "since_date must be YYYY-MM-DD"
+            ) from e
+    if lookback_days is None:
+        raw = os.environ.get("TIDE_SEARCH_DELTA_LOOKBACK_DAYS", "").strip()
+        lookback_days = int(raw) if raw else SEARCH_DELTA_LOOKBACK_DAYS
+    try:
+        lookback_days = int(lookback_days)
+    except (TypeError, ValueError) as e:
+        raise ValueError("lookback_days must be a positive integer.") from e
+    if lookback_days < 1:
+        raise ValueError("lookback_days must be a positive integer.")
+    lookback_days = min(lookback_days, SEARCH_DELTA_LOOKBACK_DAYS_MAX)
+    return (date.today() - timedelta(days=lookback_days)).isoformat()
+
+
+def _search_delta_disk_preflight(*, min_free_gb: float = SEARCH_DELTA_MIN_FREE_GB) -> float:
+    usage = shutil.disk_usage(Path(DATABASE_NAME).resolve().parent)
+    free_gb = usage.free / (1024 ** 3)
+    if free_gb < float(min_free_gb):
+        raise RuntimeError(
+            f"abort search delta: {free_gb:.1f} GB free "
+            f"(need {min_free_gb:.1f} GB)"
+        )
+    return free_gb
+
+
+def _search_snapshot_delta_column_map() -> dict:
+    return {
+        "MRELG_ID": "MRELG_ID",
+        "TITLE": "TITLE",
+        "ARTIST": "ARTIST",
+        "LUMINATE_ARTIST_ID": "LUMINATE_ARTIST_ID",
+        "RELEASE_TYPE": "RELEASE_TYPE",
+        "LABEL": "LABEL_NAME",
+        "RELEASE_DATE": "RELEASE_DATE",
+        "GENRE": "GENRE",
+    }
+
+
+def _search_snapshot_target_cols() -> list:
+    return [
+        "MRELG_ID",
+        "TITLE",
+        "ARTIST",
+        "LUMINATE_ARTIST_ID",
+        "RELEASE_TYPE",
+        "LABEL_NAME",
+        "RELEASE_DATE",
+        "GENRE",
+        "DAILY_GLOBAL_STREAMS",
+        "ARTIST_SEARCH",
+        "TITLE_SEARCH",
+    ]
+
+
+def _refresh_search_snapshot_delta_table(
+    *,
+    query_file: str,
+    insert_file: str,
+    table_name: str,
+    default_release_type: str,
+    ensure_live_fn,
+    min_street_date: str,
+) -> int:
+    """
+    Upsert a street-date window of search-snapshot rows. Does not join
+    day-2 streams and does not overwrite DAILY_GLOBAL_STREAMS on conflict.
+    """
+    sql = load_sql(query_file).replace("{MIN_STREET_DATE}", min_street_date)
+    insert_sql = load_sql(insert_file)
+    column_map = _search_snapshot_delta_column_map()
+    target_cols = _search_snapshot_target_cols()
+    total_rows = 0
+    with get_snowflake_connection() as sf, sqlite_connect() as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        ensure_live_fn(conn)
+        conn.commit()
+        for i, chunk in enumerate(
+            sf.iter_query(sql, chunksize=_SEARCH_SNAPSHOT_CHUNKSIZE),
+            start=1,
+        ):
+            rows = _prepare_search_snapshot_rows(
+                chunk,
+                column_map=column_map,
+                target_cols=target_cols,
+                default_release_type=default_release_type,
+            )
+            if rows:
+                conn.executemany(insert_sql, rows)
+                total_rows += len(rows)
+            if i == 1 or i % 20 == 0:
+                logger.info(
+                    "sqlite_handler: %s delta chunk=%d rows_so_far=%d min_street=%s",
+                    table_name,
+                    i,
+                    total_rows,
+                    min_street_date,
+                )
+            conn.commit()
+    logger.info(
+        "sqlite_handler: %s delta upserted rows=%d min_street=%s",
+        table_name,
+        total_rows,
+        min_street_date,
+    )
+    return total_rows
+
+
+def refresh_marketshare_search_snapshots_delta(
+    *,
+    lookback_days: int | None = None,
+    since_date: str | None = None,
+    persist: bool = False,
+) -> dict:
+    """
+    Cheap search-index refresh: new/changed albums, EPs, and singles since
+    ``since_date`` or ``lookback_days`` (default 21). No day-2 stream join.
+    Rebuilds local artist/distributor typeahead. Does not upload the DB
+    to S3 unless ``persist=True``.
+    """
+    min_street = _search_delta_min_street_date(
+        lookback_days=lookback_days, since_date=since_date
+    )
+    free_gb = _search_delta_disk_preflight()
+    logger.info(
+        "sqlite_handler: search snapshot delta start min_street=%s free_gb=%.1f persist=%s",
+        min_street,
+        free_gb,
+        persist,
+    )
+    albums = _refresh_search_snapshot_delta_table(
+        query_file=MARKETSHARE_SEARCH_SUMMARY_DELTA_QUERY,
+        insert_file=INSERT_MARKETSHARE_SEARCH_SUMMARY_DELTA,
+        table_name="MARKETSHARE_SEARCH_SUMMARY",
+        default_release_type="Album",
+        ensure_live_fn=ensure_marketshare_search_summary_columns,
+        min_street_date=min_street,
+    )
+    singles = _refresh_search_snapshot_delta_table(
+        query_file=MARKETSHARE_SEARCH_SUMMARY_SINGLES_DELTA_QUERY,
+        insert_file=INSERT_MARKETSHARE_SEARCH_SUMMARY_SINGLES_DELTA,
+        table_name="MARKETSHARE_SEARCH_SUMMARY_SINGLES",
+        default_release_type="Single",
+        ensure_live_fn=ensure_marketshare_search_summary_singles_columns,
+        min_street_date=min_street,
+    )
+    artists = 0
+    distributors = 0
+    try:
+        artists = refresh_marketshare_search_artists(persist=False)
+    except Exception:
+        logger.exception("sqlite_handler: MARKETSHARE_SEARCH_ARTISTS rebuild failed")
+    try:
+        distributors = refresh_marketshare_search_distributors(persist=False)
+    except Exception:
+        logger.exception(
+            "sqlite_handler: MARKETSHARE_SEARCH_DISTRIBUTORS rebuild failed"
+        )
+    try:
+        wal_checkpoint("TRUNCATE")
+    except Exception:
+        logger.exception("sqlite_handler: wal_checkpoint after search delta failed")
+    if persist:
+        _persist_marketshare_db_to_s3()
+    summary = {
+        "ok": True,
+        "mode": "delta",
+        "min_street_date": min_street,
+        "albums": albums,
+        "singles": singles,
+        "artists": artists,
+        "distributors": distributors,
+        "persist_s3": persist,
+        "free_gb": round(free_gb, 2),
+    }
+    logger.info("sqlite_handler: search snapshot delta done %s", summary)
+    return summary
+
+
 def _search_summary_has_artist_id(cur: sqlite3.Cursor, table: str) -> bool:
     """True when ``table`` exists and has a LUMINATE_ARTIST_ID column."""
     cur.execute(
@@ -956,10 +1160,11 @@ def _prepare_search_snapshot_rows(
     if "RELEASE_DATE" in df.columns:
         df["RELEASE_DATE"] = df["RELEASE_DATE"].astype(str)
 
-    if "DAILY_GLOBAL_STREAMS" in df.columns:
-        streams = pd.to_numeric(df["DAILY_GLOBAL_STREAMS"], errors="coerce")
-        streams = streams.replace([float("inf"), float("-inf")], pd.NA).fillna(0)
-        df["DAILY_GLOBAL_STREAMS"] = streams.astype("int64")
+    if "DAILY_GLOBAL_STREAMS" not in df.columns:
+        df["DAILY_GLOBAL_STREAMS"] = 0
+    streams = pd.to_numeric(df["DAILY_GLOBAL_STREAMS"], errors="coerce")
+    streams = streams.replace([float("inf"), float("-inf")], pd.NA).fillna(0)
+    df["DAILY_GLOBAL_STREAMS"] = streams.astype("int64")
 
     for col in (
         "MRELG_ID",

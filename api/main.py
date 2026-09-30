@@ -4,7 +4,7 @@ import logging
 import sys
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
@@ -27,6 +27,8 @@ except ModuleNotFoundError:
         get_manager,
         require_api_key,
     )
+
+from api.evergreen_proxy import forward_evergreen
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -151,6 +153,19 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/api/evergreen/{path:path}")
+def evergreen_album_report_proxy(path: str, request: Request):
+    """Album-report FastAPI on :8080, published on api.hightide.fm for Vercel."""
+    return forward_evergreen(request, f"/api/evergreen/{path}")
+
+
+@app.get("/api/revenue/mrelg_isrc_report/{mrelg_id}")
+def evergreen_mrelg_isrc_report_proxy(mrelg_id: str, request: Request):
+    return forward_evergreen(
+        request, f"/api/revenue/mrelg_isrc_report/{mrelg_id}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Admin endpoints (async jobs)
 #
@@ -240,12 +255,54 @@ def export_boot_json(_: None = Depends(require_api_key)) -> JobAcceptedResponse:
     return _dispatch("export_boot_json", model_handler.export_boot_json_snapshot)
 
 
+@app.post(
+    "/v1/data/refresh_artist_ppr",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=JobAcceptedResponse,
+)
+def refresh_artist_ppr(_: None = Depends(require_api_key)) -> JobAcceptedResponse:
+    """
+    Nightly artist PPR: Snowflake latest rate for roster ∪ expected, rewrite
+    SQLite, patch boot.json ``ppr`` (does not rebuild forecast curves).
+    """
+    return _dispatch("refresh_artist_ppr", model_handler.refresh_artist_ppr)
+
+
+@app.post(
+    "/v1/data/refresh_search_snapshots",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=JobAcceptedResponse,
+)
+def refresh_search_snapshots(
+    lookback_days: int = 21,
+    since_date: str | None = None,
+    _: None = Depends(require_api_key),
+) -> JobAcceptedResponse:
+    """
+    Daily catalog search delta: upsert albums/EPs/singles with street/first-sale
+    on or after ``since_date`` (YYYY-MM-DD) or ``CURRENT_DATE - lookback_days``
+    (default 21). No day-2 worldwide streams. Rebuilds artist/distributor
+    typeahead locally. Does not upload marketshare_data.db to S3.
+
+    Skip Mondays (weekly sqlite job). 409 if this job is already running.
+    """
+
+    def _run():
+        return model_handler.refresh_search_snapshots_delta(
+            lookback_days=lookback_days,
+            since_date=since_date,
+        )
+
+    return _dispatch("refresh_search_snapshots", _run)
+
+
 @app.get("/v1/boot.json")
 def get_boot_json():
     """
-    Cold-start snapshot: streaming roster + weekly stream actuals, marketshare
-    actuals/weekly, and expected releases with Actual + Forecast weekly AE
-    (same shape as GET /v1/releases/{id}/weekly).
+    Cold-start snapshot: streaming roster + weekly stream actuals, current
+    artist PPR (``ppr.artists`` / ``streaming.releases[].ppr_value``),
+    marketshare actuals/weekly, and expected releases with Actual + Forecast
+    weekly AE (same shape as GET /v1/releases/{id}/weekly).
 
     FE should load this once at startup. Insert/edit/delete drops via
     POST/PUT/DELETE /v1/releases (live). See payload ``ui`` for the contract.
@@ -833,6 +890,27 @@ def search_artists(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/v1/revenue/artist_ppr/{luminate_artist_id}")
+def artist_ppr(luminate_artist_id: str):
+    """
+    Current per-play rate for one Luminate artist (not per release).
+
+    SQLite cache first (nightly roster ∪ expected, plus prior live hits).
+    On miss, one Snowflake lookup (max CALCULATION_DATE) and upsert.
+
+    Returns ``ppr_value`` / ``calculation_date`` / ``source``
+    (``cache`` | ``live`` | ``miss`` | ``error``). Null ``ppr_value`` means
+    use the 0.004 fallback. Pair with ``GET /v1/revenue/releases_by_artist``.
+    """
+    try:
+        payload = model_handler.get_artist_ppr_json(luminate_artist_id)
+        return Response(content=payload, media_type="application/json")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/v1/revenue/releases_by_artist/{luminate_artist_id}")
 def releases_by_artist(luminate_artist_id: str):
     """
@@ -842,7 +920,7 @@ def releases_by_artist(luminate_artist_id: str):
     Each row: mrelg_id, title, artist, product_type, release_date,
     daily_global_streams, level_2_distributor (IC map; null if unmapped),
     forecast_route (``album`` vs ``singles`` for the weekly-stream
-    endpoints). Ordered by daily worldwide streams descending.
+    endpoints). Ordered by release_date descending (newest first).
     """
     try:
         payload = model_handler.get_releases_by_artist_json(luminate_artist_id)
@@ -1071,15 +1149,36 @@ def mrelg_isrc_report(
     )
 
 
+@app.get("/v1/revenue/catalog_revenue_2025_by_artist/{luminate_artist_id}")
+def catalog_revenue_2025_by_artist(luminate_artist_id: str):
+    """
+    Artist page — one Snowflake scan of MRELG_REV_2025 for this Luminate id.
+
+    ``releases[]`` is per-title 2025 PPR revenue (join to discography on
+    mrelg_id). Top-level catalog_revenue_2025 is the full artist SUM even
+    if the list is capped at 500 titles (truncated=true). Live, no cache.
+    Pair with GET /v1/revenue/releases_by_artist; do not N+1 the per-MRELG
+    route. Not for typeahead.
+    """
+    try:
+        body = model_handler.get_catalog_revenue_2025_by_artist(luminate_artist_id)
+        return {
+            "luminate_artist_id": (luminate_artist_id or "").strip(),
+            **body,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/v1/revenue/catalog_revenue_2025/{mrelg_id}")
 def catalog_revenue_2025(mrelg_id: str):
     """
-    Live Revenue board — 2025 catalog revenue for a single Luminate MRELG
-    release group. Reads from the local MARKETSHARE_REVENUE_2025 table,
-    which is loaded one-shot from
-    s3://parquetgarage/model/data/2025_revenue_catalog.csv. Returns
-    {"catalog_revenue_2025": float | null}; null when the MRELG isn't in
-    the file. Not joined into the forecast pipeline.
+    2025 PPR revenue for one title from
+    US_LABELS_SANDBOX.RONAN_N.MRELG_REV_2025. Live Snowflake, no SQLite/CSV
+    cache. Returns catalog_revenue_2025 / 2025_ppr_revenue (same number);
+    null when the MRELG is not in the table. Not joined into forecasts.
     """
     try:
         body = model_handler.get_catalog_revenue_2025_by_mrelg(mrelg_id)
