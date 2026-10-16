@@ -1998,6 +1998,50 @@ def get_streaming_roster_2026_json() -> str:
     return json.dumps(get_streaming_roster_2026(), default=str)
 
 
+def get_change_attribution(
+    week_ending_date: str | None = None,
+    *,
+    owner_label: str | None = None,
+    in_panel: bool | None = None,
+    is_amg: bool | None = None,
+    gate: str | None = None,
+    tag: str | None = None,
+) -> dict:
+    """Gated AMG share-attribution pack for one week (all owners, locked τ)."""
+    import change_attribution
+
+    return change_attribution.query_week_pack(
+        week_ending_date,
+        owner_label=owner_label,
+        in_panel=in_panel,
+        is_amg=is_amg,
+        gate=gate,
+        tag=tag,
+    )
+
+
+def get_change_attribution_json(
+    week_ending_date: str | None = None,
+    *,
+    owner_label: str | None = None,
+    in_panel: bool | None = None,
+    is_amg: bool | None = None,
+    gate: str | None = None,
+    tag: str | None = None,
+) -> str:
+    return json.dumps(
+        get_change_attribution(
+            week_ending_date,
+            owner_label=owner_label,
+            in_panel=in_panel,
+            is_amg=is_amg,
+            gate=gate,
+            tag=tag,
+        ),
+        default=str,
+    )
+
+
 def get_ytd_fiscal_revenue_by_label(
     *,
     week_end_date: str | None = None,
@@ -3503,6 +3547,9 @@ def reload_artifacts() -> None:
     import ytd_fiscal_revenue_from_csv
 
     ytd_fiscal_revenue_from_csv.clear_cache()
+    import change_attribution
+
+    change_attribution.clear_cache()
     import quarterly_share_from_csv
     import quarterly_share_level3_from_csv
     import releases_by_q_amg_labels_from_csv

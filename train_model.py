@@ -183,6 +183,18 @@ def _refresh_data_directory() -> tuple[list[dict[str, Any]], list[dict[str, str]
                 csv_path=DATA_DIR / "releases_by_q_amg_labels.csv",
             )
         )
+        attribution_min_week = _attribution_mrelg_min_week()
+        csv_stages.append(
+            _run_stage(
+                "amg_week_market.csv",
+                lambda sf=sf, min_week=attribution_min_week: _update_change_attribution(
+                    sf, min_week
+                ),
+                csv_path=DATA_DIR / "amg_week_market.csv",
+                week_col="week_end_date",
+                anchor_week=attribution_min_week,
+            )
+        )
     return csv_stages, optional_errors
 
 
@@ -497,6 +509,32 @@ def _update_quarterly_share_level3(sf: Snowflake) -> int:
     out.to_csv(csv_path, index=False)
     lvl3_csv.clear_cache()
     return len(out) - before
+
+
+def _attribution_mrelg_min_week() -> str:
+    """Floor pull starts 7 days before the persisted max so ΔAE has a lag week."""
+    import change_attribution
+
+    path = change_attribution.MRELG_FLOOR_CSV
+    if not path.exists():
+        return change_attribution.cold_start_min_week()
+    max_wk = _get_min_week_end_date(path, week_col="WEEK_END_DATE")
+    if max_wk == _COLD_START_MIN_WEEK:
+        return change_attribution.cold_start_min_week()
+    return (pd.Timestamp(max_wk) - pd.Timedelta(days=change_attribution.OVERLAP_DAYS)).strftime(
+        "%Y-%m-%d"
+    )
+
+
+def _update_change_attribution(sf: Snowflake, min_week: str) -> int:
+    """
+    Incremental all-owner MRELG AE floor, then rewrite gated week/title/label CSVs
+    at locked τ (25 / 75 / AMG anchor 40).
+    """
+    import change_attribution
+
+    added = change_attribution.refresh_change_attribution(sf, min_week)
+    return added
 
 
 def _update_releases_by_q_amg_labels(sf: Snowflake) -> int:

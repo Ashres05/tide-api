@@ -79,6 +79,7 @@ running — the cron should treat this as "already in progress" and move on.
 
 `/v1/releases`, `/v1/releases/{id}`, `/v1/releases/{id}/weekly`,
 `/v1/marketshare/actuals`, `/v1/marketshare/weekly`,
+`/v1/marketshare/attribution`,
 `/v1/releases/{id}/global_streaming`.
 
 ### Notes

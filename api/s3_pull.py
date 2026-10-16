@@ -8,7 +8,7 @@ Design pattern:
 
 Scopes:
   - "db"                   marketshare_data.db
-  - "csvs"                 model/data/*.csv (current_data_all, bigrelease_alist_75k_all, ytd_fiscal_revenue_by_label, monthly_share_and_qtd, monthly_share_labels, labels_*_marketshare, amg_full_*_marketshare, releases_by_q_amg_labels). Excludes static 2025_revenue_catalog.csv and legacy Current_Data/alist_75k/bigreleaseflag_75k/quarterly_share_*.csv (manual S3 upload only).
+  - "csvs"                 model/data/*.csv (current_data_all, bigrelease_alist_75k_all, ytd_fiscal_revenue_by_label, monthly_share_and_qtd, monthly_share_labels, labels_*_marketshare, amg_full_*_marketshare, releases_by_q_amg_labels, attribution_mrelg_weekly, amg_week_market, amg_week_owners, amg_week_mrelgs, amg_week_labels). Excludes static 2025_revenue_catalog.csv and legacy Current_Data/alist_75k/bigreleaseflag_75k/quarterly_share_*.csv (manual S3 upload only).
   - "parquets"             model/data/*.parquet (heavy; archetype/training inputs)
   - "artifacts_75k"        model/artifacts_75k/** (LGBM/Prophet/spike/df_full/sidecars)
   - "archetypes_artifacts" model/archetypes_artifacts/** (album decay + singles/ subdir; forecast serving)

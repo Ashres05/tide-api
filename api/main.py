@@ -4,7 +4,7 @@ import logging
 import sys
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
@@ -851,6 +851,71 @@ def actuals_marketshare():
     try:
         payload = model_handler.df_to_json(model_handler.get_marketshare_actuals())
         return Response(content=payload, media_type="application/json")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v1/marketshare/attribution")
+def marketshare_attribution(
+    week_ending_date: str | None = Query(
+        default=None,
+        description="Luminate week_end_date YYYY-MM-DD. Omit for the latest complete week.",
+    ),
+    owner_label: str | None = Query(
+        default=None,
+        description="Facet: filter mrelgs/labels by owner_label. Does not change week decomp.",
+    ),
+    in_panel: bool | None = Query(
+        default=None,
+        description="Facet: true = TARGET_LABELS eight, false = Other. Week decomp unchanged.",
+    ),
+    is_amg: bool | None = Query(
+        default=None,
+        description="Facet: Atlantic Music Group titles only when true. Week decomp unchanged.",
+    ),
+    gate: str | None = Query(
+        default=None,
+        description="Facet: mover | anchor | both.",
+    ),
+    tag: str | None = Query(
+        default=None,
+        description="Facet: amg | panel | other (other = not in the eight).",
+    ),
+):
+    """
+    Why AMG Current-US share moved this week.
+
+    Returns inverted-market decomp, dual-gate MRELGs (all owners), 8-label
+    `owners` cards (share, own/market, coverage, headline), owner rollup,
+    and `ui` (headline + lead_rule). Facet query params filter `mrelgs` /
+    `labels` only — `week` and `owners` stay full-pie.
+
+    Coverage: `coverage_same_sign` and `coverage_mover_same_sign` are the
+    dashboard numbers (clipped 0–1). `coverage_d_market` is net ΣΔAE and
+    can exceed 1 when up/down titles cancel.
+    """
+    try:
+        if week_ending_date is not None:
+            model_handler._validate_date(week_ending_date)
+        if gate == "ballast":
+            gate = "anchor"
+        if gate is not None and gate not in {"mover", "anchor", "both"}:
+            raise ValueError("gate must be mover, anchor, or both")
+        if tag is not None and tag not in {"amg", "panel", "other"}:
+            raise ValueError("tag must be amg, panel, or other")
+        payload = model_handler.get_change_attribution_json(
+            week_ending_date,
+            owner_label=owner_label,
+            in_panel=in_panel,
+            is_amg=is_amg,
+            gate=gate,
+            tag=tag,
+        )
+        return Response(content=payload, media_type="application/json")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
