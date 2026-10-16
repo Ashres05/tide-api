@@ -79,8 +79,27 @@ running — the cron should treat this as "already in progress" and move on.
 
 `/v1/releases`, `/v1/releases/{id}`, `/v1/releases/{id}/weekly`,
 `/v1/marketshare/actuals`, `/v1/marketshare/weekly`,
-`/v1/marketshare/attribution`,
+`/v1/marketshare/attribution` (see below),
 `/v1/releases/{id}/global_streaming`.
+
+### Weekly share attribution
+
+`GET /v1/marketshare/attribution` explains why AMG Current-US share moved
+this Luminate week: inverted-market decomp, dual-gate titles (mover or
+anchor), eight panel `owners` cards, and a driver-aware `ui.headline`.
+
+Full contract, locked τ, coverage rules, and frontend layout:
+[docs/change-attribution.md](docs/change-attribution.md).
+
+```bash
+curl -s "http://127.0.0.1:8000/v1/marketshare/attribution"
+curl -s "http://127.0.0.1:8000/v1/marketshare/attribution?week_ending_date=2026-10-08"
+```
+
+This is weekly only (not YTD). Facet query params filter `mrelgs` / `labels`;
+`week` and `owners` stay the full pie. After pulling this code, restart
+systemd (`sudo systemctl restart tide-api`) — Vercel does not pick up API
+changes from GitHub.
 
 ### Notes
 
